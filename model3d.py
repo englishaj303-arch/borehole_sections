@@ -206,8 +206,9 @@ def _style_layer(layer, color, height):
             sym.setEdgesEnabled(True)
             sym.setEdgeWidth(0.4)
             sym.setEdgeColor(color.darker(220))
-        except Exception:
-            pass
+        except (AttributeError, TypeError) as e:
+            # edge rendering is optional and missing in some QGIS versions
+            core.log_warning(f"3D edge styling not available: {type(e).__name__}: {e}")
         layer.setRenderer3D(QgsVectorLayer3DRenderer(sym))
         return None
     except Exception as e:      # report to the user instead of failing silently

@@ -10,7 +10,14 @@ from qgis.PyQt.QtGui import QColor, QBrush, QPen, QPolygonF, QFont, QPainterPath
 from qgis.PyQt.QtWidgets import QGraphicsScene
 from qgis.core import (
     QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject, QgsFeature, QgsGeometry, QgsLineString, QgsPoint, QgsPointXY, QgsVectorLayer,
+    QgsMessageLog, Qgis,
 )
+
+LOG_TAG = "Borehole Geology"
+
+
+def log_warning(msg):
+    QgsMessageLog.logMessage(msg, LOG_TAG, Qgis.MessageLevel.Warning)
 
 CRS_SJTSK = "EPSG:5514"
 
@@ -250,8 +257,9 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
         if out:
             warnings.insert(0, f"{out} borehole(s) lie outside the Czech Republic - check the "
                                "coordinate system, the minus-sign option and the swap option")
-    except Exception:
-        pass
+    except Exception as e:
+        # the location check is only advisory; keep the data but record why it was skipped
+        log_warning(f"Coordinate plausibility check skipped: {type(e).__name__}: {e}")
     return list(bhs.values()), warnings
 
 
@@ -1222,8 +1230,9 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
                     path.lineTo(px, py)
                 scene.addPath(path, strat_pen).setZValue(3)
                 strat_found = True
-        except Exception:
-            pass
+        except Exception as e:
+            # stratigraphic boundary lines are optional decoration; the section is still drawn
+            log_warning(f"Stratigraphic boundary lines skipped: {type(e).__name__}: {e}")
 
     # terrain
     pen = QPen(QColor(40, 120, 40), 1.6)
