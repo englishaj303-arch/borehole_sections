@@ -12,8 +12,24 @@ tracker=https://github.com/englishaj303-arch/borehole_sections/issues
 icon=icon.png
 repository=https://github.com/englishaj303-arch/borehole_sections
 homepage=https://github.com/englishaj303-arch/borehole_sections
-changelog=0.11.1 - metadata: qgisMaximumVersion=4.99 instead of the deprecated supportsQt6
+changelog=0.11.1 - metadata.txt changes: qgisMaximumVersion=4.99 instead of the deprecated supportsQt6
 	0.11.0 - new tab 3 Borehole logs (profiles of 1-4 boreholes and sedimentary records with grain size); 2D section is now tab 4 and 3D model tab 5; grain size column in tab 2; gravel (štěrk) recognised in default colours
+	0.10.1 - fixed gaps between Quarternary and older layers in 2D sections
+	0.10 - added stratigraphy boundary function and improved rendering of layer splitting
+	0.9.1 - menu for creating faults has been moved to the window displaying cross-sections
+	0.9 - added function of faults in cross sections
+	0.8.1 - fixed gaps ocuring on edges of different lithologies
+	0.8 - changes to the rendering of cross-sections for a smoother result
+	0.7 - added function for merging neighbouring layers of same litology in section
+	0.6.1 - added Stratigraphy line on Data tab
+	0.6 - changes in Cross-section creation logic
+	0.5.1 - bug fixes in 2D section tab
+	0.5 - changes in 2D section tab design 
+	0.4 - added 2D section tab and 3D model tab
+	0.3 - added tab Lithology colours
+	0.2.1 - fixed bug with importing data on Data tab in S-JTSK coordinates system without minus
+	0.2 - improved importing tab Data
+	0.1 - initial release
 experimental=True
 deprecated=False
 tags=geology,borehole,cross section,3D,S-JTSK
