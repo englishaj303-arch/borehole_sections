@@ -153,9 +153,10 @@ def _slab_ring(locate, da, db, width):
             (p2[0] - nx, p2[1] - ny), (p1[0] - nx, p1[1] - ny)]
 
 
-def fence_prisms(geo, locate, length, width=4.0, slab=8.0, dz=2.0):
+def fence_prisms(geo, locate, length, width=4.0, slab=8.0, dz=2.0, shift=None):
     """Turn one 2D section (core.build_section_scene(...).geo) into 3D slabs.
-    locate(d) -> (x, y) point on the section line at distance d."""
+    locate(d) -> (x, y) point on the section line at distance d.
+    shift(d) -> vertical offset (terrain following, e.g. from a DEM) or None."""
     d0, kx, ky, zmax = geo["d0"], geo["kx"], geo["ky"], geo["zmax"]
     prisms = []
     for pts, lit, _age in list(geo["polys"]) + list(geo["cols"]):
@@ -176,8 +177,10 @@ def fence_prisms(geo, locate, length, width=4.0, slab=8.0, dz=2.0):
                 if (x1 <= dc < x2) or (x2 <= dc < x1):
                     zs.append(z1 + (z2 - z1) * (dc - x1) / (x2 - x1))
             zs.sort()
+            off = shift(dc) if shift else 0.0
             ring = None
             for a, b in zip(zs[0::2], zs[1::2]):
+                a, b = a + off, b + off
                 ia, ib = int(round(a / dz)), int(round(b / dz))
                 if ib <= ia:
                     continue
@@ -248,3 +251,154 @@ def build_layers(prisms, colors, group_name):
         group.addLayer(lyr)
         count += 1
     return count, len(prisms), err
+
+
+# ---------------------------------------------- network of panels (fence diagram)
+def _median(v):
+    v = sorted(v)
+    return v[len(v) // 2] if v else 0.0
+
+
+def delaunay_edges(pts):
+    """Edges (i, j) of the Delaunay triangulation (Bowyer-Watson, small point sets)."""
+    n = len(pts)
+    if n < 2:
+        return set()
+    if n == 2:
+        return {(0, 1)}
+    minx, maxx = min(p[0] for p in pts), max(p[0] for p in pts)
+    miny, maxy = min(p[1] for p in pts), max(p[1] for p in pts)
+    dm = max(maxx - minx, maxy - miny, 1.0) * 30.0
+    mx, my = (minx + maxx) / 2.0, (miny + maxy) / 2.0
+    P = list(pts) + [(mx - dm, my - dm), (mx, my + dm), (mx + dm, my - dm)]
+
+    def in_circle(p, t):
+        (ax, ay), (bx, by), (cx, cy) = P[t[0]], P[t[1]], P[t[2]]
+        d = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+        if abs(d) < 1e-12:
+            return False
+        ux = ((ax * ax + ay * ay) * (by - cy) + (bx * bx + by * by) * (cy - ay)
+              + (cx * cx + cy * cy) * (ay - by)) / d
+        uy = ((ax * ax + ay * ay) * (cx - bx) + (bx * bx + by * by) * (ax - cx)
+              + (cx * cx + cy * cy) * (bx - ax)) / d
+        return (p[0] - ux) ** 2 + (p[1] - uy) ** 2 < (ax - ux) ** 2 + (ay - uy) ** 2 - 1e-9
+
+    tris = [(n, n + 1, n + 2)]
+    for i in range(n):
+        bad = [t for t in tris if in_circle(P[i], t)]
+        cnt = {}
+        for t in bad:
+            for e in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])):
+                k = tuple(sorted(e))
+                cnt[k] = cnt.get(k, 0) + 1
+        tris = [t for t in tris if t not in bad]
+        tris += [(e[0], e[1], i) for e, c in cnt.items() if c == 1]
+    out = set()
+    for t in tris:
+        if max(t) >= n:
+            continue
+        for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])):
+            out.add((min(a, b), max(a, b)))
+    return out
+
+
+def neighbour_edges(bhs, mode="grid", maxlen=0.0):
+    """Pairs of neighbouring boreholes (indices) that get a panel.
+    mode "grid": the nearest borehole in each of four directions (the grid is
+    rotated to the dominant direction of the boreholes), "delaunay": triangulation.
+    maxlen = longest allowed panel, 0 = 2.5 x the median nearest-neighbour distance."""
+    n = len(bhs)
+    pts = [(b.x, b.y) for b in bhs]
+    if n < 2:
+        return []
+    nn, vec = [], []
+    for i in range(n):
+        best = None
+        for j in range(n):
+            if i != j:
+                d = math.hypot(pts[j][0] - pts[i][0], pts[j][1] - pts[i][1])
+                if best is None or d < best[0]:
+                    best = (d, j)
+        nn.append(best[0])
+        vec.append(math.atan2(pts[best[1]][1] - pts[i][1], pts[best[1]][0] - pts[i][0]))
+    if maxlen <= 0:
+        maxlen = 2.5 * _median(nn)
+    if mode == "delaunay":
+        return sorted(e for e in delaunay_edges(pts)
+                      if math.hypot(pts[e[0]][0] - pts[e[1]][0], pts[e[0]][1] - pts[e[1]][1]) <= maxlen)
+    theta = 0.25 * math.atan2(sum(math.sin(4 * v) for v in vec), sum(math.cos(4 * v) for v in vec))
+    edges = set()
+    for i in range(n):
+        best = {}
+        for j in range(n):
+            if i == j:
+                continue
+            dx, dy = pts[j][0] - pts[i][0], pts[j][1] - pts[i][1]
+            d = math.hypot(dx, dy)
+            if d > maxlen:
+                continue
+            sector = int(((math.atan2(dy, dx) - theta + math.pi / 4) % (2 * math.pi)) // (math.pi / 2))
+            if sector not in best or d < best[sector][0]:
+                best[sector] = (d, j)
+        for d, j in best.values():
+            edges.add((min(i, j), max(i, j)))
+    return sorted(edges)
+
+
+def _dem_shift(A, B, L, dem, n=40):
+    """Terrain-following offset along the panel A-B: the DEM profile minus the straight
+    line between the collars, with zero offset at the two boreholes."""
+    ds = [L * k / n for k in range(n + 1)]
+    hs = []
+    for d in ds:
+        h = dem(A.x + (B.x - A.x) * d / L, A.y + (B.y - A.y) * d / L)
+        if h is None:
+            return None
+        hs.append(h)
+    e0, e1 = hs[0] - A.z, hs[-1] - B.z
+    offs = [hs[k] - (A.z + (B.z - A.z) * ds[k] / L) - (e0 * (1 - ds[k] / L) + e1 * ds[k] / L)
+            for k in range(n + 1)]
+
+    def f(d):
+        t = min(max(d / L, 0.0), 1.0) * n
+        i = min(int(t), n - 1)
+        return offs[i] + (offs[i + 1] - offs[i]) * (t - i)
+    return f
+
+
+def column_prisms(bhs, width, dz):
+    """Borehole columns (the black pillars of a fence diagram)."""
+    out = []
+    for b in bhs:
+        h = width / 2.0
+        ring = [(b.x - h, b.y - h), (b.x + h, b.y - h), (b.x + h, b.y + h), (b.x - h, b.y + h)]
+        out += stack_prisms(ring, int(round((b.z - b.depth) / dz)), int(round(b.z / dz)),
+                            dz, "Borehole")
+    return out
+
+
+def network_prisms(bhs, edges, make_geo, width=1.0, slab=5.0, dz=2.0, dem=None,
+                   colw=3.0, max_prisms=250000):
+    """Thin vertical panels between neighbouring boreholes.
+    make_geo(A, B, L) -> 2D section geometry (core.section_geo) of the pair;
+    dem(x, y) -> ground elevation or None (optional terrain following)."""
+    prisms = []
+    for i, j in edges:
+        A, B = bhs[i], bhs[j]
+        L = math.hypot(B.x - A.x, B.y - A.y)
+        if L < 1e-6:
+            continue
+        geo = make_geo(A, B, L)
+
+        def locate(d, A=A, B=B, L=L):
+            return (A.x + (B.x - A.x) * d / L, A.y + (B.y - A.y) * d / L)
+
+        shift = _dem_shift(A, B, L, dem) if dem is not None else None
+        prisms += fence_prisms(geo, locate, L, width, slab, dz, shift)
+        if len(prisms) > max_prisms:
+            raise ValueError("The model would contain too many blocks - increase the slab "
+                             "length or the vertical step, or shorten the maximum panel length.")
+    if colw > 0:
+        used = {k for e in edges for k in e}
+        prisms += column_prisms([bhs[k] for k in sorted(used)], colw, dz)
+    return prisms

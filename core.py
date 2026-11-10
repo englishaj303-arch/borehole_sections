@@ -19,12 +19,13 @@ LOG_TAG = "Borehole Geology"
 def log_warning(msg):
     QgsMessageLog.logMessage(msg, LOG_TAG, Qgis.MessageLevel.Warning)
 
+
 CRS_SJTSK = "EPSG:5514"
 
 # key -> (authid, label, x label, y label, x keywords, y keywords)
 INPUT_CRS = {
     "sjtsk": ("EPSG:5514", "S-JTSK (EPSG:5514)",
-              "X (northing, S-JTSK)", "Y (easting, S-JTSK)", ["x"], ["y"]),
+              "X (northing, latitude)", "Y (easting, longitude)", ["x"], ["y"]),
     "wgs84": ("EPSG:4326", "WGS84 geographic - lon/lat in degrees (EPSG:4326)",
               "Longitude [deg]", "Latitude [deg]",
               ["lon", "lng", "longitude", "x"], ["lat", "latitude", "y"]),
@@ -329,7 +330,7 @@ def clean_layers(layers):
     """Remove overlaps inside one borehole: only one rock at a time.
     The upper layer wins; the lower one is trimmed (or dropped)."""
     out, run = [], None
-    for L in sorted(layers, key=lambda l: (l.top, l.bottom)):
+    for L in sorted(layers, key=lambda lay: (lay.top, lay.bottom)):
         top = L.top if run is None else max(L.top, run)
         if L.bottom - top > 1e-9:
             out.append(Layer(top, L.bottom, L.litho, L.age))
@@ -355,7 +356,9 @@ def align_layers(LA, LB, zA, zB):
     Returns a set of (i, j) pairs (indices into LA / LB).  One layer may be
     paired with several layers of the other borehole (splitting / merging)."""
     n, m = len(LA), len(LB)
-    mid = lambda L: (L.top + L.bottom) / 2.0
+
+    def mid(L):
+        return (L.top + L.bottom) / 2.0
 
     def same(i, j):
         return LA[i].litho == LB[j].litho and ages_compatible(LA[i].age, LB[j].age)
@@ -406,12 +409,12 @@ def align_layers(LA, LB, zA, zB):
 
 def _run_age(run):
     """Thickness-weighted mean age index of a list of layers (None = unknown)."""
-    tot = sum(l.bottom - l.top for l in run)
-    known = sum(l.bottom - l.top for l in run if l.age is not None)
+    tot = sum(lay.bottom - lay.top for lay in run)
+    known = sum(lay.bottom - lay.top for lay in run if lay.age is not None)
     if tot <= 0 or known < 0.5 * tot:
         return None
-    return sum((l.bottom - l.top) * (l.age[0] + l.age[1]) / 2.0
-               for l in run if l.age is not None) / known
+    return sum((lay.bottom - lay.top) * (lay.age[0] + lay.age[1]) / 2.0
+               for lay in run if lay.age is not None) / known
 
 
 def _older(X, Z, margin=1.5):
@@ -421,13 +424,13 @@ def _older(X, Z, margin=1.5):
 
 
 def _run_range(run):
-    if not run or any(l.age is None for l in run):
+    if not run or any(lay.age is None for lay in run):
         return None
-    return (min(l.age[0] for l in run), max(l.age[1] for l in run))
+    return (min(lay.age[0] for lay in run), max(lay.age[1] for lay in run))
 
 
 def _thickness(run):
-    return sum(l.bottom - l.top for l in run)
+    return sum(lay.bottom - lay.top for lay in run)
 
 
 def fence_secant(LA, LB, zA, zB, xa, xb, YA, YB):
@@ -619,11 +622,11 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
         the thinner the layer, the closer to its own borehole it ends."""
         segs, cur = [], dd[0]
         for i in G:
-            l = L[i]
-            if l.top > cur + 1e-9:
-                segs.append([Ysrc(l.top) - Ysrc(cur), None, None])
-            segs.append([Ysrc(l.bottom) - Ysrc(l.top), l.litho, l.age])
-            cur = l.bottom
+            lay = L[i]
+            if lay.top > cur + 1e-9:
+                segs.append([Ysrc(lay.top) - Ysrc(cur), None, None])
+            segs.append([Ysrc(lay.bottom) - Ysrc(lay.top), lay.litho, lay.age])
+            cur = lay.bottom
         if dd[1] > cur + 1e-9:
             segs.append([Ysrc(dd[1]) - Ysrc(cur), None, None])
         dist = []
@@ -729,18 +732,20 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
                     return wf((x - xtB) / (xb - xtB))
                 return 0.0
 
-            def ctop(x, T=T, Bt=Bt, wx=wx):
-                return T(x) + (Bt(x) - T(x)) * GAMMA * (1.0 - wx(x))
-
-            def cbot(x, T=T, Bt=Bt, wx=wx):
-                return T(x) + (Bt(x) - T(x)) * (GAMMA + (1.0 - GAMMA) * wx(x))
-
             if c == nP and (bool(Ag) != bool(Bg)):
                 # layers below the bottom of the neighbouring borehole: they cannot be
                 # correlated and end "in the ground" - horizontal, with rounded ends
                 yb0 = YA(dA[1]) if Ag else YB(dB[1])
                 ctop = T
-                cbot = lambda x, T=T, wx=wx, yb0=yb0: T(x) + max(yb0 - T(x), 0.0) * wx(x)
+
+                def cbot(x, T=T, wx=wx, yb0=yb0):
+                    return T(x) + max(yb0 - T(x), 0.0) * wx(x)
+            else:
+                def ctop(x, T=T, Bt=Bt, wx=wx):
+                    return T(x) + (Bt(x) - T(x)) * GAMMA * (1.0 - wx(x))
+
+                def cbot(x, T=T, Bt=Bt, wx=wx):
+                    return T(x) + (Bt(x) - T(x)) * (GAMMA + (1.0 - GAMMA) * wx(x))
 
             for info in (iA, iB):
                 if info:
@@ -748,7 +753,9 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
 
         elif mode == "fill":    # one-sided layers of the cover fill the whole gap
             ctop, cbot = T, Bt
-            cf = lambda x, f, T=T, Bt=Bt: T(x) + (Bt(x) - T(x)) * f
+
+            def cf(x, f, T=T, Bt=Bt):
+                return T(x) + (Bt(x) - T(x)) * f
             polys = fan(Ag, LA, dA[0], dA[1], xs, cf) + fan(Bg, LB, dB[0], dB[1], xs, cf)
 
         elif mode == "ext":     # older strata not found in the shallower borehole: they end
@@ -756,8 +763,12 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
             xend = trough_end(T, xO, xY)
             wO = make_taper(xO, xend)
             ctop = T
-            cbot = lambda x, T=T, Bt=Bt, wO=wO: T(x) + (Bt(x) - T(x)) * wO(x)
-            cf = lambda x, f, T=T, Bt=Bt, wO=wO: T(x) + (Bt(x) - T(x)) * f * wO(x)
+
+            def cbot(x, T=T, Bt=Bt, wO=wO):
+                return T(x) + (Bt(x) - T(x)) * wO(x)
+
+            def cf(x, f, T=T, Bt=Bt, wO=wO):
+                return T(x) + (Bt(x) - T(x)) * f * wO(x)
             xe = end_samples(xO, xend)
             polys = (fan(Ag, LA, dA[0], dA[1], xe, cf) + fan(Bg, LB, dB[0], dB[1], xe, cf))
 
@@ -766,7 +777,9 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
             amp = min(0.05 * span, 10.0)
             xl = [x for x in xs if x < xm - amp - 1e-9]
             xr = [x for x in xs if x > xm + amp + 1e-9]
-            cq = lambda x, f, T=T, Bt=Bt: T(x) + (Bt(x) - T(x)) * f
+
+            def cq(x, f, T=T, Bt=Bt):
+                return T(x) + (Bt(x) - T(x)) * f
             nT = max(3, int(abs(Bt(xm) - T(xm)) / 16.0))
             verts = ([(0.0, 0.0)] + [(k / (2.0 * nT), 1.0 if k % 2 else -1.0)
                                      for k in range(1, 2 * nT)] + [(1.0, 0.0)])
@@ -807,37 +820,56 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
             ctop, cbot = T, Bt
             if young == "B":
                 xY, xO, YY, YO, GY, LY, GO, LO = xb, xa, YB, YA, Bg, LB, Ag, LA
-                Uw = lambda x: tau(x)
+
+                def Uw(x):
+                    return tau(x)
             else:
                 xY, xO, YY, YO, GY, LY, GO, LO = xa, xb, YA, YB, Ag, LA, Bg, LB
-                Uw = lambda x: 1.0 - tau(x)
-            U = lambda x, T=T, Bt=Bt, Uw=Uw: T(x) + (Bt(x) - T(x)) * Uw(x)
+
+                def Uw(x):
+                    return 1.0 - tau(x)
             if c == nP and bedrock is not None:
                 # nothing below: the older surface may run deeper than the drilled depth
                 yO0 = T(xO)
                 sU = max(bedrock, (Bt(xY) - yO0) / span, 0.0)
-                U = lambda x, T=T, yO0=yO0, sU=sU, xO=xO: max(yO0 + sU * abs(x - xO), T(x))
+
+                def U(x, T=T, yO0=yO0, sU=sU, xO=xO):
+                    return max(yO0 + sU * abs(x - xO), T(x))
+            else:
+                def U(x, T=T, Bt=Bt, Uw=Uw):
+                    return T(x) + (Bt(x) - T(x)) * Uw(x)
             term = not (c == nP and bedrock is not None)
             if term:
                 # older strata end at the deepest point of the younger base
                 xend = trough_end(U, xO, xY)
                 wO = make_taper(xO, xend)
-                cbot = lambda x, U=U, Bt=Bt, wO=wO: U(x) + (Bt(x) - U(x)) * wO(x)
+
+                def cbot(x, U=U, Bt=Bt, wO=wO):
+                    return U(x) + (Bt(x) - U(x)) * wO(x)
                 xdo = sorted(set(xd + end_samples(xO, xend)))
             else:
-                wO = lambda x: 1.0
+                def wO(x):
+                    return 1.0
                 xdo = xd
             for k, idx in enumerate(GY):
                 L = LY[idx]
-                ct = lambda x, y=YY(L.top): y + base(x) - base(xY)
-                cb = lambda x, y=YY(L.bottom): y + base(x) - base(xY)
+
+                def ct(x, y=YY(L.top)):
+                    return y + base(x) - base(xY)
+
+                def cb(x, y=YY(L.bottom)):
+                    return y + base(x) - base(xY)
                 top = (lambda x, T=T: T(x)) if k == 0 else (lambda x, ct=ct, T=T: max(ct(x), T(x)))
                 bot = U if k == len(GY) - 1 else (lambda x, cb=cb, U=U: min(cb(x), U(x)))
                 polys += [(p, L.litho, L.age) for p in _band(top, bot, xd)]
             for k, idx in enumerate(GO):
                 L = LO[idx]
-                ct = lambda x, y=YO(L.top): y + base(x) - base(xO)
-                cb = lambda x, y=YO(L.bottom): y + base(x) - base(xO)
+
+                def ct(x, y=YO(L.top)):
+                    return y + base(x) - base(xO)
+
+                def cb(x, y=YO(L.bottom)):
+                    return y + base(x) - base(xO)
                 top = U if k == 0 else (lambda x, ct=ct, U=U, wO=wO:
                                         U(x) + (max(ct(x), U(x)) - U(x)) * wO(x))
                 bot = ((lambda x, U=U, Bt=Bt, wO=wO: U(x) + (Bt(x) - U(x)) * wO(x))
@@ -865,8 +897,8 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
 def _quat_run(layers):
     """Number of leading layers of Quaternary age (not affected by tectonics)."""
     n = 0
-    for l in layers:
-        if l.age == (0, 0):
+    for lay in layers:
+        if lay.age == (0, 0):
             n += 1
         else:
             break
@@ -899,9 +931,10 @@ def fault_polygons(LA, LB, xa, xb, YA, YB, pos, dip_deg, direction, mA, mB, aspe
     Returns (polygons, ((x1, y1), (x2, y2)) fault line)."""
     span = xb - xa
     if G is None:
-        G = lambda x: YA(0.0) + (YB(0.0) - YA(0.0)) * (x - xa) / span
+        def G(x):
+            return YA(0.0) + (YB(0.0) - YA(0.0)) * (x - xa) / span
     y_ref = min(YA(top_depths[0]), YB(top_depths[1]))
-    y_bot = max(YA(max([l.bottom for l in LA] or [0.0])), YB(max([l.bottom for l in LB] or [0.0])))
+    y_bot = max(YA(max([lay.bottom for lay in LA] or [0.0])), YB(max([lay.bottom for lay in LB] or [0.0])))
     x_ft = xa + min(max(pos, 0.05), 0.95) * span
     sf = 0.0
     if direction and dip_deg < 89.5:
@@ -910,19 +943,26 @@ def fault_polygons(LA, LB, xa, xb, YA, YB, pos, dip_deg, direction, mA, mB, aspe
     allowed = min(x_ft - xa, xb - x_ft) - 2.0
     if allowed > 0 and abs(sf) * hy > allowed:
         sf = math.copysign(allowed / hy, sf)
-    xf = lambda y: x_ft + sf * (y - y_ref)
-    fval = lambda p: p[0] - xf(p[1])
+
+    def xf(y):
+        return x_ft + sf * (y - y_ref)
+
+    def fval(p):
+        return p[0] - xf(p[1])
     xd = sorted(set(round(xa + span * k / 120.0, 6) for k in range(121)))
     out = []
     for LL, Y_, x0, mm, keep_left in ((LA, YA, xa, mA, True), (LB, YB, xb, mB, False)):
-        for k, l in enumerate(LL):
-            ct = lambda x, y=Y_(l.top), x0=x0, mm=mm: y + mm * (x - x0)
-            cb = lambda x, y=Y_(l.bottom), x0=x0, mm=mm: y + mm * (x - x0)
+        for k, lay in enumerate(LL):
+            def ct(x, y=Y_(lay.top), x0=x0, mm=mm):
+                return y + mm * (x - x0)
+
+            def cb(x, y=Y_(lay.bottom), x0=x0, mm=mm):
+                return y + mm * (x - x0)
             top = G if k == 0 else (lambda x, ct=ct: max(ct(x), G(x)))
             for poly in _band(top, cb, xd):
                 clipped = _clip_halfplane(poly, fval, keep_negative=keep_left)
                 if len(clipped) >= 3:
-                    out.append((clipped, l.litho, l.age))
+                    out.append((clipped, lay.litho, lay.age))
     y_top = G(x_ft)
     return _no_overlap(out), ((xf(y_top), y_top), (xf(y_bot), y_bot))
 
@@ -1028,6 +1068,63 @@ def age_boundary_lines(items, offset=1.5):
     return lines
 
 
+def _top_envelope(polys, xl):
+    """y of the upper edge of the polygon union at each x (None where nothing is drawn)."""
+    res = []
+    for x in xl:
+        ymin = None
+        for item in polys:
+            pts = item[0]
+            m = len(pts)
+            for k in range(m):
+                x1, y1 = pts[k]
+                x2, y2 = pts[(k + 1) % m]
+                if (x1 <= x < x2) or (x2 <= x < x1):
+                    y = y1 + (y2 - y1) * (x - x1) / (x2 - x1)
+                    if ymin is None or y < ymin:
+                        ymin = y
+        res.append(ymin)
+    return res
+
+
+def _fill_cover_gap(rest, base, xa, xb, left, right):
+    """Where the older layers (rest) start below the base of the Quaternary cover, the
+    gap is filled with the nearest Quaternary layer (left / right = lowest Quaternary
+    layers of the two boreholes)."""
+    if not rest:
+        return []
+    span = xb - xa
+    xm = (xa + xb) / 2.0
+    xl = sorted(set([xa + span * k / 80.0 for k in range(81)] + [xm]))
+    xl[0] += 1e-6
+    xl[-1] -= 1e-6
+    env = _top_envelope(rest, xl)
+    ys = [e if e is not None else base(x) for x, e in zip(xl, env)]
+
+    def bot(x):
+        if x <= xl[0]:
+            return ys[0]
+        if x >= xl[-1]:
+            return ys[-1]
+        lo, hi = 0, len(xl) - 1
+        while hi - lo > 1:
+            mid = (lo + hi) // 2
+            if xl[mid] <= x:
+                lo = mid
+            else:
+                hi = mid
+        t = (x - xl[lo]) / (xl[hi] - xl[lo])
+        return ys[lo] + (ys[hi] - ys[lo]) * t
+
+    out = []
+    for lay, sel in ((left, [x for x in xl if x <= xm]), (right, [x for x in xl if x >= xm])):
+        if len(sel) < 2:
+            continue
+        for poly in _band(base, bot, sel):
+            out.append((poly, lay.litho, lay.age))
+    return out
+
+
 def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
                          use_dip=True, transitions=True, faults=None, aspect=1.0,
                          bedrock=None):
@@ -1042,8 +1139,12 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
         if xb - xa < 2:
             fences.append(None)
             continue
-        YA = lambda d, z=a.bh.z: Y(z - d)
-        YB = lambda d, z=b.bh.z: Y(z - d)
+
+        def YA(d, z=a.bh.z):
+            return Y(z - d)
+
+        def YB(d, z=b.bh.z):
+            return Y(z - d)
         LAk, LBk = LAY[id(a.bh)], LAY[id(b.bh)]
         faulted = k in faults
         sec = qsec = None
@@ -1109,10 +1210,53 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
             # Quaternary cover is a separate, continuous sequence (never terminated)
             out += fence_polygons(LA[:qa], LB[:qb], zA, zB, xa, xb, YA, YB,
                                   curvature, roundness, dips, transitions, None, True)
+            qlast = (LA[qa - 1], LB[qb - 1])
+            base = _contact_curve(xa, xb, YA(qlast[0].bottom), YB(qlast[1].bottom), dips,
+                                  curvature)
             LA, LB = LA[qa:], LB[qb:]
-        out += fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB,
-                              curvature, roundness, dips, transitions, bedrock)
+            rest = fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB,
+                                  curvature, roundness, dips, transitions, bedrock)
+            out += rest
+            out += _fill_cover_gap(rest, base, xa, xb, qlast[0], qlast[1])
+        else:
+            out += fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB,
+                                  curvature, roundness, dips, transitions, bedrock)
     return out, lines
+
+
+def section_geo(proj, vexag=0.0, curvature=0.6, roundness=0.6, merge_same=False,
+                use_dip=True, transitions=True, bedrock_dip=0.0):
+    """Geometry of a section in scene units (the same as build_section_scene(...).geo)
+    without creating any graphics."""
+    d0, d1 = proj[0].dist, proj[-1].dist
+    span = max(d1 - d0, 1.0)
+    kx = 1000.0 / span
+    zmax = max(p.bh.z for p in proj)
+    zmin = min(p.bh.z - p.bh.depth for p in proj)
+    ky = kx * vexag if vexag > 0 else 450.0 / max(zmax - zmin, 1.0)
+    cw = 16.0
+
+    def X(d):
+        return (d - d0) * kx
+
+    def Y(z):
+        return (zmax - z) * ky
+
+    LAY = {id(p.bh): clean_layers(p.bh.layers) for p in proj}
+    if merge_same:
+        LAY = {k: merge_same_lithology(v) for k, v in LAY.items()}
+    bedrock = (math.tan(math.radians(bedrock_dip)) * ky / kx) if bedrock_dip and bedrock_dip > 0 else None
+    polys, _ = correlation_polygons(proj, LAY, X, Y, cw, curvature, roundness, use_dip,
+                                    transitions, None, ky / kx, bedrock)
+    cols = []
+    for p in proj:
+        x = X(p.dist)
+        for L in LAY[id(p.bh)]:
+            y1, y2 = Y(p.bh.z - L.top), Y(p.bh.z - L.bottom)
+            cols.append(([(x - cw / 2, y1), (x + cw / 2, y1), (x + cw / 2, y2), (x - cw / 2, y2)],
+                         L.litho, L.age))
+    return {"polys": polys, "cols": cols, "d0": d0, "kx": kx, "ky": ky, "zmax": zmax,
+            "line": None, "strat_items": [], "terrain_items": []}
 
 
 def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
@@ -1143,8 +1287,12 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
     zr = max(zmax - zmin, 1.0)
     ky = kx * vexag if vexag > 0 else 450.0 / zr
     cw = 16.0
-    X = lambda d: (d - d0) * kx
-    Y = lambda z: (zmax - z) * ky
+
+    def X(d):
+        return (d - d0) * kx
+
+    def Y(z):
+        return (zmax - z) * ky
 
     # grid + elevation axis
     step = _nice_step(zr)
@@ -1213,6 +1361,7 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
             cols.append(([(x - cw / 2, y1), (x + cw / 2, y1), (x + cw / 2, y2), (x - cw / 2, y2)],
                          L.litho, L.age))
     strat_found = False
+    strat_items, terrain_items = [], []
     if strat_lines:
         for p in proj:
             x = X(p.dist)
@@ -1220,7 +1369,9 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
             for L1, L2 in zip(lays, lays[1:]):
                 if _age_disjoint(L1.age, L2.age):
                     yy = Y(p.bh.z - L2.top)
-                    scene.addLine(x - cw / 2, yy, x + cw / 2, yy, strat_pen).setZValue(3)
+                    it = scene.addLine(x - cw / 2, yy, x + cw / 2, yy, strat_pen)
+                    it.setZValue(3)
+                    strat_items.append(it)
                     strat_found = True
         try:
             for line in age_boundary_lines(list(polys) + cols):
@@ -1228,7 +1379,9 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
                 path.moveTo(line[0][0], line[0][1])
                 for (px, py) in line[1:]:
                     path.lineTo(px, py)
-                scene.addPath(path, strat_pen).setZValue(3)
+                it = scene.addPath(path, strat_pen)
+                it.setZValue(3)
+                strat_items.append(it)
                 strat_found = True
         except Exception as e:
             # stratigraphic boundary lines are optional decoration; the section is still drawn
@@ -1237,7 +1390,9 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
     # terrain
     pen = QPen(QColor(40, 120, 40), 1.6)
     for a, b in zip(proj, proj[1:]):
-        scene.addLine(X(a.dist), Y(a.bh.z), X(b.dist), Y(b.bh.z), pen).setZValue(3)
+        it = scene.addLine(X(a.dist), Y(a.bh.z), X(b.dist), Y(b.bh.z), pen)
+        it.setZValue(3)
+        terrain_items.append(it)
 
     # legend
     lx, ly = xr + 25, Y(zmax)
@@ -1249,15 +1404,16 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
         text(lit, lx + 24, ly + i * 20 - 1, 9, "l")
     if strat_found:
         yy = ly + len(used) * 20 + 8
-        scene.addLine(lx, yy + 7, lx + 18, yy + 7, strat_pen)
-        text("Stratigraphic boundary", lx + 24, yy - 1, 9, "l")
+        strat_items.append(scene.addLine(lx, yy + 7, lx + 18, yy + 7, strat_pen))
+        strat_items.append(text("Stratigraphic boundary", lx + 24, yy - 1, 9, "l"))
 
     text(f"Geological cross section - {len(proj)} boreholes, length {span:.1f} m, "
          f"V:H = {ky / kx:.1f}:1", ax, Y(zmax) - 82, 11, "l", True)
     scene.setSceneRect(scene.itemsBoundingRect().adjusted(-20, -20, 20, 20))
     # geometry of the section in scene units, used for the 3D fence model
     scene.geo = {"polys": list(polys), "cols": cols, "d0": d0, "kx": kx, "ky": ky,
-                 "zmax": zmax, "line": None}
+                 "zmax": zmax, "line": None,
+                 "strat_items": strat_items, "terrain_items": terrain_items}
     return scene
 
 

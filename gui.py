@@ -5,11 +5,11 @@ from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget, QGroupBox, QFormLayout,
     QComboBox, QCheckBox, QPushButton, QLabel, QPlainTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QDoubleSpinBox, QGraphicsView, QFileDialog,
-    QMessageBox, QLineEdit, QSplitter, QSpinBox,
+    QMessageBox, QSplitter, QSpinBox,
 )
 from qgis.core import (
     Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsGeometry,
-    QgsPointXY, QgsProject,
+    QgsPointXY, QgsProject, QgsRasterLayer,
 )
 from qgis.gui import QgsColorButton, QgsFileWidget, QgsMapTool, QgsRubberBand
 
@@ -70,7 +70,7 @@ class _View(QGraphicsView):
 
 
 class SectionViewer(QDialog):
-    def __init__(self, scene, parent=None, proj=None, rebuild=None, add3d=None):
+    def __init__(self, scene, parent=None, proj=None, rebuild=None, add3d=None, strat0=True):
         super().__init__(parent)
         self.add3d = add3d
         self.setWindowTitle("Geological cross section")
@@ -87,6 +87,14 @@ class SectionViewer(QDialog):
         if proj is not None and rebuild is not None and len(proj) > 1:
             side = QWidget()
             sl = QVBoxLayout(side)
+            self.chk_v_strat = QCheckBox("Show stratigraphic boundaries")
+            self.chk_v_strat.setChecked(strat0)
+            self.chk_v_ground = QCheckBox("Show ground surface line (green)")
+            self.chk_v_ground.setChecked(True)
+            self.chk_v_strat.toggled.connect(self._apply_visibility)
+            self.chk_v_ground.toggled.connect(self._apply_visibility)
+            sl.addWidget(self.chk_v_strat)
+            sl.addWidget(self.chk_v_ground)
             self.panel = FaultPanel(proj)
             sl.addWidget(self.panel)
             btn = QPushButton("Regenerate section")
@@ -111,6 +119,16 @@ class SectionViewer(QDialog):
         row.addStretch()
         row.addWidget(QLabel("Mouse wheel = zoom, drag = pan"))
         lay.addLayout(row)
+        self._apply_visibility()
+
+    def _apply_visibility(self, *_):
+        geo = getattr(self.scene, "geo", None)
+        if not geo or self.panel is None:
+            return
+        for it in geo.get("strat_items", []):
+            it.setVisible(self.chk_v_strat.isChecked())
+        for it in geo.get("terrain_items", []):
+            it.setVisible(self.chk_v_ground.isChecked())
 
     def _add3d(self):
         n = self.add3d(self.scene.geo)
@@ -126,6 +144,7 @@ class SectionViewer(QDialog):
         old = self.scene
         self.scene = scene
         self.view.setScene(scene)
+        self._apply_visibility()
         self.fit()
         old.deleteLater()
 
@@ -452,7 +471,47 @@ class BoreholeDialog(QDialog):
         fa.addRow(bg)
         lay.addWidget(ga)
 
-        gb = QGroupBox("B) Fence model - 3D from 2D cross sections")
+        gn = QGroupBox("B) Fence model - network of 2D sections between neighbouring boreholes")
+        fn = QFormLayout(gn)
+        self.cb_net = QComboBox()
+        self.cb_net.addItems(["Grid-like (nearest borehole in each direction)",
+                              "Delaunay triangulation"])
+        fn.addRow("Connect boreholes", self.cb_net)
+        self.sp_maxe = QDoubleSpinBox()
+        self.sp_maxe.setRange(0, 100000)
+        self.sp_maxe.setSpecialValueText("auto")
+        self.sp_maxe.setSuffix(" m")
+        fn.addRow("Longest panel", self.sp_maxe)
+        self.sp_pw = QDoubleSpinBox()
+        self.sp_pw.setRange(0.2, 50)
+        self.sp_pw.setValue(1.0)
+        self.sp_pw.setSuffix(" m")
+        fn.addRow("Panel thickness", self.sp_pw)
+        self.sp_nslab = QDoubleSpinBox()
+        self.sp_nslab.setRange(0.5, 200)
+        self.sp_nslab.setValue(5.0)
+        self.sp_nslab.setSuffix(" m")
+        fn.addRow("Slab length (horizontal resolution)", self.sp_nslab)
+        self.sp_colw = QDoubleSpinBox()
+        self.sp_colw.setRange(0, 50)
+        self.sp_colw.setValue(3.0)
+        self.sp_colw.setSuffix(" m")
+        self.sp_colw.setSpecialValueText("off")
+        fn.addRow("Borehole columns (black pillars), width", self.sp_colw)
+        drow = QHBoxLayout()
+        self.cb_dem = QComboBox()
+        drow.addWidget(self.cb_dem, 1)
+        bdem = QPushButton("Refresh")
+        bdem.clicked.connect(self._refresh_dem)
+        drow.addWidget(bdem)
+        fn.addRow("DEM (ground between boreholes)", drow)
+        self._refresh_dem()
+        bnet = QPushButton("Create network fence model")
+        bnet.clicked.connect(self.build_network)
+        fn.addRow(bnet)
+        lay.addWidget(gn)
+
+        gb = QGroupBox("C) Custom sections - 3D from selected 2D cross sections")
         fb = QFormLayout(gb)
         fb.addRow(QLabel("Add sections with 'Add to 3D fence model' in the section window,\n"
                          "or create perpendicular E-W and N-S sections automatically:"))
@@ -650,11 +709,11 @@ class BoreholeDialog(QDialog):
 
         def build(faults, proj=proj, colors=colors, opts=opts, bedrock=bedrock, strat=strat,
                   line=line):
-            sc = core.build_section_scene(proj, colors, *opts, faults, bedrock, strat)
+            sc = core.build_section_scene(proj, colors, *opts, faults, bedrock, True)
             sc.geo["line"] = line
             return sc
 
-        v = SectionViewer(build(None), self, proj, build, self.add_fence)
+        v = SectionViewer(build(None), self, proj, build, self.add_fence, strat)
         self.viewers.append(v)
         v.show()
 
@@ -706,6 +765,62 @@ class BoreholeDialog(QDialog):
         count, n, err = model3d.build_layers(prisms, self.current_colors(), "3D grid model")
         self._show_3d_result(count, n, err,
                              f"Grid model ({info['cells']} cells of {info['cell']:.1f} m)")
+
+    def _refresh_dem(self):
+        self.cb_dem.clear()
+        self.cb_dem.addItem("(none - straight line between the borehole collars)", None)
+        for lyr in QgsProject.instance().mapLayers().values():
+            if isinstance(lyr, QgsRasterLayer):
+                self.cb_dem.addItem(lyr.name(), lyr.id())
+
+    def _dem_func(self):
+        lid = self.cb_dem.currentData()
+        if not lid:
+            return None
+        lyr = QgsProject.instance().mapLayer(lid)
+        if lyr is None:
+            return None
+        tr = QgsCoordinateTransform(QgsCoordinateReferenceSystem(core.CRS_SJTSK), lyr.crs(),
+                                    QgsProject.instance())
+        prov = lyr.dataProvider()
+
+        def f(x, y):
+            try:
+                v, ok = prov.sample(tr.transform(QgsPointXY(x, y)), 1)
+                return v if ok else None
+            except Exception:
+                return None
+        return f
+
+    def build_network(self):
+        if not self._need_data():
+            return
+        bhs = [b for b in self._bh_subset() if b.layers]
+        edges = model3d.neighbour_edges(
+            bhs, "delaunay" if self.cb_net.currentIndex() == 1 else "grid", self.sp_maxe.value())
+        if not edges:
+            QMessageBox.warning(self, "3D fence model",
+                                "No pair of neighbouring boreholes found - increase the longest panel.")
+            return
+        colors, opts, bedrock, _strat = self._section_options()
+
+        def make_geo(A, B, L):
+            proj = [core.Projected(A, 0.0, 0.0), core.Projected(B, L, 0.0)]
+            return core.section_geo(proj, opts[0], opts[3], opts[4], opts[5], opts[6], opts[7],
+                                    bedrock)
+        dem = self._dem_func()
+        try:
+            prisms = model3d.network_prisms(
+                bhs, edges, make_geo, self.sp_pw.value(), self.sp_nslab.value(),
+                self.sp_dz.value(), dem, self.sp_colw.value())
+        except Exception as e:
+            QMessageBox.warning(self, "3D fence model", str(e))
+            return
+        cols = dict(colors)
+        cols["Borehole"] = core.QColor(20, 20, 20)
+        count, n, err = model3d.build_layers(prisms, cols, "3D fence network")
+        self._show_3d_result(count, n, err, f"Fence network ({len(edges)} panels"
+                                            + (", DEM" if dem else "") + ")")
 
     def add_fence(self, geo):
         if not geo.get("line"):
