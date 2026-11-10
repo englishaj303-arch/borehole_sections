@@ -13,7 +13,7 @@ from qgis.core import (
 )
 from qgis.gui import QgsColorButton, QgsFileWidget, QgsMapTool, QgsRubberBand
 
-from . import core, model3d
+from . import core, logs, model3d
 
 
 # ---------------------------------------------------------------- map tool
@@ -70,10 +70,11 @@ class _View(QGraphicsView):
 
 
 class SectionViewer(QDialog):
-    def __init__(self, scene, parent=None, proj=None, rebuild=None, add3d=None, strat0=True):
+    def __init__(self, scene, parent=None, proj=None, rebuild=None, add3d=None, strat0=True,
+                 title="Geological cross section"):
         super().__init__(parent)
         self.add3d = add3d
-        self.setWindowTitle("Geological cross section")
+        self.setWindowTitle(title)
         self.resize(1550, 780)
         self.scene = scene
         self.rebuild = rebuild
@@ -193,7 +194,9 @@ class SectionViewer(QDialog):
             return
         w = QPdfWriter(path)
         w.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
-        w.setPageOrientation(QPageLayout.Orientation.Landscape)
+        r = self.scene.sceneRect()
+        w.setPageOrientation(QPageLayout.Orientation.Portrait if r.height() > r.width()
+                             else QPageLayout.Orientation.Landscape)
         p = QPainter(w)
         target = QRectF(0, 0, p.device().width(), p.device().height())
         self.scene.render(p, target, self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
@@ -269,7 +272,7 @@ class BoreholeDialog(QDialog):
         self.iface = iface
         self.canvas = iface.mapCanvas()
         self.setWindowTitle("Borehole Geology Sections")
-        self.resize(640, 640)
+        self.resize(720, 680)
         self.boreholes, self.colors, self.section_pts = [], {}, None
         self.hdr = {"bh": None, "ly": None}
         self.line_rb = None
@@ -283,9 +286,10 @@ class BoreholeDialog(QDialog):
         lay = QVBoxLayout(self)
         lay.addWidget(tabs)
         tabs.addTab(self._tab_data(), "1. Data")
-        tabs.addTab(self._tab_colors(), "2. Lithology colours")
-        tabs.addTab(self._tab_2d(), "3. 2D section")
-        tabs.addTab(self._tab_3d(), "4. 3D model")
+        tabs.addTab(self._tab_colors(), "2. Lithology (colour, grain size)")
+        tabs.addTab(self._tab_logs(), "3. Borehole logs")
+        tabs.addTab(self._tab_2d(), "4. 2D section")
+        tabs.addTab(self._tab_3d(), "5. 3D model")
 
     # ---- tabs
     def _file_group(self, title, fields, key):
@@ -358,11 +362,57 @@ class BoreholeDialog(QDialog):
     def _tab_colors(self):
         w = QWidget()
         lay = QVBoxLayout(w)
-        self.tbl = QTableWidget(0, 2)
-        self.tbl.setHorizontalHeaderLabels(["Lithology", "Colour"])
+        self.tbl = QTableWidget(0, 3)
+        self.tbl.setHorizontalHeaderLabels(["Lithology", "Colour", "Grain size"])
         self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         lay.addWidget(self.tbl)
-        lay.addWidget(QLabel("Colours are filled after loading data and used in 2D and 3D."))
+        lay.addWidget(QLabel("Colours and grain sizes are filled after loading data. Colours are used in\n"
+                             "all outputs; the grain size (guessed from the name - check it) is used\n"
+                             "in the sedimentary records of tab 3."))
+        return w
+
+    def _tab_logs(self):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        box = QGroupBox("Boreholes (one to four)")
+        form = QFormLayout(box)
+        self.cb_logs = []
+        for i in range(4):
+            cb = QComboBox()
+            cb.addItem("(none)", None)
+            self.cb_logs.append(cb)
+            form.addRow(f"Borehole {i + 1}", cb)
+        b_sel = QPushButton("Take boreholes selected in the 'Boreholes' map layer (max. 4)")
+        b_sel.clicked.connect(self.logs_from_selection)
+        form.addRow(b_sel)
+        lay.addWidget(box)
+
+        opt = QGroupBox("Settings")
+        of = QFormLayout(opt)
+        self.cb_logmode = QComboBox()
+        self.cb_logmode.addItem("Depth below the surface [m]", "depth")
+        self.cb_logmode.addItem("Altitude [m a.s.l.]", "alt")
+        of.addRow("Vertical axis", self.cb_logmode)
+        self.sp_logscale = QDoubleSpinBox()
+        self.sp_logscale.setRange(0, 500)
+        self.sp_logscale.setSpecialValueText("auto")
+        self.sp_logscale.setSuffix(" px/m")
+        of.addRow("Vertical scale", self.sp_logscale)
+        self.chk_logpat = QCheckBox("Hatching by grain size in the profiles")
+        self.chk_logpat.setChecked(True)
+        of.addRow(self.chk_logpat)
+        self.chk_recsep = QCheckBox("Sedimentary records: a separate window for each borehole")
+        of.addRow(self.chk_recsep)
+        lay.addWidget(opt)
+
+        b1 = QPushButton("Create profiles (columns with layer descriptions)")
+        b1.clicked.connect(self.create_profiles)
+        b2 = QPushButton("Create sedimentary records (grain size + rock type legend)")
+        b2.clicked.connect(self.create_records)
+        lay.addWidget(b1)
+        lay.addWidget(b2)
+        lay.addWidget(QLabel("Colours and grain sizes of the rocks are set in tab 2."))
+        lay.addStretch()
         return w
 
     def _tab_2d(self):
@@ -616,7 +666,7 @@ class BoreholeDialog(QDialog):
         lithos = core.lithologies(self.boreholes)
         defaults = core.default_colors(lithos)
         self.tbl.setRowCount(len(lithos))
-        self.btns = {}
+        self.btns, self.grain_boxes = {}, {}
         for i, lit in enumerate(lithos):
             it = QTableWidgetItem(lit)
             it.setFlags(Qt.ItemFlag.ItemIsEnabled)
@@ -625,9 +675,25 @@ class BoreholeDialog(QDialog):
             cb.setColor(defaults[lit])
             self.tbl.setCellWidget(i, 1, cb)
             self.btns[lit] = cb
+            gb = QComboBox()
+            for g in logs.GRAINS:
+                gb.addItem(logs.GRAIN_LABELS[g], g)
+            gb.setCurrentIndex(logs.GRAINS.index(logs.guess_grain(lit)))
+            self.tbl.setCellWidget(i, 2, gb)
+            self.grain_boxes[lit] = gb
+        for i, cb in enumerate(self.cb_logs):
+            cb.clear()
+            cb.addItem("(none)", None)
+            for b in self.boreholes:
+                cb.addItem(b.name, b.name)
+            if i == 0 and self.boreholes:
+                cb.setCurrentIndex(1)
 
     def current_colors(self):
         return {lit: b.color() for lit, b in getattr(self, "btns", {}).items()}
+
+    def current_grains(self):
+        return {lit: b.currentData() for lit, b in getattr(self, "grain_boxes", {}).items()}
 
     def _need_data(self):
         if not self.boreholes:
@@ -639,6 +705,73 @@ class BoreholeDialog(QDialog):
         if self._need_data():
             QgsProject.instance().addMapLayer(core.make_borehole_point_layer(self.boreholes))
             self.iface.mapCanvas().zoomToFullExtent()
+
+    # ---- borehole logs
+    def logs_from_selection(self):
+        if not self._need_data():
+            return
+        names = []
+        for lyr in QgsProject.instance().mapLayersByName("Boreholes"):
+            if hasattr(lyr, "selectedFeatures"):
+                names += [str(f["name"]) for f in lyr.selectedFeatures()]
+        names = [n for n in dict.fromkeys(names) if any(b.name == n for b in self.boreholes)]
+        if not names:
+            QMessageBox.information(self, "Selection",
+                                    "Select boreholes in the 'Boreholes' map layer "
+                                    "(tab 1: Add boreholes to map).")
+            return
+        if len(names) > 4:
+            QMessageBox.information(self, "Selection",
+                                    f"{len(names)} boreholes are selected - the first four are used.")
+        for i, cb in enumerate(self.cb_logs):
+            cb.setCurrentIndex(cb.findData(names[i]) if i < len(names) else 0)
+
+    def _log_boreholes(self):
+        if not self._need_data():
+            return []
+        picked = []
+        for cb in self.cb_logs:
+            name = cb.currentData()
+            if name is not None and name not in [b.name for b in picked]:
+                picked += [b for b in self.boreholes if b.name == name][:1]
+        picked = [b for b in picked if b.layers]
+        if not picked:
+            QMessageBox.warning(self, "No borehole", "Select at least one borehole with layers.")
+        return picked
+
+    def _log_style(self, bhs):
+        lithos = core.lithologies(bhs)
+        colors = {lit: c.name() for lit, c in self.current_colors().items()}
+        grains = self.current_grains()
+        for lit in lithos:
+            grains.setdefault(lit, logs.guess_grain(lit))
+        return colors, grains
+
+    def _show_log(self, cmds, title):
+        v = SectionViewer(logs.to_scene(cmds), self, title=title)
+        self.viewers.append(v)
+        v.show()
+
+    def create_profiles(self):
+        bhs = self._log_boreholes()
+        if not bhs:
+            return
+        colors, grains = self._log_style(bhs)
+        cmds = logs.build_profiles(bhs, colors, grains, self.cb_logmode.currentData(),
+                                   self.sp_logscale.value(), logs.qt_measure(),
+                                   self.chk_logpat.isChecked())
+        self._show_log(cmds, "Borehole profiles: " + ", ".join(b.name for b in bhs))
+
+    def create_records(self):
+        bhs = self._log_boreholes()
+        if not bhs:
+            return
+        colors, grains = self._log_style(bhs)
+        mode, scale = self.cb_logmode.currentData(), self.sp_logscale.value()
+        groups = [[b] for b in bhs] if self.chk_recsep.isChecked() else [bhs]
+        for grp in groups:
+            cmds = logs.build_records(grp, colors, grains, scale, logs.qt_measure(), mode=mode)
+            self._show_log(cmds, "Sedimentary record: " + ", ".join(b.name for b in grp))
 
     # ---- 2D
     def draw_line(self):

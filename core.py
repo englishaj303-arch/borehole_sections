@@ -267,7 +267,7 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
 # ------------------------------------------------------------------- colours
 _KEYWORDS = [
     (("jil", "clay"), "#8b5a2b"), (("jilovec",), "#6b4423"),
-    (("pisek", "sand"), "#f2d16b"), (("stk", "gravel"), "#e0a458"),
+    (("pisek", "sand"), "#f2d16b"), (("sterk", "stk", "gravel"), "#e0a458"),
     (("hlina", "silt", "loam"), "#c9a66b"), (("navaz", "fill"), "#9a9a9a"),
     (("skal", "rock", "granit", "rula", "bridlic"), "#6e7b8b"),
     (("pisk", "sandstone"), "#e6c27a"), (("slin", "sinter"), "#a0a98f"),
