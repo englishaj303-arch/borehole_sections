@@ -4,7 +4,7 @@ qgisMinimumVersion=4.0
 qgisMaximumVersion=4.99
 description=Borehole logs, sedimentary records, geological cross sections (2D) and 3D lithology models from borehole data in two CSV files (S-JTSK, WGS84, ETRS89)
 about=Borehole Geology Sections turns borehole logs into geological models. Load two CSV files - a table of boreholes (name, X, Y, ground altitude, total depth) and a table of layers (borehole name, depth from, depth to, lithology, optional stratigraphy) - and the plugin shows the boreholes on the map, with coordinates in S-JTSK (EPSG:5514, also when written without the minus sign), WGS84 or ETRS89. Borehole logs: pick one to four boreholes and draw their profiles side by side with a depth ruler and layer descriptions, or draw sedimentary records in which the column width follows the grain size (clay, silt, sand, gravel) and an Index legend lists the rock types; both can be exported to PNG, SVG and PDF. 2D cross sections: draw a section line on the map (or use a selected line feature) and the plugin projects nearby boreholes onto it and correlates layers of the same lithology between neighbouring boreholes, with dip-following boundaries, pinch-outs, lateral lithology changes, optional bedrock surface, highlighted boundaries between stratigraphic sequences and user-defined faults. Vertical exaggeration and colours per lithology are adjustable, and sections can be exported to PNG, SVG and PDF. 3D models: build either a grid model (blocks interpolated from the nearest boreholes) or a fence model made of 2D cross sections (chosen manually or generated automatically as N-S and E-W families) as extruded polygon layers, ready to open in the QGIS 3D Map View. Intended for geologists, hydrogeologists and engineering-geology work with borehole data.
-version=0.11.1
+version=0.11.4
 author=Jan Hlinský
 email=englishaj303@gmail.com
 category=Plugins
@@ -12,7 +12,10 @@ tracker=https://github.com/englishaj303-arch/borehole_sections/issues
 icon=icon.png
 repository=https://github.com/englishaj303-arch/borehole_sections
 homepage=https://github.com/englishaj303-arch/borehole_sections
-changelog=0.11.1 - metadata.txt changes: qgisMaximumVersion=4.99 instead of the deprecated supportsQt6
+changelog=0.11.4 - plugin window fits on the screen (size limited to 90 percent of the screen, tabs scroll when the window is small); removed the grey stratigraphy help text from tab 1 (it stays as a tooltip of the Stratigraphy field); smaller log window at the bottom of tab 1
+	0.11.3 - 2D section: new checkbox for hatching by grain size in the section window; stratigraphic boundaries and the ground surface line are switched off by default
+	0.11.2 - small bug fixes
+	0.11.1 - metadata.txt changes: qgisMaximumVersion=4.99 instead of the deprecated supportsQt6
 	0.11.0 - new tab 3 Borehole logs (profiles of 1-4 boreholes and sedimentary records with grain size); 2D section is now tab 4 and 3D model tab 5; grain size column in tab 2; gravel (štěrk) recognised in default colours
 	0.10.1 - fixed gaps between Quarternary and older layers in 2D sections
 	0.10 - added stratigraphy boundary function and improved rendering of layer splitting
@@ -33,3 +36,4 @@ changelog=0.11.1 - metadata.txt changes: qgisMaximumVersion=4.99 instead of the 
 experimental=True
 deprecated=False
 tags=geology,borehole,cross section,3D,S-JTSK
+

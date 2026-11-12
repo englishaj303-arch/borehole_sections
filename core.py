@@ -1,7 +1,9 @@
 """Data handling, section drawing and 3D layer creation (no GUI widgets)."""
 import csv
+import difflib
 import io
 import math
+import re
 import unicodedata
 from dataclasses import dataclass, field
 
@@ -110,6 +112,9 @@ STRAT_NAMES = ["kvarter", "neogen", "paleogen", "krida", "jura", "trias", "perm"
                "karbon", "devon", "silur", "ordovik", "kambrium", "proterozoikum"]
 STRAT_LABELS = ["kvartér", "neogén", "paleogén", "křída", "jura", "trias", "perm",
                 "karbon", "devon", "silur", "ordovik", "kambrium", "proterozoikum"]
+STRAT_ENGLISH = ["Quaternary", "Neogene", "Palaeogene", "Cretaceous", "Jurassic", "Triassic",
+                 "Permian", "Carboniferous", "Devonian", "Silurian", "Ordovician", "Cambrian",
+                 "Proterozoic"]
 _STRAT_TERMS = {n: (i, i) for i, n in enumerate(STRAT_NAMES)}
 _STRAT_TERMS.update({
     "tercier": (1, 2), "mesozoikum": (3, 5), "paleozoikum": (6, 11), "permokarbon": (6, 7),
@@ -118,12 +123,17 @@ _STRAT_TERMS.update({
     "jurassic": (4, 4), "triassic": (5, 5), "permian": (6, 6), "carboniferous": (7, 7),
     "devonian": (8, 8), "silurian": (9, 9), "ordovician": (10, 10), "cambrian": (11, 11),
     "proterozoic": (12, 12), "tertiary": (1, 2), "mesozoic": (3, 5), "paleozoic": (6, 11),
+    # British spelling
+    "palaeogene": (2, 2), "palaeozoic": (6, 11),
 })
 
 
 def parse_strat(text):
-    """'neogén', 'terciér', 'křída-jura' ... -> (youngest_idx, oldest_idx) or None."""
-    t = _norm(text)
+    """'neogén', 'Terciér', 'Cretaceous', 'křída-jura' ... -> (youngest_idx, oldest_idx) or None.
+
+    Upper / lower case and diacritics are ignored (é = e, ř = r, ...).  A letter that was
+    lost or garbled by a machine error ('k?ida', 'kida') is tolerated as well."""
+    t = _norm(str(text).replace("\ufffd", "?"))
     if not t:
         return None
     found = []
@@ -131,6 +141,15 @@ def parse_strat(text):
         if name in t:
             found.append(_STRAT_TERMS[name])
             t = t.replace(name, " ")
+    # what is left: words with a lost or garbled character
+    for word in re.findall(r"[a-z?*]{4,}", t):
+        rx = re.compile("^" + "".join("." if c in "?*" else re.escape(c) for c in word) + "$")
+        hits = [n for n in _STRAT_TERMS if rx.match(n)]
+        if not hits:
+            hits = difflib.get_close_matches(word.replace("?", "").replace("*", ""),
+                                             list(_STRAT_TERMS), n=1, cutoff=0.8)
+        if hits:
+            found.append(_STRAT_TERMS[hits[0]])
     if not found:
         return None
     return (min(a for a, _ in found), max(b for _, b in found))
@@ -1259,10 +1278,19 @@ def section_geo(proj, vexag=0.0, curvature=0.6, roundness=0.6, merge_same=False,
             "line": None, "strat_items": [], "terrain_items": []}
 
 
+def hatch_brush(grain):
+    """Translucent hatching for a grain class (clay, silt, sand, gravel) - the same
+    hatch styles as in the borehole profiles (logs.to_scene); None for an unknown class."""
+    styles = {"clay": Qt.BrushStyle.HorPattern, "silt": Qt.BrushStyle.Dense5Pattern,
+              "sand": Qt.BrushStyle.Dense6Pattern, "gravel": Qt.BrushStyle.DiagCrossPattern}
+    style = styles.get(grain)
+    return QBrush(QColor(0, 0, 0, 110), style) if style is not None else None
+
+
 def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
                         curvature=0.6, roundness=0.6, merge_same=False,
                         use_dip=True, transitions=True, faults=None, bedrock_dip=0.0,
-                        strat_lines=True):
+                        strat_lines=True, grains=None):
     """Return a QGraphicsScene with the cross section. vexag<=0 -> auto."""
     scene = QGraphicsScene()
     scene.setBackgroundBrush(QBrush(Qt.GlobalColor.white))
@@ -1315,6 +1343,16 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
     if merge_same:
         LAY = {k: merge_same_lithology(v) for k, v in LAY.items()}
 
+    hatch_items = []        # hatching by grain size, shown or hidden in the section window
+    no_pen = QPen(Qt.PenStyle.NoPen)
+
+    def add_hatch(item_poly, lit, z):
+        brush = hatch_brush(grains.get(lit)) if grains else None
+        if brush is not None:
+            h = item_poly(brush)
+            h.setZValue(z)
+            hatch_items.append(h)
+
     # correlation polygons
     polys = []
     if correlate:
@@ -1324,9 +1362,10 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
         for pts, lit, age in polys:
             c = QColor(colors.get(lit, QColor(Qt.GlobalColor.gray)))
             c.setAlpha(170)
-            it = scene.addPolygon(QPolygonF([QPointF(x, y) for x, y in pts]),
-                                  QPen(c.darker(150), 0.6), QBrush(c))
+            poly = QPolygonF([QPointF(x, y) for x, y in pts])
+            it = scene.addPolygon(poly, QPen(c.darker(150), 0.6), QBrush(c))
             it.setZValue(0)
+            add_hatch(lambda b, poly=poly: scene.addPolygon(poly, no_pen, b), lit, 0.5)
         for n_f, ((x1, y1), (x2, y2)) in enumerate(flines, start=1):
             ln = scene.addLine(x1, y1, x2, y2, QPen(QColor(170, 0, 0), 2.6))
             ln.setZValue(4)
@@ -1343,6 +1382,9 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
             r = scene.addRect(x - cw / 2, Y(bh.z - L.top), cw, (L.bottom - L.top) * ky,
                               QPen(Qt.GlobalColor.black, 0.8), QBrush(c))
             r.setZValue(2)
+            add_hatch(lambda b, x=x, L=L: scene.addRect(x - cw / 2, Y(bh.z - L.top), cw,
+                                                        (L.bottom - L.top) * ky, no_pen, b),
+                      L.litho, 2.5)
         if labels:
             text(bh.name, x, Y(bh.z) - 36, 9, "c", True)
             text(f"{bh.z:.2f}", x, Y(bh.z) - 20, 8)
@@ -1401,6 +1443,7 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
     for i, lit in enumerate(used):
         scene.addRect(lx, ly + i * 20, 18, 14, QPen(Qt.GlobalColor.black, 0.8),
                       QBrush(colors.get(lit, QColor(Qt.GlobalColor.gray))))
+        add_hatch(lambda b, i=i: scene.addRect(lx, ly + i * 20, 18, 14, no_pen, b), lit, 0.5)
         text(lit, lx + 24, ly + i * 20 - 1, 9, "l")
     if strat_found:
         yy = ly + len(used) * 20 + 8
@@ -1413,7 +1456,8 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
     # geometry of the section in scene units, used for the 3D fence model
     scene.geo = {"polys": list(polys), "cols": cols, "d0": d0, "kx": kx, "ky": ky,
                  "zmax": zmax, "line": None,
-                 "strat_items": strat_items, "terrain_items": terrain_items}
+                 "strat_items": strat_items, "terrain_items": terrain_items,
+                 "hatch_items": hatch_items}
     return scene
 
 

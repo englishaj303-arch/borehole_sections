@@ -1,11 +1,12 @@
 from qgis.PyQt.QtCore import Qt, QRectF, pyqtSignal
-from qgis.PyQt.QtGui import (QColor, QImage, QPainter, QPdfWriter, QPageSize, QPageLayout)
+from qgis.PyQt.QtGui import (QColor, QGuiApplication, QImage, QPainter, QPdfWriter, QPageSize,
+                             QPageLayout)
 from qgis.PyQt.QtSvg import QSvgGenerator
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget, QGroupBox, QFormLayout,
     QComboBox, QCheckBox, QPushButton, QLabel, QPlainTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QDoubleSpinBox, QGraphicsView, QFileDialog,
-    QMessageBox, QSplitter, QSpinBox,
+    QMessageBox, QSplitter, QSpinBox, QScrollArea, QFrame,
 )
 from qgis.core import (
     Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsGeometry,
@@ -70,12 +71,11 @@ class _View(QGraphicsView):
 
 
 class SectionViewer(QDialog):
-    def __init__(self, scene, parent=None, proj=None, rebuild=None, add3d=None, strat0=True,
+    def __init__(self, scene, parent=None, proj=None, rebuild=None, strat0=True,
                  title="Geological cross section"):
         super().__init__(parent)
-        self.add3d = add3d
         self.setWindowTitle(title)
-        self.resize(1550, 780)
+        _fit_to_screen(self, 1550, 780)
         self.scene = scene
         self.rebuild = rebuild
         self.view = _View(scene)
@@ -91,11 +91,15 @@ class SectionViewer(QDialog):
             self.chk_v_strat = QCheckBox("Show stratigraphic boundaries")
             self.chk_v_strat.setChecked(strat0)
             self.chk_v_ground = QCheckBox("Show ground surface line (green)")
-            self.chk_v_ground.setChecked(True)
+            self.chk_v_ground.setChecked(False)
+            self.chk_v_hatch = QCheckBox("Hatching by grain size (as in the profiles)")
+            self.chk_v_hatch.setChecked(False)
             self.chk_v_strat.toggled.connect(self._apply_visibility)
             self.chk_v_ground.toggled.connect(self._apply_visibility)
+            self.chk_v_hatch.toggled.connect(self._apply_visibility)
             sl.addWidget(self.chk_v_strat)
             sl.addWidget(self.chk_v_ground)
+            sl.addWidget(self.chk_v_hatch)
             self.panel = FaultPanel(proj)
             sl.addWidget(self.panel)
             btn = QPushButton("Regenerate section")
@@ -111,12 +115,6 @@ class SectionViewer(QDialog):
             b = QPushButton(label)
             b.clicked.connect(fn)
             row.addWidget(b)
-        if add3d is not None:
-            b3 = QPushButton("Add to 3D fence model")
-            b3.clicked.connect(self._add3d)
-            row.addWidget(b3)
-            self.lbl_add = QLabel("")
-            row.addWidget(self.lbl_add)
         row.addStretch()
         row.addWidget(QLabel("Mouse wheel = zoom, drag = pan"))
         lay.addLayout(row)
@@ -130,10 +128,8 @@ class SectionViewer(QDialog):
             it.setVisible(self.chk_v_strat.isChecked())
         for it in geo.get("terrain_items", []):
             it.setVisible(self.chk_v_ground.isChecked())
-
-    def _add3d(self):
-        n = self.add3d(self.scene.geo)
-        self.lbl_add.setText(f"added - {n} section(s) in the 3D fence model")
+        for it in geo.get("hatch_items", []):
+            it.setVisible(self.chk_v_hatch.isChecked())
 
     def regenerate(self):
         faults = self.panel.faults() or None
@@ -266,13 +262,52 @@ LY_FIELDS = [("name", "Borehole name", ["name", "borehole", "vrt", "nazev", "id"
              ("strat", "Stratigraphy (optional)", ["strat", "period", "perioda", "utvar", "vek", "age", "system", "geolog"])]
 
 
+def _fit_to_screen(widget, width, height):
+    """Resize a window to the wanted size, but never larger than 90 % of the screen."""
+    try:
+        scr = widget.screen() or QGuiApplication.primaryScreen()
+        area = scr.availableGeometry()
+        width, height = min(width, int(area.width() * 0.9)), min(height, int(area.height() * 0.85))
+    except (AttributeError, RuntimeError):
+        pass
+    widget.resize(width, height)
+
+
+def _scrolled(widget):
+    """Tab content in a scroll area, so a tall tab never makes the window taller than the screen."""
+    sa = QScrollArea()
+    sa.setWidgetResizable(True)
+    sa.setFrameShape(QFrame.Shape.NoFrame)
+    sa.setWidget(widget)
+    return sa
+
+
+def _strat_help():
+    cz = ", ".join(f"{c} ({e})" for c, e in zip(core.STRAT_LABELS, core.STRAT_ENGLISH))
+    return (
+        "Stratigraphy (optional): the age of each layer. It is used to correlate the layers and "
+        "to decide what is older (bedrock) and what is younger. Periods from the youngest to "
+        "the oldest: " + cz + ".\n"
+        "Also accepted: terciér (Tertiary = Neogene + Palaeogene), mesozoikum (Mesozoic = "
+        "Cretaceous + Jurassic + Triassic), paleozoikum (Palaeozoic = Permian, Carboniferous, "
+        "Devonian, Silurian, Ordovician, Cambrian), permokarbon (Permian + Carboniferous).\n"
+        "It does not matter whether the first letter is upper or lower case; 'e' instead of 'é' "
+        "and 'r' instead of 'ř' (krida) are accepted too.")
+
+
+STRAT_HELP = _strat_help()
+
+# Czech names shown in brackets in the grain-size menu of tab 2
+GRAIN_CZ = {"silt": "prach", "clay": "jíl", "sand": "písek", "gravel": "štěrk"}
+
+
 class BoreholeDialog(QDialog):
     def __init__(self, iface, parent=None):
         super().__init__(parent)
         self.iface = iface
         self.canvas = iface.mapCanvas()
         self.setWindowTitle("Borehole Geology Sections")
-        self.resize(720, 680)
+        _fit_to_screen(self, 720, 600)
         self.boreholes, self.colors, self.section_pts = [], {}, None
         self.hdr = {"bh": None, "ly": None}
         self.line_rb = None
@@ -285,11 +320,11 @@ class BoreholeDialog(QDialog):
         tabs = QTabWidget()
         lay = QVBoxLayout(self)
         lay.addWidget(tabs)
-        tabs.addTab(self._tab_data(), "1. Data")
-        tabs.addTab(self._tab_colors(), "2. Lithology (colour, grain size)")
-        tabs.addTab(self._tab_logs(), "3. Borehole logs")
-        tabs.addTab(self._tab_2d(), "4. 2D section")
-        tabs.addTab(self._tab_3d(), "5. 3D model")
+        tabs.addTab(_scrolled(self._tab_data()), "1. Data")
+        tabs.addTab(_scrolled(self._tab_colors()), "2. Lithology (colour, grain size)")
+        tabs.addTab(_scrolled(self._tab_logs()), "3. Borehole logs")
+        tabs.addTab(_scrolled(self._tab_2d()), "4. 2D section")
+        tabs.addTab(_scrolled(self._tab_3d()), "5. 3D model")
 
     # ---- tabs
     def _file_group(self, title, fields, key):
@@ -327,6 +362,8 @@ class BoreholeDialog(QDialog):
         self.forms["bh"][0].insertRow(2, "Input coordinate system", self.cb_crs)
         lay.addWidget(b1)
         lay.addWidget(b2)
+        strat_help = STRAT_HELP
+        self.cb_ly["strat"].setToolTip(strat_help)
         self.chk_neg = QCheckBox("Coordinates are given without minus sign (add it - S-JTSK only)")
         self.chk_neg.setChecked(True)
         self.chk_swap = QCheckBox("Swap the two coordinate columns (X<->Y / lon<->lat)")
@@ -344,7 +381,9 @@ class BoreholeDialog(QDialog):
         lay.addLayout(row)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
+        self.log.setMaximumHeight(90)
         lay.addWidget(self.log)
+        lay.addStretch()
         return w
 
     def _crs_changed(self, *_):
@@ -376,15 +415,21 @@ class BoreholeDialog(QDialog):
         lay = QVBoxLayout(w)
         box = QGroupBox("Boreholes (one to four)")
         form = QFormLayout(box)
+        explain = QLabel("Choose the boreholes in one of two ways:\n"
+                         "1) on the map - select them in the 'Boreholes' layer (any QGIS selection "
+                         "tool) and press the button below;\n"
+                         "2) from the drop-down lists below - pick each borehole by its name.")
+        explain.setWordWrap(True)
+        form.addRow(explain)
+        b_sel = QPushButton("Take selected boreholes from the map (max. 4)")
+        b_sel.clicked.connect(self.logs_from_selection)
+        form.addRow(b_sel)
         self.cb_logs = []
         for i in range(4):
             cb = QComboBox()
             cb.addItem("(none)", None)
             self.cb_logs.append(cb)
             form.addRow(f"Borehole {i + 1}", cb)
-        b_sel = QPushButton("Take boreholes selected in the 'Boreholes' map layer (max. 4)")
-        b_sel.clicked.connect(self.logs_from_selection)
-        form.addRow(b_sel)
         lay.addWidget(box)
 
         opt = QGroupBox("Settings")
@@ -467,7 +512,7 @@ class BoreholeDialog(QDialog):
         self.chk_trans = QCheckBox("Jagged boundary for lateral change of lithology")
         self.chk_trans.setChecked(True)
         self.chk_strat = QCheckBox("Highlight boundaries between stratigraphic sequences")
-        self.chk_strat.setChecked(True)
+        self.chk_strat.setChecked(False)
         self.chk_lab = QCheckBox("Show labels")
         self.chk_lab.setChecked(True)
         lay.addWidget(self.chk_corr)
@@ -485,7 +530,6 @@ class BoreholeDialog(QDialog):
     def _tab_3d(self):
         w = QWidget()
         lay = QVBoxLayout(w)
-        self.fences = []
         com = QGroupBox("Common settings")
         cf = QFormLayout(com)
         self.sp_dz = QDoubleSpinBox()
@@ -561,47 +605,6 @@ class BoreholeDialog(QDialog):
         fn.addRow(bnet)
         lay.addWidget(gn)
 
-        gb = QGroupBox("C) Custom sections - 3D from selected 2D cross sections")
-        fb = QFormLayout(gb)
-        fb.addRow(QLabel("Add sections with 'Add to 3D fence model' in the section window,\n"
-                         "or create perpendicular E-W and N-S sections automatically:"))
-        self.sp_nx = QSpinBox()
-        self.sp_nx.setRange(0, 20)
-        self.sp_nx.setValue(2)
-        fb.addRow("Number of N-S sections", self.sp_nx)
-        self.sp_ny = QSpinBox()
-        self.sp_ny.setRange(0, 20)
-        self.sp_ny.setValue(2)
-        fb.addRow("Number of E-W sections", self.sp_ny)
-        self.sp_fd = QDoubleSpinBox()
-        self.sp_fd.setRange(1, 100000)
-        self.sp_fd.setValue(80)
-        self.sp_fd.setSuffix(" m")
-        fb.addRow("Max. distance of boreholes from an automatic section", self.sp_fd)
-        ba = QPushButton("Create automatic sections")
-        ba.clicked.connect(self.auto_fences)
-        fb.addRow(ba)
-        self.sp_slab = QDoubleSpinBox()
-        self.sp_slab.setRange(0.5, 500)
-        self.sp_slab.setValue(8)
-        self.sp_slab.setSuffix(" m")
-        fb.addRow("Slab length (horizontal resolution)", self.sp_slab)
-        self.sp_width = QDoubleSpinBox()
-        self.sp_width.setRange(0.2, 200)
-        self.sp_width.setValue(4)
-        self.sp_width.setSuffix(" m")
-        fb.addRow("Slab width (thickness of the fence)", self.sp_width)
-        self.lbl_fence = QLabel("0 sections prepared")
-        fb.addRow(self.lbl_fence)
-        row = QHBoxLayout()
-        bb = QPushButton("Build fence model")
-        bb.clicked.connect(self.build_fence)
-        bc = QPushButton("Clear sections")
-        bc.clicked.connect(self.clear_fences)
-        row.addWidget(bb)
-        row.addWidget(bc)
-        fb.addRow(row)
-        lay.addWidget(gb)
         lay.addWidget(QLabel("Open the result with View > New 3D Map View "
                              "(raise the vertical scale in the 3D view settings)."))
         lay.addStretch()
@@ -677,7 +680,7 @@ class BoreholeDialog(QDialog):
             self.btns[lit] = cb
             gb = QComboBox()
             for g in logs.GRAINS:
-                gb.addItem(logs.GRAIN_LABELS[g], g)
+                gb.addItem(f"{logs.GRAIN_LABELS[g]} ({GRAIN_CZ[g]})", g)
             gb.setCurrentIndex(logs.GRAINS.index(logs.guess_grain(lit)))
             self.tbl.setCellWidget(i, 2, gb)
             self.grain_boxes[lit] = gb
@@ -838,15 +841,16 @@ class BoreholeDialog(QDialog):
                                 "No borehole within the given distance of the line.")
             return
         colors, opts, bedrock, strat = self._section_options()
+        grains = self.current_grains()
         line = list(self.section_pts)
 
         def build(faults, proj=proj, colors=colors, opts=opts, bedrock=bedrock, strat=strat,
-                  line=line):
-            sc = core.build_section_scene(proj, colors, *opts, faults, bedrock, True)
+                  line=line, grains=grains):
+            sc = core.build_section_scene(proj, colors, *opts, faults, bedrock, True, grains)
             sc.geo["line"] = line
             return sc
 
-        v = SectionViewer(build(None), self, proj, build, self.add_fence, strat)
+        v = SectionViewer(build(None), self, proj, build, strat)
         self.viewers.append(v)
         v.show()
 
@@ -954,77 +958,6 @@ class BoreholeDialog(QDialog):
         count, n, err = model3d.build_layers(prisms, cols, "3D fence network")
         self._show_3d_result(count, n, err, f"Fence network ({len(edges)} panels"
                                             + (", DEM" if dem else "") + ")")
-
-    def add_fence(self, geo):
-        if not geo.get("line"):
-            return len(self.fences)
-        self.fences.append(geo)
-        self._fence_label()
-        return len(self.fences)
-
-    def _fence_label(self):
-        self.lbl_fence.setText(f"{len(self.fences)} section(s) prepared for the fence model")
-
-    def clear_fences(self):
-        self.fences = []
-        self._fence_label()
-
-    def auto_fences(self):
-        if not self._need_data():
-            return
-        bhs = self._bh_subset()
-        xs, ys = [b.x for b in bhs], [b.y for b in bhs]
-        xmin, xmax, ymin, ymax = min(xs), max(xs), min(ys), max(ys)
-        pad = 0.05 * max(xmax - xmin, ymax - ymin) + 10
-        lines = []
-        ny, nx = self.sp_ny.value(), self.sp_nx.value()
-        for i in range(ny):
-            y = ymin + (i + 1) * (ymax - ymin) / (ny + 1)
-            lines.append([QgsPointXY(xmin - pad, y), QgsPointXY(xmax + pad, y)])
-        for i in range(nx):
-            x = xmin + (i + 1) * (xmax - xmin) / (nx + 1)
-            lines.append([QgsPointXY(x, ymin - pad), QgsPointXY(x, ymax + pad)])
-        colors, opts, bedrock, strat = self._section_options()
-        made = 0
-        for pts in lines:
-            proj = core.project_boreholes(pts, bhs, self.sp_fd.value())
-            if len(proj) < 2:
-                continue
-            sc = core.build_section_scene(proj, colors, *opts, None, bedrock, strat)
-            sc.geo["line"] = pts
-            self.fences.append(sc.geo)
-            made += 1
-        self._fence_label()
-        self.iface.messageBar().pushMessage(
-            "3D", f"{made} of {len(lines)} automatic sections created "
-                  "(sections with fewer than two boreholes are skipped).",
-            level=Qgis.MessageLevel.Info, duration=8)
-
-    def build_fence(self):
-        if not self.fences:
-            QMessageBox.warning(self, "3D fence model",
-                                "No sections prepared. Add sections from the section window "
-                                "or create automatic sections.")
-            return
-        prisms = []
-        for geo in self.fences:
-            line = QgsGeometry.fromPolylineXY(geo["line"])
-
-            def locate(d, line=line):
-                p = line.interpolate(d).asPoint()
-                return (p.x(), p.y())
-            prisms += model3d.fence_prisms(geo, locate, line.length(), self.sp_width.value(),
-                                           self.sp_slab.value(), self.sp_dz.value())
-            if len(prisms) > 200000:
-                QMessageBox.warning(self, "3D fence model",
-                                    "Too many blocks - increase the slab length or the "
-                                    "vertical step.")
-                return
-        if not prisms:
-            QMessageBox.warning(self, "3D fence model", "The sections contain no polygons.")
-            return
-        count, n, err = model3d.build_layers(prisms, self.current_colors(), "3D fence model")
-        self._show_3d_result(count, n, err, f"Fence model ({len(self.fences)} sections)")
 
     def cleanup(self):
         if self.line_rb:
