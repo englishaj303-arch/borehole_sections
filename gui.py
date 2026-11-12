@@ -1,4 +1,4 @@
-from qgis.PyQt.QtCore import Qt, QRectF, pyqtSignal
+from qgis.PyQt.QtCore import Qt, QRectF, QSize, pyqtSignal
 from qgis.PyQt.QtGui import (QColor, QGuiApplication, QImage, QPainter, QPdfWriter, QPageSize,
                              QPageLayout)
 from qgis.PyQt.QtSvg import QSvgGenerator
@@ -14,7 +14,7 @@ from qgis.core import (
 )
 from qgis.gui import QgsColorButton, QgsFileWidget, QgsMapTool, QgsRubberBand
 
-from . import core, logs, model3d
+from . import core, logs, model3d, patterns
 
 
 # ---------------------------------------------------------------- map tool
@@ -92,7 +92,7 @@ class SectionViewer(QDialog):
             self.chk_v_strat.setChecked(strat0)
             self.chk_v_ground = QCheckBox("Show ground surface line (green)")
             self.chk_v_ground.setChecked(False)
-            self.chk_v_hatch = QCheckBox("Hatching by grain size (as in the profiles)")
+            self.chk_v_hatch = QCheckBox("Lithologic patterns (FGDC)")
             self.chk_v_hatch.setChecked(False)
             self.chk_v_strat.toggled.connect(self._apply_visibility)
             self.chk_v_ground.toggled.connect(self._apply_visibility)
@@ -254,7 +254,9 @@ BH_FIELDS = [("name", "Borehole name", ["name", "borehole", "vrt", "nazev", "id"
              ("x", "X", ["x"]),
              ("y", "Y", ["y"]),
              ("z", "Altitude Z", ["z", "alt", "altitude", "kota", "elev", "vyska"]),
-             ("depth", "Total depth", ["depth", "hloub", "total", "delka"])]
+             ("depth", "Total depth", ["depth", "hloub", "total", "delka"]),
+             ("azimuth", "Azimuth [deg] (optional)", ["azimuth", "azimut", "azim", "az", "smer", "direction", "bearing"]),
+             ("dip", "Dip / deviation [deg] (optional)", ["dip", "deviation", "inclination", "incl", "sklon", "odklon", "angle", "tilt"])]
 LY_FIELDS = [("name", "Borehole name", ["name", "borehole", "vrt", "nazev", "id", "sonda", "oznaceni"]),
              ("top", "Layer from [m]", ["from", "od", "top", "start", "begin", "zacatek", "pocatek"]),
              ("bottom", "Layer to [m]", ["to", "do", "bottom", "end", "konec"]),
@@ -401,13 +403,14 @@ class BoreholeDialog(QDialog):
     def _tab_colors(self):
         w = QWidget()
         lay = QVBoxLayout(w)
-        self.tbl = QTableWidget(0, 3)
-        self.tbl.setHorizontalHeaderLabels(["Lithology", "Colour", "Grain size"])
+        self.tbl = QTableWidget(0, 4)
+        self.tbl.setHorizontalHeaderLabels(["Lithology", "Colour", "Grain size", "Pattern"])
         self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         lay.addWidget(self.tbl)
-        lay.addWidget(QLabel("Colours and grain sizes are filled after loading data. Colours are used in\n"
-                             "all outputs; the grain size (guessed from the name - check it) is used\n"
-                             "in the sedimentary records of tab 3."))
+        lay.addWidget(QLabel("Colours, grain sizes and patterns are filled after loading data. Colours are\n"
+                             "used in all outputs. The grain size (guessed from the name - check it) is\n"
+                             "used in the sedimentary records of tab 3. The pattern (FGDC lithologic\n"
+                             "patterns) is used in the logs of tab 3 and in the 2D section."))
         return w
 
     def _tab_logs(self):
@@ -443,9 +446,17 @@ class BoreholeDialog(QDialog):
         self.sp_logscale.setSpecialValueText("auto")
         self.sp_logscale.setSuffix(" px/m")
         of.addRow("Vertical scale", self.sp_logscale)
-        self.chk_logpat = QCheckBox("Hatching by grain size in the profiles")
+        self.chk_logpat = QCheckBox("Lithologic patterns (FGDC) in the profiles")
         self.chk_logpat.setChecked(True)
         of.addRow(self.chk_logpat)
+        self.chk_logstrat = QCheckBox("Stratigraphy column next to the lithology column")
+        self.chk_logstrat.setChecked(True)
+        of.addRow(self.chk_logstrat)
+        self.sp_patscale = QDoubleSpinBox()
+        self.sp_patscale.setRange(0.1, 2.0)
+        self.sp_patscale.setSingleStep(0.05)
+        self.sp_patscale.setValue(0.45)
+        of.addRow("Size of the patterns", self.sp_patscale)
         self.chk_recsep = QCheckBox("Sedimentary records: a separate window for each borehole")
         of.addRow(self.chk_recsep)
         lay.addWidget(opt)
@@ -511,15 +522,12 @@ class BoreholeDialog(QDialog):
         self.chk_dip.setChecked(True)
         self.chk_trans = QCheckBox("Jagged boundary for lateral change of lithology")
         self.chk_trans.setChecked(True)
-        self.chk_strat = QCheckBox("Highlight boundaries between stratigraphic sequences")
-        self.chk_strat.setChecked(False)
         self.chk_lab = QCheckBox("Show labels")
         self.chk_lab.setChecked(True)
         lay.addWidget(self.chk_corr)
         lay.addWidget(self.chk_merge)
         lay.addWidget(self.chk_dip)
         lay.addWidget(self.chk_trans)
-        lay.addWidget(self.chk_strat)
         lay.addWidget(self.chk_lab)
         b3 = QPushButton("Create cross section")
         b3.clicked.connect(self.create_section)
@@ -632,7 +640,7 @@ class BoreholeDialog(QDialog):
                 kw = core.INPUT_CRS[crs_key][5]
             cb = combos[k]
             cb.clear()
-            if k == "strat":
+            if k in ("strat", "azimuth", "dip"):
                 cb.addItem("(none)")
                 cb.addItems(header)
                 cb.setCurrentIndex(core.guess_column(header, kw, default=-1) + 1)
@@ -649,8 +657,10 @@ class BoreholeDialog(QDialog):
             h1, r1 = core.read_table(p1, self.delims["bh"].currentData())
             h2, r2 = core.read_table(p2, self.delims["ly"].currentData())
             m1 = {k: c.currentIndex() for k, c in self.cb_bh.items()}
+            m1["azimuth"] = self.cb_bh["azimuth"].currentIndex() - 1   # -1 = none
+            m1["dip"] = self.cb_bh["dip"].currentIndex() - 1           # -1 = none
             m2 = {k: c.currentIndex() for k, c in self.cb_ly.items()}
-            m2["strat"] = self.cb_ly["strat"].currentIndex() - 1   # -1 = none
+            m2["strat"] = self.cb_ly["strat"].currentIndex() - 1       # -1 = none
             self.boreholes, warns = core.build_boreholes(
                 h1, r1, m1, h2, r2, m2, self.cb_crs.currentData(),
                 self.chk_neg.isChecked(), self.chk_swap.isChecked())
@@ -669,7 +679,7 @@ class BoreholeDialog(QDialog):
         lithos = core.lithologies(self.boreholes)
         defaults = core.default_colors(lithos)
         self.tbl.setRowCount(len(lithos))
-        self.btns, self.grain_boxes = {}, {}
+        self.btns, self.grain_boxes, self.pat_boxes = {}, {}, {}
         for i, lit in enumerate(lithos):
             it = QTableWidgetItem(lit)
             it.setFlags(Qt.ItemFlag.ItemIsEnabled)
@@ -684,6 +694,15 @@ class BoreholeDialog(QDialog):
             gb.setCurrentIndex(logs.GRAINS.index(logs.guess_grain(lit)))
             self.tbl.setCellWidget(i, 2, gb)
             self.grain_boxes[lit] = gb
+            pb = QComboBox()
+            pb.setIconSize(QSize(48, 36))
+            pb.setMaxVisibleItems(12)
+            pb.addItem("(none)", "")
+            for code in patterns.NAMES:
+                pb.addItem(patterns.icon(code), patterns.label(code), code)
+            pb.setCurrentIndex(max(pb.findData(patterns.default_pattern(lit)), 0))
+            self.tbl.setCellWidget(i, 3, pb)
+            self.pat_boxes[lit] = pb
         for i, cb in enumerate(self.cb_logs):
             cb.clear()
             cb.addItem("(none)", None)
@@ -697,6 +716,9 @@ class BoreholeDialog(QDialog):
 
     def current_grains(self):
         return {lit: b.currentData() for lit, b in getattr(self, "grain_boxes", {}).items()}
+
+    def current_patterns(self):
+        return {lit: b.currentData() for lit, b in getattr(self, "pat_boxes", {}).items()}
 
     def _need_data(self):
         if not self.boreholes:
@@ -746,12 +768,14 @@ class BoreholeDialog(QDialog):
         lithos = core.lithologies(bhs)
         colors = {lit: c.name() for lit, c in self.current_colors().items()}
         grains = self.current_grains()
+        pats = self.current_patterns()
         for lit in lithos:
             grains.setdefault(lit, logs.guess_grain(lit))
-        return colors, grains
+            pats.setdefault(lit, patterns.default_pattern(lit))
+        return colors, grains, pats
 
     def _show_log(self, cmds, title):
-        v = SectionViewer(logs.to_scene(cmds), self, title=title)
+        v = SectionViewer(logs.to_scene(cmds, self.sp_patscale.value()), self, title=title)
         self.viewers.append(v)
         v.show()
 
@@ -759,21 +783,21 @@ class BoreholeDialog(QDialog):
         bhs = self._log_boreholes()
         if not bhs:
             return
-        colors, grains = self._log_style(bhs)
-        cmds = logs.build_profiles(bhs, colors, grains, self.cb_logmode.currentData(),
+        colors, _grains, pats = self._log_style(bhs)
+        cmds = logs.build_profiles(bhs, colors, pats, self.cb_logmode.currentData(),
                                    self.sp_logscale.value(), logs.qt_measure(),
-                                   self.chk_logpat.isChecked())
+                                   self.chk_logpat.isChecked(), self.chk_logstrat.isChecked())
         self._show_log(cmds, "Borehole profiles: " + ", ".join(b.name for b in bhs))
 
     def create_records(self):
         bhs = self._log_boreholes()
         if not bhs:
             return
-        colors, grains = self._log_style(bhs)
+        colors, grains, pats = self._log_style(bhs)
         mode, scale = self.cb_logmode.currentData(), self.sp_logscale.value()
         groups = [[b] for b in bhs] if self.chk_recsep.isChecked() else [bhs]
         for grp in groups:
-            cmds = logs.build_records(grp, colors, grains, scale, logs.qt_measure(), mode=mode)
+            cmds = logs.build_records(grp, colors, grains, pats, scale, logs.qt_measure(), mode=mode)
             self._show_log(cmds, "Sedimentary record: " + ", ".join(b.name for b in grp))
 
     # ---- 2D
@@ -841,12 +865,12 @@ class BoreholeDialog(QDialog):
                                 "No borehole within the given distance of the line.")
             return
         colors, opts, bedrock, strat = self._section_options()
-        grains = self.current_grains()
+        pats = self.current_patterns()
         line = list(self.section_pts)
 
         def build(faults, proj=proj, colors=colors, opts=opts, bedrock=bedrock, strat=strat,
-                  line=line, grains=grains):
-            sc = core.build_section_scene(proj, colors, *opts, faults, bedrock, True, grains)
+                  line=line, pats=pats):
+            sc = core.build_section_scene(proj, colors, *opts, faults, bedrock, True, pats)
             sc.geo["line"] = line
             return sc
 
@@ -859,7 +883,7 @@ class BoreholeDialog(QDialog):
         opts = (self.sp_vex.value(), self.chk_corr.isChecked(), self.chk_lab.isChecked(),
                 self.sp_curv.value(), self.sp_round.value(), self.chk_merge.isChecked(),
                 self.chk_dip.isChecked(), self.chk_trans.isChecked())
-        return colors, opts, self.sp_bed.value(), self.chk_strat.isChecked()
+        return colors, opts, self.sp_bed.value(), False
 
     # ---- 3D
     def _bh_subset(self):
@@ -942,7 +966,8 @@ class BoreholeDialog(QDialog):
         colors, opts, bedrock, _strat = self._section_options()
 
         def make_geo(A, B, L):
-            proj = [core.Projected(A, 0.0, 0.0), core.Projected(B, L, 0.0)]
+            proj = core.project_boreholes(
+                [QgsPointXY(A.x, A.y), QgsPointXY(B.x, B.y)], [A, B], 1e9)
             return core.section_geo(proj, opts[0], opts[3], opts[4], opts[5], opts[6], opts[7],
                                     bedrock)
         dem = self._dem_func()

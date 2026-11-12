@@ -65,12 +65,16 @@ def grid_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0,
     if len(bhs) < 2:
         raise ValueError("At least two boreholes with layers are needed.")
     lay = {id(b): core.clean_layers(b.layers) for b in bhs}
+    cos_dip = {id(b): max(math.cos(math.radians(b.dip)), 1e-4) for b in bhs}
     qth = {}
+    qvth = {}
     for b in bhs:
         n = core._quat_run(lay[id(b)])
-        qth[id(b)] = lay[id(b)][n - 1].bottom if n else 0.0
-    xs = [b.x for b in bhs]
-    ys = [b.y for b in bhs]
+        md_q = lay[id(b)][n - 1].bottom if n else 0.0
+        qth[id(b)] = md_q
+        qvth[id(b)] = md_q * cos_dip[id(b)]
+    xs = [b.x for b in bhs] + [b.point_at(b.depth)[0] for b in bhs]
+    ys = [b.y for b in bhs] + [b.point_at(b.depth)[1] for b in bhs]
     ext = max(max(xs) - min(xs), max(ys) - min(ys), 1.0)
     if cell <= 0:
         cell = max(ext / 25.0, 1.0)
@@ -94,29 +98,45 @@ def grid_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0,
             wts = [(1.0 / (d * d + eps), b) for d, b in near]
             wsum = sum(w for w, _ in wts)
             g = sum(w * b.z for w, b in wts) / wsum                 # ground elevation
-            qt = sum(w * qth[id(b)] for w, b in wts) / wsum        # Quaternary thickness
-            zbot = min(b.z - b.depth for _, b in near)
+            qt = sum(w * qvth[id(b)] for w, b in wts) / wsum       # vertical Quaternary thickness
+            zbot = min(b.z_at(b.depth) for _, b in near)
             i_top = int(math.floor(g / dz - 0.5))
             i_min = int(math.floor(zbot / dz))
             seq = []
             for i in range(i_top, i_min - 1, -1):
                 zc = (i + 0.5) * dz
                 dg = g - zc
+                # weight boreholes by horizontal distance to their trace at elevation zc
+                z_dist = []
+                for b in bhs:
+                    cd = cos_dip[id(b)]
+                    md_z = max(0.0, min(b.depth, (b.z - zc) / cd))
+                    bx, by, _ = b.point_at(md_z)
+                    d_z = math.hypot(bx - cx, by - cy)
+                    if maxdist <= 0 or d_z <= maxdist:
+                        z_dist.append((d_z, b))
+                if not z_dist:
+                    seq.append((i, None))
+                    continue
+                z_dist.sort(key=lambda t: t[0])
+                z_wts = [(1.0 / (d * d + eps), b) for d, b in z_dist[:max(1, k)]]
                 votes = {}
                 if qt > 0 and dg <= qt:                            # Quaternary cover
-                    for w, b in wts:
-                        q_b = qth[id(b)]
-                        if q_b <= 0:
+                    for w, b in z_wts:
+                        q_vb = qvth[id(b)]
+                        if q_vb <= 0:
                             continue
-                        L = unit_at(lay[id(b)], dg * q_b / qt)
+                        cd = cos_dip[id(b)]
+                        L = unit_at(lay[id(b)], (dg * q_vb / qt) / cd)
                         if L is not None and L.age == (0, 0):
                             votes[L.litho] = votes.get(L.litho, 0.0) + w
                 else:
-                    for w, b in wts:
+                    for w, b in z_wts:
+                        cd = cos_dip[id(b)]
                         if mode == "depth":
-                            dep = qth[id(b)] + (dg - qt)
+                            dep = qth[id(b)] + (dg - qt) / cd
                         else:
-                            dep = b.z - zc
+                            dep = (b.z - zc) / cd
                         L = unit_at(lay[id(b)], dep)
                         if L is not None and L.age != (0, 0):
                             votes[L.litho] = votes.get(L.litho, 0.0) + w
@@ -161,8 +181,8 @@ def fence_prisms(geo, locate, length, width=4.0, slab=8.0, dz=2.0, shift=None):
     prisms = []
     for pts, lit, _age in list(geo["polys"]) + list(geo["cols"]):
         P = [(d0 + px / kx, zmax - py / ky) for px, py in pts]
-        dmin = max(min(p[0] for p in P), 0.0)
-        dmax = min(max(p[0] for p in P), length)
+        dmin = min(p[0] for p in P)
+        dmax = max(p[0] for p in P)
         if dmax - dmin < 1e-6:
             continue
         n = max(1, int(math.ceil((dmax - dmin) / slab)))
@@ -367,13 +387,28 @@ def _dem_shift(A, B, L, dem, n=40):
 
 
 def column_prisms(bhs, width, dz):
-    """Borehole columns (the black pillars of a fence diagram)."""
+    """Borehole columns (the black pillars of a fence diagram; supports inclined boreholes)."""
     out = []
+    h = width / 2.0
     for b in bhs:
-        h = width / 2.0
-        ring = [(b.x - h, b.y - h), (b.x + h, b.y - h), (b.x + h, b.y + h), (b.x - h, b.y + h)]
-        out += stack_prisms(ring, int(round((b.z - b.depth) / dz)), int(round(b.z / dz)),
-                            dz, "Borehole")
+        i0 = int(round(b.z_at(b.depth) / dz))
+        i1 = int(round(b.z / dz))
+        cos_d = max(math.cos(math.radians(b.dip)), 1e-4)
+        cur = None
+        for i in range(i0, i1 + 1):
+            zc = (i + 0.5) * dz
+            md = max(0.0, min(b.depth, (b.z - zc) / cos_d))
+            bx, by, _ = b.point_at(md)
+            key = (round(bx, 3), round(by, 3)) if i < i1 else None
+            if cur and cur[0] == key:
+                cur[2] = i + 1
+            else:
+                if cur:
+                    (cx, cy), ia, ib = cur
+                    ring = [(cx - h, cy - h), (cx + h, cy - h),
+                            (cx + h, cy + h), (cx - h, cy + h)]
+                    out += stack_prisms(ring, ia, ib, dz, "Borehole")
+                cur = [key, i, i + 1] if key else None
     return out
 
 

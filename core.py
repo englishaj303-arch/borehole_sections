@@ -15,6 +15,8 @@ from qgis.core import (
     QgsMessageLog, Qgis,
 )
 
+from . import patterns as _patterns
+
 LOG_TAG = "Borehole Geology"
 
 
@@ -59,6 +61,23 @@ class Borehole:
     z: float          # collar altitude
     depth: float
     layers: list = field(default_factory=list)
+    azimuth: float = 0.0   # 0..360 deg clockwise from North (0 = N, 90 = E)
+    dip: float = 0.0       # 0..90 deg inclination from vertical (0 = vertical, 90 = horizontal)
+
+    def point_at(self, md):
+        """3D coordinates (x, y, z) at measured along-hole depth `md`."""
+        inc = math.radians(self.dip)
+        az = math.radians(self.azimuth)
+        horiz = md * math.sin(inc)
+        return (
+            self.x + horiz * math.sin(az),
+            self.y + horiz * math.cos(az),
+            self.z - md * math.cos(inc),
+        )
+
+    def z_at(self, md):
+        """Elevation a.s.l. at measured along-hole depth `md`."""
+        return self.z - md * math.cos(math.radians(self.dip))
 
 
 @dataclass
@@ -66,6 +85,21 @@ class Projected:
     bh: Borehole
     dist: float
     offset: float
+    d_top: float = None
+    d_bot: float = None
+
+    def __post_init__(self):
+        if self.d_top is None:
+            self.d_top = self.dist
+        if self.d_bot is None:
+            self.d_bot = self.dist
+
+    def d_at(self, md):
+        """Distance along section polyline at measured along-hole depth `md`."""
+        if self.bh.depth <= 1e-9:
+            return self.d_top
+        t = md / self.bh.depth
+        return self.d_top + (self.d_bot - self.d_top) * t
 
 
 # ----------------------------------------------------------------- CSV input
@@ -183,7 +217,8 @@ def guess_column(header, keywords, default=0):
 
 
 def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=False):
-    """m1: dict name,x,y,z,depth -> column index.  m2: name,top,bottom,litho.
+    """m1: dict name,x,y,z,depth[,azimuth,dip] -> column index (-1 = none).
+    m2: dict name,top,bottom,litho[,strat] -> column index (-1 = none).
 
     Input CRS is given by crs_key (see INPUT_CRS); all boreholes are converted
     to S-JTSK (EPSG:5514) which is used for map, section and 3D.
@@ -197,6 +232,8 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
     xform = None if crs_key == "sjtsk" else QgsCoordinateTransform(
         src, dst, QgsProject.instance().transformContext())
     warnings, bhs, bad_strat = [], {}, set()
+    az_idx = m1.get("azimuth", -1)
+    dip_idx = m1.get("dip", -1)
     for n, r in enumerate(r1, start=2):
         try:
             name = r[m1["name"]].strip()
@@ -208,6 +245,31 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
         if not name or None in (sx, sy, z):
             warnings.append(f"Boreholes file, line {n}: invalid values - skipped")
             continue
+
+        raw_az = r[az_idx].strip() if 0 <= az_idx < len(r) else ""
+        if not raw_az:
+            az = 0.0
+        else:
+            az = to_float(raw_az)
+            if az is None:
+                warnings.append(f"Boreholes file, line {n} ({name}): invalid azimuth '{raw_az}' - assumed 0")
+                az = 0.0
+            elif az < 0.0 or az > 360.0:
+                warnings.append(f"Boreholes file, line {n} ({name}): azimuth {az:g} outside 0..360 deg - normalized")
+                az = az % 360.0
+
+        raw_dip = r[dip_idx].strip() if 0 <= dip_idx < len(r) else ""
+        if not raw_dip:
+            dip = 0.0
+        else:
+            dip = to_float(raw_dip)
+            if dip is None:
+                warnings.append(f"Boreholes file, line {n} ({name}): invalid dip/deviation '{raw_dip}' - assumed 0")
+                dip = 0.0
+            elif dip < 0.0 or dip > 90.0:
+                warnings.append(f"Boreholes file, line {n} ({name}): dip/deviation {dip:g} outside 0..90 deg - clamped")
+                dip = min(max(dip, 0.0), 90.0)
+
         if swap:
             sx, sy = sy, sx
         if crs_key == "sjtsk":
@@ -223,14 +285,14 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
                 continue
         if name in bhs:
             warnings.append(f"Duplicate borehole '{name}' - last one used")
-        bhs[name] = Borehole(name, qx, qy, z, depth or 0.0)
+        bhs[name] = Borehole(name, qx, qy, z, depth or 0.0, azimuth=az, dip=dip)
 
     for n, r in enumerate(r2, start=2):
         try:
             name = r[m2["name"]].strip()
             t, b = to_float(r[m2["top"]]), to_float(r[m2["bottom"]])
             lit = r[m2["litho"]].strip() or "(unknown)"
-            raw_age = r[m2["strat"]].strip() if m2.get("strat", -1) >= 0 else ""
+            raw_age = r[m2["strat"]].strip() if 0 <= m2.get("strat", -1) < len(r) else ""
         except IndexError:
             warnings.append(f"Layers file, line {n}: too few columns - skipped")
             continue
@@ -323,19 +385,55 @@ def lithologies(boreholes):
 
 
 # --------------------------------------------------------------- projection
+def _extend_polyline(points, ext):
+    """Extend the first and last segments of a polyline by `ext` so inclined boreholes
+    near the ends of the section line project without endpoint clamping."""
+    pts = [QgsPointXY(p) for p in points]
+    if len(pts) < 2 or ext <= 0:
+        return pts
+    dx0, dy0 = pts[1].x() - pts[0].x(), pts[1].y() - pts[0].y()
+    ln0 = math.hypot(dx0, dy0)
+    if ln0 > 1e-9:
+        pts[0] = QgsPointXY(pts[0].x() - ext * dx0 / ln0, pts[0].y() - ext * dy0 / ln0)
+    dx1, dy1 = pts[-1].x() - pts[-2].x(), pts[-1].y() - pts[-2].y()
+    ln1 = math.hypot(dx1, dy1)
+    if ln1 > 1e-9:
+        pts[-1] = QgsPointXY(pts[-1].x() + ext * dx1 / ln1, pts[-1].y() + ext * dy1 / ln1)
+    return pts
+
+
 def project_boreholes(points, boreholes, max_offset):
     line = QgsGeometry.fromPolylineXY(points)
+    max_dep = max([b.depth for b in boreholes] or [0.0])
+    ext = max_dep + line.length() + 1000.0
+    ext_pts = _extend_polyline(points, ext)
+    ext_line = QgsGeometry.fromPolylineXY(ext_pts)
+    has_ext = len(ext_pts) >= 2 and ext_line.length() > line.length()
     out = []
     for b in boreholes:
-        pg = QgsGeometry.fromPointXY(QgsPointXY(b.x, b.y))
-        off = line.distance(pg)
+        bx, by, _ = b.point_at(b.depth)
+        p_top = QgsPointXY(b.x, b.y)
+        p_bot = QgsPointXY(bx, by)
+        if math.hypot(bx - b.x, by - b.y) > 1e-6:
+            trace = QgsGeometry.fromPolylineXY([p_top, p_bot])
+        else:
+            trace = QgsGeometry.fromPointXY(p_top)
+        off = line.distance(trace)
         if off <= max_offset:
-            out.append(Projected(b, line.lineLocatePoint(pg), off))
+            g_top = QgsGeometry.fromPointXY(p_top)
+            g_bot = QgsGeometry.fromPointXY(p_bot)
+            if has_ext:
+                d_top = ext_line.lineLocatePoint(g_top) - ext
+                d_bot = ext_line.lineLocatePoint(g_bot) - ext
+            else:
+                d_top = line.lineLocatePoint(g_top)
+                d_bot = line.lineLocatePoint(g_bot)
+            d_mid = 0.5 * (d_top + d_bot)
+            out.append(Projected(b, d_mid, off, d_top, d_bot))
     out.sort(key=lambda p: p.dist)
     return out
 
 
-# ------------------------------------------------------------ 2D section
 def _nice_step(span, target=8):
     raw = max(span, 1e-9) / target
     mag = 10 ** math.floor(math.log10(raw))
@@ -1144,42 +1242,150 @@ def _fill_cover_gap(rest, base, xa, xb, left, right):
     return out
 
 
+
+def _bh_column_geom(p, X, Y, cw):
+    """Scene-space geometry for a (possibly inclined) borehole column.
+
+    Returns dict with:
+      x0, y0   : collar center in scene coordinates
+      x1, y1   : bottom center in scene coordinates
+      tx, ty   : unit tangent vector along borehole (collar -> bottom)
+      nx, ny   : right-hand unit normal vector perpendicular to borehole
+      left(md) : (x, y) on left edge at measured depth `md`
+      right(md): (x, y) on right edge at measured depth `md`
+      quad(t, b): [(x, y), ...] 4 corners of interval [t, b]
+    """
+    bh = p.bh
+    x0, y0 = X(p.d_top), Y(bh.z)
+    x1, y1 = X(p.d_bot), Y(bh.z_at(bh.depth))
+    dx, dy = x1 - x0, y1 - y0
+    ln = math.hypot(dx, dy)
+    if ln > 1e-9:
+        tx, ty = dx / ln, dy / ln
+    else:
+        tx, ty = 0.0, 1.0
+    nx, ny = ty, -tx
+    hw = cw / 2.0
+
+    def left(md):
+        xc, yc = X(p.d_at(md)), Y(bh.z_at(md))
+        return (xc - hw * nx, yc - hw * ny)
+
+    def right(md):
+        xc, yc = X(p.d_at(md)), Y(bh.z_at(md))
+        return (xc + hw * nx, yc + hw * ny)
+
+    def quad(top, bot):
+        return [left(top), right(top), right(bot), left(bot)]
+
+    return {
+        "x0": x0, "y0": y0, "x1": x1, "y1": y1,
+        "tx": tx, "ty": ty, "nx": nx, "ny": ny,
+        "left": left, "right": right, "quad": quad,
+    }
+
+
+def _map_to_inclined(pts, span_ref, x_A, x_B, y_cross_hi=None, y_cross_lo=None):
+    """Map reference polygon coordinates (xr in [0, span_ref], y) onto the region
+    between tilted borehole edges x_A(y) and x_B(y)."""
+    mapped = []
+    for xr, y in pts:
+        u = xr / span_ref
+        mapped.append(((1.0 - u) * x_A(y) + u * x_B(y), y))
+    if y_cross_lo is not None:
+        mapped = _clip_halfplane(mapped, lambda p: p[1] - y_cross_lo, keep_negative=True)
+    if y_cross_hi is not None:
+        mapped = _clip_halfplane(mapped, lambda p: y_cross_hi - p[1], keep_negative=True)
+    return mapped
+
+
+def _fence_secant_inclined(LA, LB, YA, YB, x_A, x_B):
+    """Median apparent dip (scene dy/dx) of correlated contacts between inclined walls."""
+    sl = []
+    for i, j in align_layers(LA, LB, 0.0, 0.0):
+        ya_t, yb_t = YA(LA[i].top), YB(LB[j].top)
+        dx_t = x_B(yb_t) - x_A(ya_t)
+        if abs(dx_t) > 1e-6:
+            sl.append((yb_t - ya_t) / dx_t)
+        ya_b, yb_b = YA(LA[i].bottom), YB(LB[j].bottom)
+        dx_b = x_B(yb_b) - x_A(ya_b)
+        if abs(dx_b) > 1e-6:
+            sl.append((yb_b - ya_b) / dx_b)
+    if not sl:
+        return None
+    sl.sort()
+    return sl[len(sl) // 2]
+
+
 def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
                          use_dip=True, transitions=True, faults=None, aspect=1.0,
                          bedrock=None):
-    """All correlation polygons of a section.
+    """All correlation polygons of a section (supports both vertical and inclined boreholes).
     faults = {k: {"pos": 0..1, "dip": degrees, "dir": +1/-1/0}} for the fence
     between proj[k] and proj[k+1].  Layers of Quaternary age are not cut by
-    faults.  Returns ([(points, litho)], fault_lines)."""
+    faults.  Returns ([(points, litho, age)], fault_lines)."""
     faults = faults or {}
+    cols_geom = [_bh_column_geom(p, X, Y, cw) for p in proj]
     fences = []
     for k, (a, b) in enumerate(zip(proj, proj[1:])):
-        xa, xb = X(a.dist) + cw / 2, X(b.dist) - cw / 2
-        if xb - xa < 2:
+        gA, gB = cols_geom[k], cols_geom[k + 1]
+        pRA0 = gA["right"](0.0)
+        pLB0 = gB["left"](0.0)
+        pRA1 = gA["right"](a.bh.depth)
+        pLB1 = gB["left"](b.bh.depth)
+
+        tyA = gA["ty"] if abs(gA["ty"]) > 1e-4 else (1e-4 if gA["ty"] >= 0 else -1e-4)
+        tyB = gB["ty"] if abs(gB["ty"]) > 1e-4 else (1e-4 if gB["ty"] >= 0 else -1e-4)
+        mxA = gA["tx"] / tyA
+        mxB = gB["tx"] / tyB
+
+        def x_A(y, x0=pRA0[0], y0=pRA0[1], mx=mxA):
+            return x0 + mx * (y - y0)
+
+        def x_B(y, x0=pLB0[0], y0=pLB0[1], mx=mxB):
+            return x0 + mx * (y - y0)
+
+        y_top_mid = 0.5 * (pRA0[1] + pLB0[1])
+        y_bot_mid = 0.5 * (pRA1[1] + pLB1[1])
+        s_top = x_B(y_top_mid) - x_A(y_top_mid)
+        s_bot = x_B(y_bot_mid) - x_A(y_bot_mid)
+        span_ref = max(s_top, s_bot, 0.5 * (s_top + s_bot))
+        if span_ref < 2.0:
             fences.append(None)
             continue
 
-        def YA(d, z=a.bh.z):
-            return Y(z - d)
+        y_cross_lo = y_cross_hi = None
+        if abs(mxA - mxB) > 1e-9:
+            yc = (x_B(0.0) - x_A(0.0)) / (mxA - mxB)
+            if mxA > mxB:
+                y_cross_lo = yc
+            else:
+                y_cross_hi = yc
 
-        def YB(d, z=b.bh.z):
-            return Y(z - d)
+        def YA(d, bh=a.bh):
+            return Y(bh.z_at(d))
+
+        def YB(d, bh=b.bh):
+            return Y(bh.z_at(d))
+
         LAk, LBk = LAY[id(a.bh)], LAY[id(b.bh)]
         faulted = k in faults
         sec = qsec = None
         if not faulted:
-            sec = fence_secant(LAk, LBk, a.bh.z, b.bh.z, xa, xb, YA, YB)
+            sec = _fence_secant_inclined(LAk, LBk, YA, YB, x_A, x_B)
         matched = sec is not None
-        ground = (Y(b.bh.z) - Y(a.bh.z)) / (xb - xa)
+        dx_g = pLB0[0] - pRA0[0]
+        ground = (pLB0[1] - pRA0[1]) / dx_g if abs(dx_g) > 1e-6 else 0.0
         if faulted:
             qa, qb = _quat_run(LAk), _quat_run(LBk)
             if qa and qb:
-                qsec = fence_secant(LAk[:qa], LBk[:qb], a.bh.z, b.bh.z, xa, xb, YA, YB)
+                qsec = _fence_secant_inclined(LAk[:qa], LBk[:qb], YA, YB, x_A, x_B)
                 if qsec is None:
                     qsec = ground
         if sec is None:         # nothing correlated: follow the ground surface
             sec = ground
-        fences.append((xa, xb, YA, YB, sec, faulted, qsec, matched))
+        fences.append((0.0, span_ref, YA, YB, sec, faulted, qsec, matched,
+                       x_A, x_B, y_cross_hi, y_cross_lo))
 
     def real_sec(k):            # dip usable for neighbours (Quaternary continues over faults)
         fc = fences[k] if 0 <= k < len(fences) else None
@@ -1195,9 +1401,18 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
     for k, fc in enumerate(fences):
         if fc is None:
             continue
-        xa, xb, YA, YB, sec, faulted, qsec, matched = fc
+        xa, xb, YA, YB, sec, faulted, qsec, matched, x_A, x_B, y_cross_hi, y_cross_lo = fc
         LA, LB = LAY[id(proj[k].bh)], LAY[id(proj[k + 1].bh)]
         zA, zB = proj[k].bh.z, proj[k + 1].bh.z
+
+        def map_polys(raw_polys):
+            res = []
+            for pts, lit, age in raw_polys:
+                mp = _map_to_inclined(pts, xb, x_A, x_B, y_cross_hi, y_cross_lo)
+                if len(mp) >= 3:
+                    res.append((mp, lit, age))
+            return res
+
         if faulted:
             f = faults[k]
             sl, sr = block_sec(k - 1), block_sec(k + 1)
@@ -1211,47 +1426,57 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
                 dq = (LA[qa - 1].bottom, LB[qb - 1].bottom)
                 dipsq = (qsec, blend_slopes(real_sec(k - 1), qsec),
                          blend_slopes(qsec, real_sec(k + 1))) if use_dip else None
-                out += fence_polygons(LA[:qa], LB[:qb], zA, zB, xa, xb, YA, YB,
-                                      curvature, roundness, dipsq, transitions, None, True)
+                out += map_polys(fence_polygons(LA[:qa], LB[:qb], zA, zB, xa, xb, YA, YB,
+                                                curvature, roundness, dipsq, transitions, None, True))
                 G = _contact_curve(xa, xb, YA(dq[0]), YB(dq[1]), dipsq, curvature)
                 top = dq
                 LA, LB = LA[qa:], LB[qb:]
             polys, line = fault_polygons(LA, LB, xa, xb, YA, YB, f.get("pos", 0.5),
                                          f.get("dip", 80.0), f.get("dir", 1), mA, mB, aspect,
                                          G, top)
-            out += polys
-            lines.append(line)
+            out += map_polys(polys)
+            (fx1, fy1), (fx2, fy2) = line
+            u1, u2 = fx1 / xb, fx2 / xb
+            lines.append((((1.0 - u1) * x_A(fy1) + u1 * x_B(fy1), fy1),
+                          ((1.0 - u2) * x_A(fy2) + u2 * x_B(fy2), fy2)))
             continue
         sl, sr = real_sec(k - 1), real_sec(k + 1)
         dips = (sec, blend_slopes(sl, sec), blend_slopes(sec, sr)) if use_dip else None
         qa, qb = _quat_run(LA), _quat_run(LB)
         if qa and qb and qa < len(LA) and qb < len(LB):
             # Quaternary cover is a separate, continuous sequence (never terminated)
-            out += fence_polygons(LA[:qa], LB[:qb], zA, zB, xa, xb, YA, YB,
-                                  curvature, roundness, dips, transitions, None, True)
+            out += map_polys(fence_polygons(LA[:qa], LB[:qb], zA, zB, xa, xb, YA, YB,
+                                            curvature, roundness, dips, transitions, None, True))
             qlast = (LA[qa - 1], LB[qb - 1])
             base = _contact_curve(xa, xb, YA(qlast[0].bottom), YB(qlast[1].bottom), dips,
                                   curvature)
             LA, LB = LA[qa:], LB[qb:]
             rest = fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB,
                                   curvature, roundness, dips, transitions, bedrock)
-            out += rest
-            out += _fill_cover_gap(rest, base, xa, xb, qlast[0], qlast[1])
+            out += map_polys(rest)
+            out += map_polys(_fill_cover_gap(rest, base, xa, xb, qlast[0], qlast[1]))
         else:
-            out += fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB,
-                                  curvature, roundness, dips, transitions, bedrock)
+            out += map_polys(fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB,
+                                            curvature, roundness, dips, transitions, bedrock))
     return out, lines
+
+
+def _section_bounds(proj):
+    """(d0, d1, zmax, zmin) accounting for collar and inclined bottom positions."""
+    ds = [d for p in proj for d in (p.d_top, p.d_bot)]
+    d0, d1 = min(ds), max(ds)
+    zmax = max(p.bh.z for p in proj)
+    zmin = min(p.bh.z_at(p.bh.depth) for p in proj)
+    return d0, d1, zmax, zmin
 
 
 def section_geo(proj, vexag=0.0, curvature=0.6, roundness=0.6, merge_same=False,
                 use_dip=True, transitions=True, bedrock_dip=0.0):
     """Geometry of a section in scene units (the same as build_section_scene(...).geo)
     without creating any graphics."""
-    d0, d1 = proj[0].dist, proj[-1].dist
+    d0, d1, zmax, zmin = _section_bounds(proj)
     span = max(d1 - d0, 1.0)
     kx = 1000.0 / span
-    zmax = max(p.bh.z for p in proj)
-    zmin = min(p.bh.z - p.bh.depth for p in proj)
     ky = kx * vexag if vexag > 0 else 450.0 / max(zmax - zmin, 1.0)
     cw = 16.0
 
@@ -1269,28 +1494,22 @@ def section_geo(proj, vexag=0.0, curvature=0.6, roundness=0.6, merge_same=False,
                                     transitions, None, ky / kx, bedrock)
     cols = []
     for p in proj:
-        x = X(p.dist)
+        cg = _bh_column_geom(p, X, Y, cw)
         for L in LAY[id(p.bh)]:
-            y1, y2 = Y(p.bh.z - L.top), Y(p.bh.z - L.bottom)
-            cols.append(([(x - cw / 2, y1), (x + cw / 2, y1), (x + cw / 2, y2), (x - cw / 2, y2)],
-                         L.litho, L.age))
+            cols.append((cg["quad"](L.top, L.bottom), L.litho, L.age))
     return {"polys": polys, "cols": cols, "d0": d0, "kx": kx, "ky": ky, "zmax": zmax,
             "line": None, "strat_items": [], "terrain_items": []}
 
 
-def hatch_brush(grain):
-    """Translucent hatching for a grain class (clay, silt, sand, gravel) - the same
-    hatch styles as in the borehole profiles (logs.to_scene); None for an unknown class."""
-    styles = {"clay": Qt.BrushStyle.HorPattern, "silt": Qt.BrushStyle.Dense5Pattern,
-              "sand": Qt.BrushStyle.Dense6Pattern, "gravel": Qt.BrushStyle.DiagCrossPattern}
-    style = styles.get(grain)
-    return QBrush(QColor(0, 0, 0, 110), style) if style is not None else None
+def hatch_brush(code):
+    """Brush with the FGDC lithologic pattern `code` (patterns.py); None when there is none."""
+    return _patterns.pattern_brush(code, 0.35) if code else None
 
 
 def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
                         curvature=0.6, roundness=0.6, merge_same=False,
                         use_dip=True, transitions=True, faults=None, bedrock_dip=0.0,
-                        strat_lines=True, grains=None):
+                        strat_lines=True, patterns=None):
     """Return a QGraphicsScene with the cross section. vexag<=0 -> auto."""
     scene = QGraphicsScene()
     scene.setBackgroundBrush(QBrush(Qt.GlobalColor.white))
@@ -1307,11 +1526,9 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
         it.setZValue(5)
         return it
 
-    d0, d1 = proj[0].dist, proj[-1].dist
+    d0, d1, zmax, zmin = _section_bounds(proj)
     span = max(d1 - d0, 1.0)
     kx = 1000.0 / span
-    zmax = max(p.bh.z for p in proj)
-    zmin = min(p.bh.z - p.bh.depth for p in proj)
     zr = max(zmax - zmin, 1.0)
     ky = kx * vexag if vexag > 0 else 450.0 / zr
     cw = 16.0
@@ -1343,14 +1560,15 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
     if merge_same:
         LAY = {k: merge_same_lithology(v) for k, v in LAY.items()}
 
-    hatch_items = []        # hatching by grain size, shown or hidden in the section window
+    hatch_items = []        # lithologic patterns, shown or hidden in the section window
     no_pen = QPen(Qt.PenStyle.NoPen)
 
     def add_hatch(item_poly, lit, z):
-        brush = hatch_brush(grains.get(lit)) if grains else None
+        brush = hatch_brush(patterns.get(lit)) if patterns else None
         if brush is not None:
             h = item_poly(brush)
             h.setZValue(z)
+            h.setOpacity(0.85)
             hatch_items.append(h)
 
     # correlation polygons
@@ -1371,25 +1589,32 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
             ln.setZValue(4)
             text(f"F{n_f}", x1, y1 - 18, 9, "c", True, QColor(170, 0, 0))
 
-    # boreholes
+    # boreholes (vertical or inclined)
+    col_geoms = {}
     for p in proj:
-        bh, x = p.bh, X(p.dist)
-        full = scene.addRect(x - cw / 2, Y(bh.z), cw, (bh.depth) * ky,
-                             QPen(Qt.GlobalColor.black, 1), QBrush(Qt.GlobalColor.white))
+        bh = p.bh
+        cg = _bh_column_geom(p, X, Y, cw)
+        col_geoms[id(bh)] = cg
+        q_full = QPolygonF([QPointF(px, py) for px, py in cg["quad"](0.0, bh.depth)])
+        full = scene.addPolygon(q_full, QPen(Qt.GlobalColor.black, 1), QBrush(Qt.GlobalColor.white))
         full.setZValue(1)
         for L in LAY[id(bh)]:
             c = colors.get(L.litho, QColor(Qt.GlobalColor.gray))
-            r = scene.addRect(x - cw / 2, Y(bh.z - L.top), cw, (L.bottom - L.top) * ky,
-                              QPen(Qt.GlobalColor.black, 0.8), QBrush(c))
+            q_lay = QPolygonF([QPointF(px, py) for px, py in cg["quad"](L.top, L.bottom)])
+            r = scene.addPolygon(q_lay, QPen(Qt.GlobalColor.black, 0.8), QBrush(c))
             r.setZValue(2)
-            add_hatch(lambda b, x=x, L=L: scene.addRect(x - cw / 2, Y(bh.z - L.top), cw,
-                                                        (L.bottom - L.top) * ky, no_pen, b),
-                      L.litho, 2.5)
+            add_hatch(lambda b, q_lay=q_lay: scene.addPolygon(q_lay, no_pen, b), L.litho, 2.5)
         if labels:
-            text(bh.name, x, Y(bh.z) - 36, 9, "c", True)
-            text(f"{bh.z:.2f}", x, Y(bh.z) - 20, 8)
-            text(f"{bh.z - bh.depth:.2f}", x, Y(bh.z - bh.depth) + 3, 8)
-            text(f"d={p.dist - d0:.1f} m\noff={p.offset:.1f} m", x, Y(zmin) + 22, 7)
+            x_top, y_top = cg["x0"], cg["y0"]
+            x_bot, y_bot = cg["x1"], cg["y1"]
+            z_bot = bh.z_at(bh.depth)
+            text(bh.name, x_top, y_top - 36, 9, "c", True)
+            text(f"{bh.z:.2f}", x_top, y_top - 20, 8)
+            text(f"{z_bot:.2f}", x_bot, y_bot + 3, 8)
+            info_lbl = f"d={p.d_top - d0:.1f} m\noff={p.offset:.1f} m"
+            if bh.dip > 0:
+                info_lbl += f"\naz={bh.azimuth:g}°, dip={bh.dip:g}°"
+            text(info_lbl, x_top, Y(zmin) + 22, 7)
 
     # interfaces between stratigraphic sequences of different age
     strat_pen = QPen(QColor(30, 30, 30), 2.6)
@@ -1397,21 +1622,19 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
     strat_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
     cols = []
     for p in proj:
-        x = X(p.dist)
+        cg = col_geoms[id(p.bh)]
         for L in LAY[id(p.bh)]:
-            y1, y2 = Y(p.bh.z - L.top), Y(p.bh.z - L.bottom)
-            cols.append(([(x - cw / 2, y1), (x + cw / 2, y1), (x + cw / 2, y2), (x - cw / 2, y2)],
-                         L.litho, L.age))
+            cols.append((cg["quad"](L.top, L.bottom), L.litho, L.age))
     strat_found = False
     strat_items, terrain_items = [], []
     if strat_lines:
         for p in proj:
-            x = X(p.dist)
+            cg = col_geoms[id(p.bh)]
             lays = LAY[id(p.bh)]
             for L1, L2 in zip(lays, lays[1:]):
                 if _age_disjoint(L1.age, L2.age):
-                    yy = Y(p.bh.z - L2.top)
-                    it = scene.addLine(x - cw / 2, yy, x + cw / 2, yy, strat_pen)
+                    pL, pR = cg["left"](L2.top), cg["right"](L2.top)
+                    it = scene.addLine(pL[0], pL[1], pR[0], pR[1], strat_pen)
                     it.setZValue(3)
                     strat_items.append(it)
                     strat_found = True
@@ -1429,10 +1652,10 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
             # stratigraphic boundary lines are optional decoration; the section is still drawn
             log_warning(f"Stratigraphic boundary lines skipped: {type(e).__name__}: {e}")
 
-    # terrain
+    # terrain (connects borehole collars)
     pen = QPen(QColor(40, 120, 40), 1.6)
     for a, b in zip(proj, proj[1:]):
-        it = scene.addLine(X(a.dist), Y(a.bh.z), X(b.dist), Y(b.bh.z), pen)
+        it = scene.addLine(X(a.d_top), Y(a.bh.z), X(b.d_top), Y(b.bh.z), pen)
         it.setZValue(3)
         terrain_items.append(it)
 
@@ -1464,13 +1687,14 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
 # ------------------------------------------------------------------- layers
 def make_borehole_point_layer(boreholes):
     lyr = QgsVectorLayer(
-        f"PointZ?crs={CRS_SJTSK}&field=name:string&field=z:double&field=depth:double",
+        f"PointZ?crs={CRS_SJTSK}&field=name:string&field=z:double&field=depth:double"
+        "&field=azimuth:double&field=dip:double",
         "Boreholes", "memory")
     feats = []
     for b in boreholes:
         f = QgsFeature(lyr.fields())
         f.setGeometry(QgsGeometry(QgsPoint(b.x, b.y, b.z)))
-        f.setAttributes([b.name, b.z, b.depth])
+        f.setAttributes([b.name, b.z, b.depth, b.azimuth, b.dip])
         feats.append(f)
     lyr.dataProvider().addFeatures(feats)
     lyr.updateExtents()
@@ -1487,7 +1711,7 @@ def make_3d_interval_layer(boreholes):
         for L in b.layers:
             f = QgsFeature(lyr.fields())
             f.setGeometry(QgsGeometry(QgsLineString([
-                QgsPoint(b.x, b.y, b.z - L.top), QgsPoint(b.x, b.y, b.z - L.bottom)])))
+                QgsPoint(*b.point_at(L.top)), QgsPoint(*b.point_at(L.bottom))])))
             f.setAttributes([b.name, L.litho, L.top, L.bottom])
             feats.append(f)
     lyr.dataProvider().addFeatures(feats)

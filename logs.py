@@ -5,8 +5,8 @@ so the layout does not depend on Qt; ``to_scene`` turns the list into a QGraphic
 
 Two figures are offered:
 
-* ``build_profiles``  - up to four borehole columns side by side with a depth ruler and the
-                        description of every layer written next to the column,
+* ``build_profiles``  - up to four borehole columns side by side with a depth ruler, a
+                        lithology and a stratigraphy column and the description of every layer,
 * ``build_records``   - sedimentary records: the column width follows the grain size
                         (clay / silt / sand / gravel) and an "Index" legend lists the rock types.
 """
@@ -14,6 +14,7 @@ import math
 import string
 
 from . import core
+from . import patterns as pat
 
 GRAINS = ["clay", "silt", "sand", "gravel"]
 GRAIN_LABELS = {"clay": "Clay", "silt": "Silt", "sand": "Sand", "gravel": "Gravel"}
@@ -212,11 +213,39 @@ def _layout_labels(items, line_h):
     return boxes
 
 
-def build_profiles(bhs, colors, grains, mode="depth", px_per_m=0.0, measure=approx_measure,
-                   show_pattern=True):
+# colours of the geological periods (ICS), same order as core.STRAT_NAMES
+STRAT_COLORS = ["#F9F97F", "#FFE619", "#FD9A52", "#7FC64E", "#34B2C9", "#812B92", "#F04028",
+                "#67A599", "#CB8C37", "#B3E1B6", "#009270", "#7FA056", "#F74370"]
+STRAT_W = 66.0
+
+
+def strat_color(age):
+    """Colour of a period; a span of several periods gets the mean of its two ends."""
+    a, b = STRAT_COLORS[age[0]], STRAT_COLORS[age[1]]
+    mix = [(int(a[i:i + 2], 16) + int(b[i:i + 2], 16)) // 2 for i in (1, 3, 5)]
+    return "#%02x%02x%02x" % tuple(mix)
+
+
+def strat_blocks(layers):
+    """[(top, bottom, age)] - neighbouring layers of the same age form one block."""
+    blocks = []
+    for L in layers:
+        if L.age is None:
+            continue
+        if blocks and blocks[-1][2] == L.age and abs(blocks[-1][1] - L.top) < 1e-6:
+            blocks[-1][1] = L.bottom
+        else:
+            blocks.append([L.top, L.bottom, L.age])
+    return blocks
+
+
+def build_profiles(bhs, colors, patterns, mode="depth", px_per_m=0.0, measure=approx_measure,
+                   show_pattern=True, show_strat=True):
     """Primitives of up to four borehole columns with descriptions.
 
-    colors: litho -> '#rrggbb';  grains: litho -> grain class;  mode: 'depth' or 'alt'."""
+    colors: litho -> '#rrggbb';  patterns: litho -> FGDC pattern code ('' = none);
+    mode: 'depth' or 'alt'.  A stratigraphy column is added next to the lithology column
+    when the layers have a stratigraphy."""
     cmds = []
     v_top, v_bot = _extent(bhs, mode)
     span = max(v_bot - v_top if mode == "depth" else v_top - v_bot, 1e-6)
@@ -232,11 +261,16 @@ def build_profiles(bhs, colors, grains, mode="depth", px_per_m=0.0, measure=appr
     cmds.append(_text("Depth [m]" if mode == "depth" else "Altitude [m a.s.l.]",
                       ruler_x - 54, TOP - 40, 9, "l", bold=True))
 
+    sw = STRAT_W if show_strat and any(L.age for b in bhs for L in _clean(b)) else 0.0
     x0 = ruler_x + 70
     for bh in bhs:
         layers = _clean(bh)
         z0 = bh.z
-        cmds.append(_text(bh.name, x0 + COL_W / 2, TOP - 50, 15, "c", bold=True))
+        cmds.append(_text(bh.name, x0 + (COL_W + sw) / 2, TOP - 50, 15, "c", bold=True))
+        if bh.dip > 0:
+            cmds.append(_text(f"az {bh.azimuth:g}°, dip {bh.dip:g}°",
+                              x0 + (COL_W + sw) / 2, TOP - 32, 8, "c"))
+        cmds.append(_text("Lithology", x0 + COL_W / 2, TOP - 20, 8, "c"))
         # ground marker
         ytop = y_of(0.0 if mode == "depth" else z0)
         cmds.append(_rect(x0, ytop - 5, COL_W, 5, "#ffffff", "#000000", 0.8, "ground"))
@@ -246,13 +280,27 @@ def build_profiles(bhs, colors, grains, mode="depth", px_per_m=0.0, measure=appr
             b = L.bottom if mode == "depth" else z0 - L.bottom
             y1, y2 = y_of(a), y_of(b)
             col = colors.get(L.litho, "#cccccc")
-            gr = grains.get(L.litho, DEFAULT_GRAIN)
             cmds.append(_rect(x0, y1, COL_W, y2 - y1, col, "#303030", 0.6))
-            if show_pattern:
-                cmds.append(_rect(x0, y1, COL_W, y2 - y1, None, "#303030", 0.0, gr))
+            if show_pattern and patterns.get(L.litho):
+                cmds.append(_rect(x0, y1, COL_W, y2 - y1, None, "#303030", 0.0, patterns[L.litho]))
             items.append((y1, y2, wrap_text(L.litho, LABEL_W - 40, measure, 10), L.litho))
+        # stratigraphy column next to the lithology column
+        if sw:
+            cmds.append(_text("Stratigraphy", x0 + COL_W + sw / 2, TOP - 20, 8, "c"))
+            for t, b, age in strat_blocks(layers):
+                a = t if mode == "depth" else z0 - t
+                bb = b if mode == "depth" else z0 - b
+                y1, y2 = y_of(a), y_of(bb)
+                cmds.append(_rect(x0 + COL_W, y1, sw, y2 - y1, strat_color(age), "#303030", 0.8))
+                txt = core.age_label(age).capitalize()
+                lines = [txt] if measure(txt, 8) <= sw - 6 else wrap_text(
+                    txt.replace("-", "- "), sw - 6, measure, 8)
+                if len(lines) * 11.0 <= y2 - y1:
+                    for i, s in enumerate(lines):
+                        cmds.append(_text(s, x0 + COL_W + sw / 2,
+                                          (y1 + y2) / 2 - len(lines) * 5.5 + i * 11.0, 8, "c"))
         # descriptions
-        lx0, lx1 = x0 + COL_W + 6, x0 + COL_W + LABEL_W
+        lx0, lx1 = x0 + COL_W + sw + 6, x0 + COL_W + sw + LABEL_W
         boxes = _layout_labels([(a, b, ln) for a, b, ln, _ in items], line_h)
         for (y1, y2, lines, _), (b0, b1) in zip(items, boxes):
             slanted = abs(b0 - y1) > 2.5 or abs(b1 - y2) > 2.5
@@ -269,7 +317,7 @@ def build_profiles(bhs, colors, grains, mode="depth", px_per_m=0.0, measure=appr
             cy = mid - len(lines) * line_h / 2
             for i, s in enumerate(lines):
                 cmds.append(_text(s, (tx0 + lx1) / 2, cy + i * line_h - 1, 10, "c"))
-        x0 += COL_W + LABEL_W + GAP
+        x0 += COL_W + sw + LABEL_W + GAP
     return cmds
 
 
@@ -279,9 +327,12 @@ HEAD_H = 58.0
 REC_TOP = 110.0
 
 
-def build_records(bhs, colors, grains, px_per_m=0.0, measure=approx_measure, letters=True,
-                  legend=True, mode="depth"):
-    """Sedimentary records side by side + an 'Index' legend (rock type and grain size)."""
+def build_records(bhs, colors, grains, patterns=None, px_per_m=0.0, measure=approx_measure,
+                  letters=True, legend=True, mode="depth"):
+    """Sedimentary records side by side + an 'Index' legend (rock type and grain size).
+
+    grains: litho -> grain class (column width);  patterns: litho -> FGDC pattern code."""
+    patterns = patterns or {}
     cmds = []
     v_top, v_bot = _extent(bhs, mode)
     span = max(v_bot - v_top if mode == "depth" else v_top - v_bot, 1e-6)
@@ -320,7 +371,8 @@ def build_records(bhs, colors, grains, px_per_m=0.0, measure=approx_measure, let
             w = CELL * (GRAINS.index(gr) + 1)
             y1, y2 = y_of(a), y_of(b)
             cmds.append(_rect(x0, y1, w, y2 - y1, colors.get(L.litho, "#cccccc"), "#000000", 0.9))
-            cmds.append(_rect(x0, y1, w, y2 - y1, None, "#000000", 0.0, gr))
+            if patterns.get(L.litho):
+                cmds.append(_rect(x0, y1, w, y2 - y1, None, "#000000", 0.0, patterns[L.litho]))
             if L.litho not in used:
                 used.append(L.litho)
         if letters:
@@ -337,21 +389,22 @@ def build_records(bhs, colors, grains, px_per_m=0.0, measure=approx_measure, let
             y = ly + i * row
             gr = grains.get(lit, DEFAULT_GRAIN)
             cmds.append(_rect(lx, y, 40, 18, colors.get(lit, "#cccccc"), "#000000", 0.9))
-            cmds.append(_rect(lx, y, 40, 18, None, "#000000", 0.0, gr))
+            if patterns.get(lit):
+                cmds.append(_rect(lx, y, 40, 18, None, "#000000", 0.0, patterns[lit]))
             cmds.append(_text(f"{lit}  ({GRAIN_LABELS[gr].lower()})", lx + 50, y + 1, 10, "l"))
     return cmds
 
 
 # ------------------------------------------------------------------- scene
-def to_scene(cmds):
-    """QGraphicsScene with the primitives (imported here: the module works without Qt)."""
+def to_scene(cmds, pattern_scale=0.45):
+    """QGraphicsScene with the primitives (imported here: the module works without Qt).
+
+    A polygon with a pattern code is drawn with the FGDC pattern tile (see patterns.py);
+    'ground' is the hatched ground marker.  pattern_scale = size of the tiles (1 = 300 dpi)."""
     from qgis.PyQt.QtCore import Qt, QPointF
     from qgis.PyQt.QtGui import QBrush, QColor, QFont, QPen, QPolygonF
     from qgis.PyQt.QtWidgets import QGraphicsScene
 
-    styles = {"clay": Qt.BrushStyle.HorPattern, "silt": Qt.BrushStyle.Dense5Pattern,
-              "sand": Qt.BrushStyle.Dense6Pattern, "gravel": Qt.BrushStyle.DiagCrossPattern,
-              "ground": Qt.BrushStyle.BDiagPattern}
     scene = QGraphicsScene()
     scene.setBackgroundBrush(QBrush(Qt.GlobalColor.white))
     for c in cmds:
@@ -359,15 +412,16 @@ def to_scene(cmds):
             _, pts, fill, pen, pw, pattern = c
             poly = QPolygonF([QPointF(x, y) for x, y in pts])
             p = QPen(QColor(pen), pw) if pw > 0 else QPen(Qt.PenStyle.NoPen)
-            if pattern in styles:
-                color = QColor(0, 0, 0, 110)
-                if fill is None:
-                    b = QBrush(color, styles[pattern])
+            if pattern:
+                if pattern == "ground":
+                    b = QBrush(QColor(0, 0, 0), Qt.BrushStyle.BDiagPattern)
                 else:
-                    b = QBrush(QColor(fill), styles[pattern])
-                    b.setColor(color)
+                    b = pat.pattern_brush(pattern, pattern_scale)
+                if b is None:
+                    continue
                 it = scene.addPolygon(poly, p, b)
                 it.setZValue(2)
+                it.setOpacity(0.85)
             else:
                 b = QBrush(QColor(fill)) if fill else QBrush(Qt.BrushStyle.NoBrush)
                 it = scene.addPolygon(poly, p, b)
