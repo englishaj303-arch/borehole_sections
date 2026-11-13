@@ -124,7 +124,7 @@ def _extent(bhs, mode):
     """(value of the top, value of the bottom) covering all boreholes."""
     if mode == "alt":
         return (max(b.z for b in bhs),
-                min(b.z - max([L.bottom for L in b.layers] or [b.depth]) for b in bhs))
+                min(b.z_at(max([L.bottom for L in b.layers] or [b.depth])) for b in bhs))
     return 0.0, max(max([L.bottom for L in b.layers] or [b.depth]) for b in bhs)
 
 
@@ -135,81 +135,19 @@ GAP = 40.0
 TOP = 70.0
 
 
-def _spread(wish, hgt):
-    """Boxes of the given heights as close to their wished starts as possible, not overlapping
-    (neighbouring boxes that collide are shifted together around their wished position)."""
-    clusters = []                       # [first index, last index, start y]
-
-    def start_of(i0, i1):
-        off, tot = 0.0, 0.0
-        for j in range(i0, i1 + 1):
-            tot += wish[j] - off
-            off += hgt[j]
-        return tot / (i1 - i0 + 1)
-
-    for i in range(len(wish)):
-        cl = [i, i, wish[i]]
-        while clusters:
-            p = clusters[-1]
-            if p[2] + sum(hgt[p[0]:p[1] + 1]) <= cl[2] + 1e-6:
-                break
-            clusters.pop()
-            cl = [p[0], i, start_of(p[0], i)]
-        clusters.append(cl)
-    out = []
-    for i0, i1, y in clusters:
-        for j in range(i0, i1 + 1):
-            out.append([y, y + hgt[j]])
-            y += hgt[j]
-    return out
-
-
 def _layout_labels(items, line_h):
     """items: [(top_y, bottom_y, lines)] sorted by depth.  Returns [(box_top, box_bottom)].
 
-    A label whose text fits into its layer keeps the extent of the layer.  The labels of thin
-    layers get a box centred on the layer, pushed apart from each other and kept inside the
-    free space between the fitting labels (if the space is too small the lower ones move down)."""
-    n = len(items)
-    need = [len(lines) * line_h + 4 for _, _, lines in items]
-    fits = [need[i] <= items[i][1] - items[i][0] for i in range(n)]
-    boxes = [None] * n
-    cursor, i = -1e9, 0
-    while i < n:
-        if fits[i]:
-            top = max(items[i][0], cursor)
-            boxes[i] = (top, top + (items[i][1] - items[i][0]))
-            cursor = boxes[i][1]
-            i += 1
-            continue
-        j = i
-        while j < n and not fits[j]:
-            j += 1
-        hi = items[j][0] if j < n else 1e9
-        hgt = [need[m] for m in range(i, j)]
-        wish = [(items[m][0] + items[m][1]) / 2 - need[m] / 2 for m in range(i, j)]
-        grp = _spread(wish, hgt)
-        prev = cursor
-        for g in grp:                           # not above the previous box
-            d = max(prev - g[0], 0.0)
-            g[0] += d
-            g[1] += d
-            prev = g[1]
-        lim = hi
-        for g in reversed(grp):                 # not into the next fitting box, if possible
-            d = max(g[1] - lim, 0.0)
-            g[0] -= d
-            g[1] -= d
-            lim = g[0]
-        prev = cursor
-        for g in grp:
-            d = max(prev - g[0], 0.0)
-            g[0] += d
-            g[1] += d
-            prev = g[1]
-            boxes[i + grp.index(g)] = (g[0], g[1])
-        cursor = prev
-        i = j
+    A label box starts at the top of its layer and is at least as high as its text; when
+    the text does not fit into a thin layer the box hangs below the layer and the next
+    boxes are pushed down (like the descriptions in a classical borehole log)."""
+    boxes, prev = [], -1e9
+    for top, bot, lines in items:
+        need = len(lines) * line_h + 4
+        b0 = max(top, prev)
+        b1 = max(bot, b0 + need)
+        boxes.append((b0, b1))
+        prev = b1
     return boxes
 
 
@@ -244,13 +182,14 @@ def build_profiles(bhs, colors, patterns, mode="depth", px_per_m=0.0, measure=ap
     """Primitives of up to four borehole columns with descriptions.
 
     colors: litho -> '#rrggbb';  patterns: litho -> FGDC pattern code ('' = none);
-    mode: 'depth' or 'alt'.  A stratigraphy column is added next to the lithology column
-    when the layers have a stratigraphy."""
+    mode: 'depth' or 'alt'.  Left to right: the lithology column, the description of the
+    layers and (when the layers have a stratigraphy) the stratigraphy column."""
     cmds = []
     v_top, v_bot = _extent(bhs, mode)
     span = max(v_bot - v_top if mode == "depth" else v_top - v_bot, 1e-6)
     k = px_per_m if px_per_m > 0 else max(8.0, min(60.0, 900.0 / span))
     line_h = 13.0
+    slant = 14.0
 
     def y_of(v):                           # v = depth, or altitude in 'alt' mode
         return TOP + ((v - v_top) if mode == "depth" else (v_top - v)) * k
@@ -266,58 +205,54 @@ def build_profiles(bhs, colors, patterns, mode="depth", px_per_m=0.0, measure=ap
     for bh in bhs:
         layers = _clean(bh)
         z0 = bh.z
-        cmds.append(_text(bh.name, x0 + (COL_W + sw) / 2, TOP - 50, 15, "c", bold=True))
+        lx0, lx1 = x0 + COL_W + 6, x0 + COL_W + LABEL_W          # description column
+        sx = lx1 + 6                                             # stratigraphy column
+        cmds.append(_text(bh.name, x0 + COL_W / 2, TOP - 50, 15, "c", bold=True))
         if bh.dip > 0:
             cmds.append(_text(f"az {bh.azimuth:g}°, dip {bh.dip:g}°",
-                              x0 + (COL_W + sw) / 2, TOP - 32, 8, "c"))
+                              x0 + COL_W / 2, TOP - 32, 8, "c"))
         cmds.append(_text("Lithology", x0 + COL_W / 2, TOP - 20, 8, "c"))
         # ground marker
         ytop = y_of(0.0 if mode == "depth" else z0)
         cmds.append(_rect(x0, ytop - 5, COL_W, 5, "#ffffff", "#000000", 0.8, "ground"))
         items = []
         for L in layers:
-            a = L.top if mode == "depth" else z0 - L.top
-            b = L.bottom if mode == "depth" else z0 - L.bottom
+            a = L.top if mode == "depth" else bh.z_at(L.top)
+            b = L.bottom if mode == "depth" else bh.z_at(L.bottom)
             y1, y2 = y_of(a), y_of(b)
-            col = colors.get(L.litho, "#cccccc")
-            cmds.append(_rect(x0, y1, COL_W, y2 - y1, col, "#303030", 0.6))
+            cmds.append(_rect(x0, y1, COL_W, y2 - y1, colors.get(L.litho, "#cccccc"), "#303030", 0.6))
             if show_pattern and patterns.get(L.litho):
                 cmds.append(_rect(x0, y1, COL_W, y2 - y1, None, "#303030", 0.0, patterns[L.litho]))
-            items.append((y1, y2, wrap_text(L.litho, LABEL_W - 40, measure, 10), L.litho))
-        # stratigraphy column next to the lithology column
+            items.append((y1, y2, wrap_text(L.desc or L.litho, LABEL_W - 2 * slant - 8, measure, 10)))
+        # descriptions: separating lines; a label that does not fit into a thin layer
+        # hangs below it as a trapezoid (narrower at the bottom)
+        boxes = _layout_labels(items, line_h)
+        for (y1, y2, lines), (b0, b1) in zip(items, boxes):
+            if len(lines) * line_h + 4 > y2 - y1:      # the text does not fit into the layer
+                cmds.append(_poly([(lx0, b0), (lx1, b0), (lx1 - slant, b1), (lx0 + slant, b1)],
+                                  None, "#000000", 0.8))
+            else:
+                cmds.append(_line(lx0, b0, lx1, b0, "#000000", 0.8))
+                cmds.append(_line(lx0, b1, lx1, b1, "#000000", 0.8))
+            cy = (b0 + b1) / 2 - len(lines) * line_h / 2
+            for i, s in enumerate(lines):
+                cmds.append(_text(s, (lx0 + lx1) / 2, cy + i * line_h - 1, 10, "c"))
+        # stratigraphy column
         if sw:
-            cmds.append(_text("Stratigraphy", x0 + COL_W + sw / 2, TOP - 20, 8, "c"))
+            cmds.append(_text("Stratigraphy", sx + sw / 2, TOP - 20, 8, "c"))
             for t, b, age in strat_blocks(layers):
-                a = t if mode == "depth" else z0 - t
-                bb = b if mode == "depth" else z0 - b
+                a = t if mode == "depth" else bh.z_at(t)
+                bb = b if mode == "depth" else bh.z_at(b)
                 y1, y2 = y_of(a), y_of(bb)
-                cmds.append(_rect(x0 + COL_W, y1, sw, y2 - y1, strat_color(age), "#303030", 0.8))
+                cmds.append(_rect(sx, y1, sw, y2 - y1, strat_color(age), "#303030", 0.8))
                 txt = core.age_label(age).capitalize()
                 lines = [txt] if measure(txt, 8) <= sw - 6 else wrap_text(
                     txt.replace("-", "- "), sw - 6, measure, 8)
                 if len(lines) * 11.0 <= y2 - y1:
                     for i, s in enumerate(lines):
-                        cmds.append(_text(s, x0 + COL_W + sw / 2,
+                        cmds.append(_text(s, sx + sw / 2,
                                           (y1 + y2) / 2 - len(lines) * 5.5 + i * 11.0, 8, "c"))
-        # descriptions
-        lx0, lx1 = x0 + COL_W + sw + 6, x0 + COL_W + sw + LABEL_W
-        boxes = _layout_labels([(a, b, ln) for a, b, ln, _ in items], line_h)
-        for (y1, y2, lines, _), (b0, b1) in zip(items, boxes):
-            slanted = abs(b0 - y1) > 2.5 or abs(b1 - y2) > 2.5
-            if slanted:
-                # trapezoid: the box is displaced, its sides lead to the layer
-                cmds.append(_poly([(lx0, y1), (lx0 + 18, b0), (lx1, b0)], None, "#000000", 0.8))
-                cmds.append(_poly([(lx0, y2), (lx0 + 18, b1), (lx1, b1)], None, "#000000", 0.8))
-                tx0 = lx0 + 18
-            else:
-                cmds.append(_line(lx0, b0, lx1, b0, "#000000", 0.8))
-                cmds.append(_line(lx0, b1, lx1, b1, "#000000", 0.8))
-                tx0 = lx0
-            mid = (b0 + b1) / 2 if slanted else (y1 + y2) / 2
-            cy = mid - len(lines) * line_h / 2
-            for i, s in enumerate(lines):
-                cmds.append(_text(s, (tx0 + lx1) / 2, cy + i * line_h - 1, 10, "c"))
-        x0 += COL_W + sw + LABEL_W + GAP
+        x0 = sx + sw + GAP + (6 if sw else 0)
     return cmds
 
 
@@ -365,16 +300,16 @@ def build_records(bhs, colors, grains, patterns=None, px_per_m=0.0, measure=appr
             cmds.append(_line(x0 + i * CELL, REC_TOP, x0 + i * CELL, bottom_px,
                               "#b0b0b0", 0.6, True))
         for L in layers:
-            a = L.top if mode == "depth" else z0 - L.top
-            b = L.bottom if mode == "depth" else z0 - L.bottom
+            a = L.top if mode == "depth" else bh.z_at(L.top)
+            b = L.bottom if mode == "depth" else bh.z_at(L.bottom)
             gr = grains.get(L.litho, DEFAULT_GRAIN)
             w = CELL * (GRAINS.index(gr) + 1)
             y1, y2 = y_of(a), y_of(b)
             cmds.append(_rect(x0, y1, w, y2 - y1, colors.get(L.litho, "#cccccc"), "#000000", 0.9))
             if patterns.get(L.litho):
                 cmds.append(_rect(x0, y1, w, y2 - y1, None, "#000000", 0.0, patterns[L.litho]))
-            if L.litho not in used:
-                used.append(L.litho)
+            if (L.litho, L.desc or L.litho) not in used:
+                used.append((L.litho, L.desc or L.litho))
         if letters:
             cmds.append(_text(string.ascii_lowercase[n % 26], x0 + gw / 2, bottom_px + 12, 14,
                               "c", bold=True))
@@ -385,13 +320,13 @@ def build_records(bhs, colors, grains, patterns=None, px_per_m=0.0, measure=appr
         ly = REC_TOP - 8
         cmds.append(_text("Index", lx, ly - 34, 14, "l", bold=True, italic=True, underline=True))
         row = 26.0
-        for i, lit in enumerate(used):
+        for i, (lit, text) in enumerate(used):
             y = ly + i * row
             gr = grains.get(lit, DEFAULT_GRAIN)
             cmds.append(_rect(lx, y, 40, 18, colors.get(lit, "#cccccc"), "#000000", 0.9))
             if patterns.get(lit):
                 cmds.append(_rect(lx, y, 40, 18, None, "#000000", 0.0, patterns[lit]))
-            cmds.append(_text(f"{lit}  ({GRAIN_LABELS[gr].lower()})", lx + 50, y + 1, 10, "l"))
+            cmds.append(_text(f"{text}  ({GRAIN_LABELS[gr].lower()})", lx + 50, y + 1, 10, "l"))
     return cmds
 
 

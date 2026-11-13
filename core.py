@@ -51,6 +51,8 @@ class Layer:
     bottom: float
     litho: str
     age: tuple = None   # (youngest_index, oldest_index) in STRAT_NAMES, or None
+    extra: dict = None  # all columns of the layers CSV row: header -> text
+    desc: str = None    # description text for the borehole logs (None = same as litho)
 
 
 @dataclass
@@ -110,7 +112,8 @@ def _norm(s):
 
 def read_table(path, delimiter=None):
     """Return (header, rows). Auto-detects encoding; delimiter=None -> auto."""
-    raw = open(path, "rb").read()
+    with open(path, "rb") as fh:
+        raw = fh.read()
     text = None
     for enc in ("utf-8-sig", "cp1250", "latin-1"):
         try:
@@ -231,6 +234,12 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
     dst = QgsCoordinateReferenceSystem(CRS_SJTSK)
     xform = None if crs_key == "sjtsk" else QgsCoordinateTransform(
         src, dst, QgsProject.instance().transformContext())
+    for key in ("name", "x", "y", "z", "depth"):
+        if m1.get(key, -1) < 0:
+            raise ValueError(f"Boreholes file: no column selected for '{key}'.")
+    for key in ("name", "top", "bottom", "litho"):
+        if m2.get(key, -1) < 0:
+            raise ValueError(f"Layers file: no column selected for '{key}'.")
     warnings, bhs, bad_strat = [], {}, set()
     az_idx = m1.get("azimuth", -1)
     dip_idx = m1.get("dip", -1)
@@ -305,7 +314,8 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
         age = parse_strat(raw_age) if raw_age else None
         if raw_age and age is None:
             bad_strat.add(raw_age)
-        bhs[name].layers.append(Layer(t, b, lit, age))
+        extra = {h: r[i].strip() for i, h in enumerate(h2) if i < len(r)}
+        bhs[name].layers.append(Layer(t, b, lit, age, extra))
 
     for bh in bhs.values():
         bh.layers.sort(key=lambda L: L.top)
@@ -402,8 +412,26 @@ def _extend_polyline(points, ext):
     return pts
 
 
-def project_boreholes(points, boreholes, max_offset):
+OFF_LINE_TOL = 1.0     # m; boreholes farther from the section line are drawn with dashed edges
+
+
+def drop_close_boreholes(proj, min_gap):
+    """Of boreholes closer together than `min_gap` (collar distance, m) only the one nearest
+    to the section line is kept."""
+    if min_gap <= 0:
+        return proj
+    kept = []
+    for p in sorted(proj, key=lambda q: (q.offset, q.bh.name)):
+        if all(math.hypot(p.bh.x - k.bh.x, p.bh.y - k.bh.y) >= min_gap for k in kept):
+            kept.append(p)
+    kept.sort(key=lambda q: q.dist)
+    return kept
+
+
+def project_boreholes(points, boreholes, max_offset, min_gap=0.0):
     line = QgsGeometry.fromPolylineXY(points)
+    if len(points) < 2 or line.length() < 1e-6:
+        return []          # degenerate (zero-length) section line
     max_dep = max([b.depth for b in boreholes] or [0.0])
     ext = max_dep + line.length() + 1000.0
     ext_pts = _extend_polyline(points, ext)
@@ -431,7 +459,7 @@ def project_boreholes(points, boreholes, max_offset):
             d_mid = 0.5 * (d_top + d_bot)
             out.append(Projected(b, d_mid, off, d_top, d_bot))
     out.sort(key=lambda p: p.dist)
-    return out
+    return drop_close_boreholes(out, min_gap)
 
 
 def _nice_step(span, target=8):
@@ -450,20 +478,26 @@ def clean_layers(layers):
     for L in sorted(layers, key=lambda lay: (lay.top, lay.bottom)):
         top = L.top if run is None else max(L.top, run)
         if L.bottom - top > 1e-9:
-            out.append(Layer(top, L.bottom, L.litho, L.age))
+            out.append(Layer(top, L.bottom, L.litho, L.age, L.extra, L.desc))
             run = L.bottom if run is None else max(run, L.bottom)
     return out
 
 
 def merge_same_lithology(layers, tol=1e-6):
-    """Merge directly neighbouring layers with the same lithology."""
+    """Merge directly neighbouring layers with the same lithology (and age).
+
+    Different descriptions of the merged layers are joined with '; '."""
     out = []
     for L in layers:
         if (out and out[-1].litho == L.litho and out[-1].age == L.age
                 and abs(L.top - out[-1].bottom) <= tol):
-            out[-1] = Layer(out[-1].top, L.bottom, L.litho, L.age)
+            p = out[-1]
+            desc = p.desc
+            if L.desc and L.desc != p.desc:
+                desc = L.desc if not p.desc else f"{p.desc}; {L.desc}"
+            out[-1] = Layer(p.top, L.bottom, L.litho, L.age, p.extra, desc)
         else:
-            out.append(Layer(L.top, L.bottom, L.litho, L.age))
+            out.append(Layer(L.top, L.bottom, L.litho, L.age, L.extra, L.desc))
     return out
 
 
@@ -1099,6 +1133,8 @@ def _no_overlap(items):
                 continue
             acc = g if acc is None else acc.combine(g)
             for part in g.asGeometryCollection():
+                if part.type() != Qgis.GeometryType.Polygon:
+                    continue        # degenerate line / point left by difference()
                 poly = part.asQPolygonF()
                 pp = [(poly.at(k).x(), poly.at(k).y()) for k in range(poly.count())]
                 area = abs(sum(pp[k][0] * pp[(k + 1) % len(pp)][1]
@@ -1240,7 +1276,6 @@ def _fill_cover_gap(rest, base, xa, xb, left, right):
         for poly in _band(base, bot, sel):
             out.append((poly, lay.litho, lay.age))
     return out
-
 
 
 def _bh_column_geom(p, X, Y, cw):
@@ -1596,12 +1631,19 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
         cg = _bh_column_geom(p, X, Y, cw)
         col_geoms[id(bh)] = cg
         q_full = QPolygonF([QPointF(px, py) for px, py in cg["quad"](0.0, bh.depth)])
-        full = scene.addPolygon(q_full, QPen(Qt.GlobalColor.black, 1), QBrush(Qt.GlobalColor.white))
+        # a borehole off the section line has dashed edges
+        dashed = p.offset > OFF_LINE_TOL
+        edge_style = Qt.PenStyle.DashLine if dashed else Qt.PenStyle.SolidLine
+        full_pen = QPen(Qt.GlobalColor.black, 1)
+        full_pen.setStyle(edge_style)
+        full = scene.addPolygon(q_full, full_pen, QBrush(Qt.GlobalColor.white))
         full.setZValue(1)
         for L in LAY[id(bh)]:
             c = colors.get(L.litho, QColor(Qt.GlobalColor.gray))
             q_lay = QPolygonF([QPointF(px, py) for px, py in cg["quad"](L.top, L.bottom)])
-            r = scene.addPolygon(q_lay, QPen(Qt.GlobalColor.black, 0.8), QBrush(c))
+            lay_pen = QPen(Qt.GlobalColor.black, 0.8)
+            lay_pen.setStyle(edge_style)
+            r = scene.addPolygon(q_lay, lay_pen, QBrush(c))
             r.setZValue(2)
             add_hatch(lambda b, q_lay=q_lay: scene.addPolygon(q_lay, no_pen, b), L.litho, 2.5)
         if labels:
@@ -1708,7 +1750,7 @@ def make_3d_interval_layer(boreholes):
         "Boreholes 3D (lithology)", "memory")
     feats = []
     for b in boreholes:
-        for L in b.layers:
+        for L in clean_layers(b.layers):
             f = QgsFeature(lyr.fields())
             f.setGeometry(QgsGeometry(QgsLineString([
                 QgsPoint(*b.point_at(L.top)), QgsPoint(*b.point_at(L.bottom))])))
@@ -1722,7 +1764,10 @@ def make_3d_interval_layer(boreholes):
 def apply_3d_style(layer, colors, width):
     """Rule-based 3D renderer: one tube symbol per lithology."""
     from qgis._3d import QgsLine3DSymbol, QgsRuleBased3DRenderer
-    from qgis.core import Qgis, QgsPhongMaterialSettings
+    try:
+        from qgis._3d import QgsPhongMaterialSettings
+    except ImportError:         # older / alternative bindings
+        from qgis.core import QgsPhongMaterialSettings
 
     root = QgsRuleBased3DRenderer.Rule(None)
     for lit, col in colors.items():

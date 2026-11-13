@@ -14,6 +14,8 @@ from qgis.core import (
 )
 from qgis.gui import QgsColorButton, QgsFileWidget, QgsMapTool, QgsRubberBand
 
+from dataclasses import replace
+
 from . import core, logs, model3d, patterns
 
 
@@ -21,10 +23,12 @@ from . import core, logs, model3d, patterns
 class SectionLineTool(QgsMapTool):
     lineFinished = pyqtSignal(list)
     cancelled = pyqtSignal()
+    aborted = pyqtSignal()      # tool was replaced (e.g. by Pan) before the line was finished
 
     def __init__(self, canvas):
         super().__init__(canvas)
         self.points = []
+        self._finished = False
         self.rb = QgsRubberBand(canvas, Qgis.GeometryType.Line)
         self.rb.setColor(QColor(220, 0, 0))
         self.rb.setWidth(2)
@@ -45,6 +49,7 @@ class SectionLineTool(QgsMapTool):
             self.points.append(QgsPointXY(e.mapPoint()))
             self._redraw()
         elif e.button() == Qt.MouseButton.RightButton:
+            self._finished = True
             pts, self.points = self.points, []
             self.rb.reset(Qgis.GeometryType.Line)
             if len(pts) >= 2:
@@ -54,13 +59,23 @@ class SectionLineTool(QgsMapTool):
 
     def keyPressEvent(self, e):
         if e.key() == Qt.Key.Key_Escape:
+            self._finished = True
             self.points = []
             self.rb.reset(Qgis.GeometryType.Line)
             self.cancelled.emit()
 
+    def activate(self):
+        self._finished = False
+        self.points = []
+        super().activate()
+
     def deactivate(self):
+        unfinished = not self._finished
+        self.points = []
         self.rb.reset(Qgis.GeometryType.Line)
         super().deactivate()
+        if unfinished:
+            self.aborted.emit()
 
 
 # ------------------------------------------------------------ section view
@@ -80,11 +95,14 @@ class SectionViewer(QDialog):
         self.rebuild = rebuild
         self.view = _View(scene)
         self.view.setRenderHint(QPainter.RenderHint.Antialiasing)
+        self.view.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self.view.setDragMode(QGraphicsView.DragMode.ScrollHandDrag)
         lay = QVBoxLayout(self)
         split = QSplitter(Qt.Orientation.Horizontal)
+        self.split = split
         split.addWidget(self.view)
         self.panel = None
+        self._strat0 = strat0
         if proj is not None and rebuild is not None and len(proj) > 1:
             side = QWidget()
             sl = QVBoxLayout(side)
@@ -122,7 +140,11 @@ class SectionViewer(QDialog):
 
     def _apply_visibility(self, *_):
         geo = getattr(self.scene, "geo", None)
-        if not geo or self.panel is None:
+        if not geo:
+            return
+        if self.panel is None:      # single-borehole section: no side panel
+            for it in geo.get("strat_items", []):
+                it.setVisible(self._strat0)
             return
         for it in geo.get("strat_items", []):
             it.setVisible(self.chk_v_strat.isChecked())
@@ -163,13 +185,18 @@ class SectionViewer(QDialog):
         if not path:
             return
         r = self.scene.sceneRect()
+        if r.width() <= 0 or r.height() <= 0:
+            QMessageBox.warning(self, "Export", "The scene is empty - nothing to export.")
+            return
         img = QImage(int(r.width() * 2), int(r.height() * 2), QImage.Format.Format_ARGB32)
         img.fill(Qt.GlobalColor.white)
         p = QPainter(img)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self.scene.render(p, QRectF(img.rect()), r)
         p.end()
-        img.save(path)
+        if not img.save(path):
+            QMessageBox.warning(self, "Export", f"Could not write the file:\n{path}")
 
     def export_svg(self):
         path = self._ask("SVG (*.svg)", ".svg")
@@ -181,6 +208,7 @@ class SectionViewer(QDialog):
         g.setSize(r.size().toSize())
         g.setViewBox(QRectF(0, 0, r.width(), r.height()))
         p = QPainter(g)
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self.scene.render(p, QRectF(0, 0, r.width(), r.height()), r)
         p.end()
 
@@ -193,10 +221,62 @@ class SectionViewer(QDialog):
         r = self.scene.sceneRect()
         w.setPageOrientation(QPageLayout.Orientation.Portrait if r.height() > r.width()
                              else QPageLayout.Orientation.Landscape)
-        p = QPainter(w)
+        p = QPainter()
+        if not p.begin(w):
+            QMessageBox.warning(self, "Export",
+                                f"Could not write the PDF (is it open in another program?):\n{path}")
+            return
+        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         target = QRectF(0, 0, p.device().width(), p.device().height())
         self.scene.render(p, target, self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
         p.end()
+
+
+class LogViewer(SectionViewer):
+    """Window of borehole profiles / sedimentary records with a side panel:
+    the column of the layers table with the description, the column the profile (colours,
+    patterns) is made from, merging of identical lithologies and a button to redraw."""
+
+    def __init__(self, scene, parent, title, columns, desc0, prof0, merge0, rebuild):
+        super().__init__(scene, parent, title=title)
+        self.log_rebuild = rebuild
+        side = QWidget()
+        sl = QVBoxLayout(side)
+        box = QGroupBox("Borehole log")
+        form = QFormLayout(box)
+        self.cb_desc = QComboBox()
+        self.cb_desc.addItems(columns)
+        self.cb_desc.setCurrentIndex(max(columns.index(desc0), 0) if desc0 in columns else 0)
+        self.cb_prof = QComboBox()
+        self.cb_prof.addItems(columns)
+        self.cb_prof.setCurrentIndex(max(columns.index(prof0), 0) if prof0 in columns else 0)
+        self.chk_merge = QCheckBox("Merge identical lithologies")
+        self.chk_merge.setChecked(merge0)
+        form.addRow("Lithological description from column", self.cb_desc)
+        form.addRow("Lithological profile from column", self.cb_prof)
+        form.addRow(self.chk_merge)
+        btn = QPushButton("Regenerate")
+        btn.clicked.connect(self.regenerate_log)
+        sl.addWidget(box)
+        sl.addWidget(btn)
+        sl.addStretch()
+        side.setMinimumWidth(300)
+        self.split.addWidget(side)
+        self.split.setStretchFactor(0, 4)
+        self.split.setStretchFactor(1, 1)
+
+    def regenerate_log(self):
+        try:
+            scene = self.log_rebuild(self.cb_desc.currentText(), self.cb_prof.currentText(),
+                                     self.chk_merge.isChecked())
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+            return
+        old = self.scene
+        self.scene = scene
+        self.view.setScene(scene)
+        self.fit()
+        old.deleteLater()
 
 
 # ------------------------------------------------------------- main dialog
@@ -316,6 +396,8 @@ class BoreholeDialog(QDialog):
         self.tool = SectionLineTool(self.canvas)
         self.tool.lineFinished.connect(self._line_done)
         self.tool.cancelled.connect(self._line_cancel)
+        self.tool.aborted.connect(self.show)
+        self.bh_layer_id = None
         self.viewers = []
         self.forms = {}
 
@@ -457,7 +539,7 @@ class BoreholeDialog(QDialog):
         self.sp_patscale.setSingleStep(0.05)
         self.sp_patscale.setValue(0.45)
         of.addRow("Size of the patterns", self.sp_patscale)
-        self.chk_recsep = QCheckBox("Sedimentary records: a separate window for each borehole")
+        self.chk_recsep = QCheckBox("A separate window for each borehole (profiles and sedimentary records)")
         of.addRow(self.chk_recsep)
         lay.addWidget(opt)
 
@@ -493,6 +575,15 @@ class BoreholeDialog(QDialog):
         self.sp_off.setValue(50)
         self.sp_off.setSuffix(" m")
         form.addRow("Max. distance of borehole from line", self.sp_off)
+        self.sp_gap = QDoubleSpinBox()
+        self.sp_gap.setRange(0, 1e5)
+        self.sp_gap.setValue(5)
+        self.sp_gap.setSuffix(" m")
+        self.sp_gap.setSpecialValueText("off")
+        self.sp_gap.setToolTip("Boreholes closer together than this: only the one nearer to the "
+                               "section line is used (0 = use all). Boreholes off the line are "
+                               "drawn with dashed edges.")
+        form.addRow("Min. spacing of boreholes", self.sp_gap)
         self.sp_vex = QDoubleSpinBox()
         self.sp_vex.setRange(0, 100)
         self.sp_vex.setSpecialValueText("Auto")
@@ -661,6 +752,8 @@ class BoreholeDialog(QDialog):
             m1["dip"] = self.cb_bh["dip"].currentIndex() - 1           # -1 = none
             m2 = {k: c.currentIndex() for k, c in self.cb_ly.items()}
             m2["strat"] = self.cb_ly["strat"].currentIndex() - 1       # -1 = none
+            self.ly_header = list(h2)
+            self.litho_col = h2[m2["litho"]]
             self.boreholes, warns = core.build_boreholes(
                 h1, r1, m1, h2, r2, m2, self.cb_crs.currentData(),
                 self.chk_neg.isChecked(), self.chk_swap.isChecked())
@@ -699,7 +792,11 @@ class BoreholeDialog(QDialog):
             pb.setMaxVisibleItems(12)
             pb.addItem("(none)", "")
             for code in patterns.NAMES:
-                pb.addItem(patterns.icon(code), patterns.label(code), code)
+                ic = patterns.icon(code)
+                if ic is not None:
+                    pb.addItem(ic, patterns.label(code), code)
+                else:
+                    pb.addItem(patterns.label(code), code)
             pb.setCurrentIndex(max(pb.findData(patterns.default_pattern(lit)), 0))
             self.tbl.setCellWidget(i, 3, pb)
             self.pat_boxes[lit] = pb
@@ -728,15 +825,22 @@ class BoreholeDialog(QDialog):
 
     def add_points(self):
         if self._need_data():
-            QgsProject.instance().addMapLayer(core.make_borehole_point_layer(self.boreholes))
+            lyr = core.make_borehole_point_layer(self.boreholes)
+            QgsProject.instance().addMapLayer(lyr)
+            self.bh_layer_id = lyr.id()
             self.iface.mapCanvas().zoomToFullExtent()
+
+    def _bh_layers(self):
+        """The borehole point layer added by this plugin (by id), else layers named 'Boreholes'."""
+        lyr = QgsProject.instance().mapLayer(self.bh_layer_id) if self.bh_layer_id else None
+        return [lyr] if lyr is not None else QgsProject.instance().mapLayersByName("Boreholes")
 
     # ---- borehole logs
     def logs_from_selection(self):
         if not self._need_data():
             return
         names = []
-        for lyr in QgsProject.instance().mapLayersByName("Boreholes"):
+        for lyr in self._bh_layers():
             if hasattr(lyr, "selectedFeatures"):
                 names += [str(f["name"]) for f in lyr.selectedFeatures()]
         names = [n for n in dict.fromkeys(names) if any(b.name == n for b in self.boreholes)]
@@ -764,9 +868,30 @@ class BoreholeDialog(QDialog):
             QMessageBox.warning(self, "No borehole", "Select at least one borehole with layers.")
         return picked
 
+    def _log_view(self, bhs, desc_col, prof_col, merge):
+        """Copies of the boreholes: litho = value of the profile column (colours, patterns),
+        desc = value of the description column; optionally identical neighbours merged."""
+        def value(L, col):
+            if col == self.litho_col:
+                return L.litho
+            return ((L.extra or {}).get(col) or "").strip()
+
+        out = []
+        for b in bhs:
+            lay = []
+            for L in core.clean_layers(b.layers):
+                prof = value(L, prof_col) or "(unknown)"
+                lay.append(core.Layer(L.top, L.bottom, prof, L.age, L.extra,
+                                      value(L, desc_col) or prof))
+            out.append(replace(b, layers=core.merge_same_lithology(lay) if merge else lay))
+        return out
+
     def _log_style(self, bhs):
+        """Colours, grain sizes and patterns: those of tab 2, defaults for other values."""
         lithos = core.lithologies(bhs)
         colors = {lit: c.name() for lit, c in self.current_colors().items()}
+        for lit, c in core.default_colors([lit for lit in lithos if lit not in colors]).items():
+            colors[lit] = c.name()
         grains = self.current_grains()
         pats = self.current_patterns()
         for lit in lithos:
@@ -774,31 +899,42 @@ class BoreholeDialog(QDialog):
             pats.setdefault(lit, patterns.default_pattern(lit))
         return colors, grains, pats
 
-    def _show_log(self, cmds, title):
-        v = SectionViewer(logs.to_scene(cmds, self.sp_patscale.value()), self, title=title)
-        self.viewers.append(v)
+    def _open_log(self, kind, bhs):
+        """Window with the profiles (kind 'profiles') or the sedimentary records of `bhs`."""
+        mode, scale = self.cb_logmode.currentData(), self.sp_logscale.value()
+        show_pat, show_strat = self.chk_logpat.isChecked(), self.chk_logstrat.isChecked()
+        pscale = self.sp_patscale.value()
+
+        def build(desc_col, prof_col, merge):
+            view = self._log_view(bhs, desc_col, prof_col, merge)
+            colors, grains, pats = self._log_style(view)
+            if kind == "profiles":
+                cmds = logs.build_profiles(view, colors, pats, mode, scale, logs.qt_measure(),
+                                           show_pat, show_strat)
+            else:
+                cmds = logs.build_records(view, colors, grains, pats, scale, logs.qt_measure(),
+                                          mode=mode)
+            return logs.to_scene(cmds, pscale)
+
+        names = ", ".join(b.name for b in bhs)
+        title = ("Borehole profiles: " if kind == "profiles" else "Sedimentary record: ") + names
+        col = self.litho_col
+        v = LogViewer(build(col, col, False), self, title, self.ly_header, col, col, False, build)
+        self._track_viewer(v)
         v.show()
 
-    def create_profiles(self):
+    def _create_logs(self, kind):
         bhs = self._log_boreholes()
         if not bhs:
             return
-        colors, _grains, pats = self._log_style(bhs)
-        cmds = logs.build_profiles(bhs, colors, pats, self.cb_logmode.currentData(),
-                                   self.sp_logscale.value(), logs.qt_measure(),
-                                   self.chk_logpat.isChecked(), self.chk_logstrat.isChecked())
-        self._show_log(cmds, "Borehole profiles: " + ", ".join(b.name for b in bhs))
+        for grp in ([[b] for b in bhs] if self.chk_recsep.isChecked() else [bhs]):
+            self._open_log(kind, grp)
+
+    def create_profiles(self):
+        self._create_logs("profiles")
 
     def create_records(self):
-        bhs = self._log_boreholes()
-        if not bhs:
-            return
-        colors, grains, pats = self._log_style(bhs)
-        mode, scale = self.cb_logmode.currentData(), self.sp_logscale.value()
-        groups = [[b] for b in bhs] if self.chk_recsep.isChecked() else [bhs]
-        for grp in groups:
-            cmds = logs.build_records(grp, colors, grains, pats, scale, logs.qt_measure(), mode=mode)
-            self._show_log(cmds, "Sedimentary record: " + ", ".join(b.name for b in grp))
+        self._create_logs("records")
 
     # ---- 2D
     def draw_line(self):
@@ -811,12 +947,19 @@ class BoreholeDialog(QDialog):
     def clear_line(self):
         """Remove the current section line (from the map and from memory)."""
         self.section_pts = None
-        if self.line_rb:
-            self.line_rb.reset(Qgis.GeometryType.Line)
-            self.line_rb = None
+        self._drop_line_rb()
         self.tool.points = []
         self.tool.rb.reset(Qgis.GeometryType.Line)
         self.lbl_line.setText("No section line defined.")
+
+    def _drop_line_rb(self):
+        """Reset the section-line rubber band and remove it from the canvas scene."""
+        if self.line_rb:
+            self.line_rb.reset(Qgis.GeometryType.Line)
+            sc = self.canvas.scene()
+            if sc is not None:
+                sc.removeItem(self.line_rb)
+            self.line_rb = None
 
     def _line_cancel(self):
         self.canvas.unsetMapTool(self.tool)
@@ -837,17 +980,28 @@ class BoreholeDialog(QDialog):
         if g.type() != Qgis.GeometryType.Line:
             QMessageBox.warning(self, "Selection", "Selected feature is not a line.")
             return
-        pts = g.asMultiPolyline()[0] if g.isMultipart() else g.asPolyline()
+        if g.isNull() or g.isEmpty():
+            QMessageBox.warning(self, "Selection", "The selected feature has an empty geometry.")
+            return
+        parts = g.asMultiPolyline() if g.isMultipart() else [g.asPolyline()]
+        pts = parts[0] if parts else []
+        if len(pts) < 2:
+            QMessageBox.warning(self, "Selection", "The selected line needs at least two vertices.")
+            return
         self._set_line(pts, lyr.crs())
 
     def _set_line(self, pts, src_crs):
         dst = QgsCoordinateReferenceSystem(core.CRS_SJTSK)
         tr = QgsCoordinateTransform(src_crs, dst, QgsProject.instance())
-        self.section_pts = [tr.transform(QgsPointXY(p)) for p in pts]
-        length = QgsGeometry.fromPolylineXY(self.section_pts).length()
+        new_pts = [tr.transform(QgsPointXY(p)) for p in pts]
+        length = QgsGeometry.fromPolylineXY(new_pts).length() if len(new_pts) >= 2 else 0.0
+        if length < 1e-6:
+            QMessageBox.warning(self, "Section line",
+                                "The section line has zero length - click two different points.")
+            return
+        self.section_pts = new_pts
         self.lbl_line.setText(f"Section line: {len(pts)} vertices, length {length:.1f} m")
-        if self.line_rb:
-            self.line_rb.reset(Qgis.GeometryType.Line)
+        self._drop_line_rb()
         self.line_rb = QgsRubberBand(self.canvas, Qgis.GeometryType.Line)
         self.line_rb.setColor(QColor(220, 0, 0))
         self.line_rb.setWidth(2)
@@ -859,7 +1013,12 @@ class BoreholeDialog(QDialog):
         if not self.section_pts:
             QMessageBox.warning(self, "No line", "Define the section line first.")
             return
-        proj = core.project_boreholes(self.section_pts, self.boreholes, self.sp_off.value())
+        try:
+            proj = core.project_boreholes(self.section_pts, self.boreholes, self.sp_off.value(),
+                                          self.sp_gap.value())
+        except Exception as e:
+            QMessageBox.warning(self, "2D section", f"{type(e).__name__}: {e}")
+            return
         if not proj:
             QMessageBox.warning(self, "No boreholes",
                                 "No borehole within the given distance of the line.")
@@ -874,9 +1033,18 @@ class BoreholeDialog(QDialog):
             sc.geo["line"] = line
             return sc
 
-        v = SectionViewer(build(None), self, proj, build, strat)
-        self.viewers.append(v)
+        try:
+            v = SectionViewer(build(None), self, proj, build, strat)
+        except Exception as e:
+            QMessageBox.warning(self, "2D section", f"{type(e).__name__}: {e}")
+            return
+        self._track_viewer(v)
         v.show()
+
+    def _track_viewer(self, v):
+        """Keep a reference while the window is open; forget it when it is closed."""
+        self.viewers.append(v)
+        v.finished.connect(lambda _r=0, v=v: self.viewers.remove(v) if v in self.viewers else None)
 
     def _section_options(self):
         colors = self.current_colors()
@@ -890,7 +1058,7 @@ class BoreholeDialog(QDialog):
         bhs = self.boreholes
         if self.chk_sel.isChecked():
             names = set()
-            for lyr in QgsProject.instance().mapLayersByName("Boreholes"):
+            for lyr in self._bh_layers():
                 if hasattr(lyr, "selectedFeatures"):
                     names |= {str(f["name"]) for f in lyr.selectedFeatures()}
             sub = [b for b in bhs if b.name in names]
@@ -957,8 +1125,12 @@ class BoreholeDialog(QDialog):
         if not self._need_data():
             return
         bhs = [b for b in self._bh_subset() if b.layers]
-        edges = model3d.neighbour_edges(
-            bhs, "delaunay" if self.cb_net.currentIndex() == 1 else "grid", self.sp_maxe.value())
+        try:
+            edges = model3d.neighbour_edges(
+                bhs, "delaunay" if self.cb_net.currentIndex() == 1 else "grid", self.sp_maxe.value())
+        except Exception as e:
+            QMessageBox.warning(self, "3D fence model", f"{type(e).__name__}: {e}")
+            return
         if not edges:
             QMessageBox.warning(self, "3D fence model",
                                 "No pair of neighbouring boreholes found - increase the longest panel.")
@@ -985,6 +1157,15 @@ class BoreholeDialog(QDialog):
                                             + (", DEM" if dem else "") + ")")
 
     def cleanup(self):
-        if self.line_rb:
-            self.line_rb.reset(Qgis.GeometryType.Line)
+        try:
+            self.tool.aborted.disconnect(self.show)
+        except (TypeError, RuntimeError):
+            pass
+        for v in list(self.viewers):
+            v.close()
+        self.viewers.clear()
+        self._drop_line_rb()
         self.canvas.unsetMapTool(self.tool)
+        sc = self.canvas.scene()
+        if sc is not None:
+            sc.removeItem(self.tool.rb)

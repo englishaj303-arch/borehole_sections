@@ -202,6 +202,8 @@ def fence_prisms(geo, locate, length, width=4.0, slab=8.0, dz=2.0, shift=None):
             for a, b in zip(zs[0::2], zs[1::2]):
                 a, b = a + off, b + off
                 ia, ib = int(round(a / dz)), int(round(b / dz))
+                if b - a > 1e-9:
+                    ib = max(ib, ia + 1)    # keep thin layers (thinner than dz) as one block
                 if ib <= ia:
                     continue
                 if ring is None:
@@ -217,7 +219,11 @@ def _style_layer(layer, color, height):
     """Single-colour extruded 3D style; returns None or an error text."""
     try:
         from qgis._3d import QgsPolygon3DSymbol, QgsVectorLayer3DRenderer
-        from qgis.core import Qgis, QgsPhongMaterialSettings
+        from qgis.core import Qgis
+        try:
+            from qgis._3d import QgsPhongMaterialSettings
+        except ImportError:     # older / alternative bindings
+            from qgis.core import QgsPhongMaterialSettings
         sym = QgsPolygon3DSymbol()
         sym.setAltitudeClamping(Qgis.AltitudeClamping.Absolute)
         sym.setExtrusionHeight(height)

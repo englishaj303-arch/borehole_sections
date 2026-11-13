@@ -2,8 +2,9 @@
 (FGDC-STD-013-2006, Appendix A, chapter 37 - a US Government publication).
 
 The tiles are in the folder ``patterns`` (``601.png`` ... ``733.png``, black lines on a
-transparent background); this module gives the names, a default pattern for a lithology
-and the Qt brush made from a tile.
+transparent background, 1200 dpi, from the "geologic-patterns" repackaging by Daven Quinn,
+CC0; 718 comes from the FGDC PDF) - see LICENSE.  This module gives the names, a default
+pattern for a lithology and the Qt brush made from a tile.
 """
 import os
 
@@ -113,13 +114,15 @@ def tile_path(code):
 
 
 _cache = {}
+OVERSAMPLE = 2.0       # tiles are kept 2x larger than shown, so the pattern stays sharp when zoomed
 
 
-def tile_pixmap(code, scale=0.45):
-    """QPixmap of a tile scaled by `scale` (1 = 300 dpi), or None for an unknown code."""
+def tile_pixmap(code, scale=0.45, oversample=OVERSAMPLE):
+    """QPixmap of a tile.  scale 1 = the tile shown in 300 dpi (the PNG files have 1200 dpi),
+    `oversample` makes the pixmap larger by that factor.  None for an unknown code."""
     if code not in NAMES:
         return None
-    key = (code, round(scale, 3))
+    key = (code, round(scale, 3), oversample)
     if key not in _cache:
         from qgis.PyQt.QtCore import Qt
         from qgis.PyQt.QtGui import QPixmap
@@ -127,19 +130,25 @@ def tile_pixmap(code, scale=0.45):
         if pm.isNull():
             _cache[key] = None
         else:
-            w, h = max(8, round(pm.width() * scale)), max(8, round(pm.height() * scale))
+            k = 0.25 * scale * oversample
+            w, h = max(8, round(pm.width() * k)), max(8, round(pm.height() * k))
             _cache[key] = pm.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
                                     Qt.TransformationMode.SmoothTransformation)
     return _cache[key]
 
 
 def pattern_brush(code, scale=0.45):
-    """Texture brush (black pattern on a transparent background) or None."""
+    """Texture brush (black pattern on a transparent background) or None.
+
+    The texture is OVERSAMPLE times larger than shown; the brush transform shrinks it
+    (the views and exports use SmoothPixmapTransform)."""
     pm = tile_pixmap(code, scale)
     if pm is None:
         return None
-    from qgis.PyQt.QtGui import QBrush
-    return QBrush(pm)
+    from qgis.PyQt.QtGui import QBrush, QTransform
+    b = QBrush(pm)
+    b.setTransform(QTransform.fromScale(1.0 / OVERSAMPLE, 1.0 / OVERSAMPLE))
+    return b
 
 
 _icons = {}
@@ -155,7 +164,7 @@ def icon(code, size=(64, 48)):
 def _make_icon(code, size):
     from qgis.PyQt.QtCore import Qt
     from qgis.PyQt.QtGui import QIcon, QPainter, QPixmap
-    pm = tile_pixmap(code, 0.3)
+    pm = tile_pixmap(code, 0.3, 1.0)
     if pm is None:
         return None
     out = QPixmap(size[0], size[1])

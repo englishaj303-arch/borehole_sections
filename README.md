@@ -23,10 +23,23 @@ Open **Plugins \> Borehole Geology \> Borehole Geology Sections** and follow the
 
 Requires QGIS 4.0 or newer (Qt6).
 
+## 2D section (tab 4)
+
+- Boreholes that do not lie on the section line are drawn with dashed edges.
+- *Min. spacing of boreholes*: of boreholes that are almost at the same point, only the one nearer to the line is used.
+
+## Borehole logs (tab 3)
+
+- Profiles of 1-4 boreholes: depth ruler, log with FGDC lithologic patterns, lithological description (labels of thin layers hang on slanted lines) and a stratigraphy column.
+- Sedimentary records with the column width given by the grain size and an Index legend.
+- Both windows have a side panel: column for the lithological description, column for the lithological profile (colours, patterns), merging of identical lithologies, and a **Regenerate** button.
+- The checkbox *A separate window for each borehole* works for both profiles and sedimentary records.
+
 ## License
 
-Free software, released under the GNU General Public License v2 or later (see `LICENSE`).
+The source code is free software, released under the GNU General Public License v2 or later (see `LICENSE`).
+The lithologic pattern tiles in the folder `patterns` are not covered by the GPL; they are public domain / CC0 (see the separate section in `LICENSE`).
 
 ## Credits
 
-Lithologic patterns (folder `patterns`): FGDC Digital Cartographic Standard for Geologic Map Symbolization (FGDC-STD-013-2006), Appendix A, chapter 37, a publication of the US Federal Geographic Data Committee.
+Lithologic patterns (folder `patterns`): FGDC Digital Cartographic Standard for Geologic Map Symbolization (FGDC-STD-013-2006), Appendix A, chapter 37, a publication of the US Federal Geographic Data Committee. The patterns comply with this standard (pattern numbers 601-686 and 701-733). High-resolution tiles come from the CC0 repackaging "geologic-patterns" by Daven Quinn (https://github.com/davenquinn/geologic-patterns).

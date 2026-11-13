@@ -348,3 +348,30 @@ proprietary programs.  If your program is a subroutine library, you may
 consider it more useful to permit linking proprietary applications with the
 library.  If this is what you want to do, use the GNU Lesser General
 Public License instead of this License.
+
+
+======================================================================
+THIRD-PARTY MATERIAL: FGDC LITHOLOGIC PATTERNS (folder "patterns")
+======================================================================
+
+The GNU General Public License above applies to the source code of this plugin only.
+It does NOT apply to the image tiles in the folder "patterns" (601.png ... 733.png).
+
+Those tiles are the lithologic patterns of the "FGDC Digital Cartographic Standard for
+Geologic Map Symbolization" (FGDC-STD-013-2006), Appendix A, chapter 37 (Lithologic patterns),
+published by the Federal Geographic Data Committee (FGDC) and the U.S. Geological Survey.
+
+  - Source of the 1200 dpi raster tiles used here: the repository "geologic-patterns"
+    by Daven Quinn (https://github.com/davenquinn/geologic-patterns), black variants on
+    a transparent background (assets/png/NNN.png). Pattern 718 (Granite, 1st option) is
+    cut from the FGDC standard itself.
+  - Pattern numbers and names follow the FGDC standard.
+  - Licence: as a work of the United States federal government the basic symbology is in the
+    public domain; the repackaging by Daven Quinn is released under the Creative Commons
+    CC0 1.0 Universal public domain dedication
+    (https://creativecommons.org/publicdomain/zero/1.0/).
+    You may copy, modify, distribute and use these patterns, also commercially, without
+    asking permission.
+  - The patterns are used in accordance with FGDC-STD-013-2006 (pattern numbers, names and
+    appearance are not altered, only the tile size is adapted for display).
+
