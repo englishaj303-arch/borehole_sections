@@ -232,43 +232,67 @@ class SectionViewer(QDialog):
         p.end()
 
 
-class LogViewer(SectionViewer):
-    """Window of borehole profiles / sedimentary records with a side panel:
-    the column of the layers table with the description, the column the profile (colours,
-    patterns) is made from, merging of identical lithologies and a button to redraw."""
+NO_STRAT = "(none)"
 
-    def __init__(self, scene, parent, title, columns, desc0, prof0, merge0, rebuild):
+
+class LogViewer(SectionViewer):
+    """Window of borehole profiles / sedimentary records with a side panel. Every drop-down
+    changes only its own item and redraws the log:
+      profiles:  Lithology (column of the profile + merging), Lithological description,
+                 Stratigraphy (column of the stratigraphy column, none = hidden);
+      records:   Lithology (column of the record + merging), Legend (text of the legend)."""
+
+    def __init__(self, scene, parent, title, kind, columns, start, rebuild):
         super().__init__(scene, parent, title=title)
         self.log_rebuild = rebuild
         side = QWidget()
         sl = QVBoxLayout(side)
-        box = QGroupBox("Borehole log")
+
+        def combo(items, current):
+            cb = QComboBox()
+            cb.addItems(items)
+            cb.setCurrentIndex(max(items.index(current), 0) if current in items else 0)
+            return cb
+
+        box = QGroupBox("Lithology")
         form = QFormLayout(box)
-        self.cb_desc = QComboBox()
-        self.cb_desc.addItems(columns)
-        self.cb_desc.setCurrentIndex(max(columns.index(desc0), 0) if desc0 in columns else 0)
-        self.cb_prof = QComboBox()
-        self.cb_prof.addItems(columns)
-        self.cb_prof.setCurrentIndex(max(columns.index(prof0), 0) if prof0 in columns else 0)
+        self.cb_prof = combo(columns, start["prof"])
         self.chk_merge = QCheckBox("Merge identical lithologies")
-        self.chk_merge.setChecked(merge0)
-        form.addRow("Lithological description from column", self.cb_desc)
-        form.addRow("Lithological profile from column", self.cb_prof)
+        self.chk_merge.setChecked(start["merge"])
+        form.addRow("Lithology from column", self.cb_prof)
         form.addRow(self.chk_merge)
+        sl.addWidget(box)
+        box = QGroupBox("Lithological description" if kind == "profiles" else "Legend")
+        form = QFormLayout(box)
+        self.cb_desc = combo(columns, start["desc"])
+        form.addRow("Description from column" if kind == "profiles" else "Legend text from column",
+                    self.cb_desc)
+        sl.addWidget(box)
+        self.cb_strat = None
+        if kind == "profiles":
+            box = QGroupBox("Stratigraphy")
+            form = QFormLayout(box)
+            self.cb_strat = combo([NO_STRAT] + list(columns), start["strat"])
+            form.addRow("Stratigraphy from column", self.cb_strat)
+            sl.addWidget(box)
         btn = QPushButton("Regenerate")
         btn.clicked.connect(self.regenerate_log)
-        sl.addWidget(box)
         sl.addWidget(btn)
         sl.addStretch()
         side.setMinimumWidth(300)
         self.split.addWidget(side)
         self.split.setStretchFactor(0, 4)
         self.split.setStretchFactor(1, 1)
+        for cb in (self.cb_prof, self.cb_desc, self.cb_strat):
+            if cb is not None:
+                cb.currentIndexChanged.connect(self.regenerate_log)
+        self.chk_merge.toggled.connect(self.regenerate_log)
 
-    def regenerate_log(self):
+    def regenerate_log(self, *_):
         try:
             scene = self.log_rebuild(self.cb_desc.currentText(), self.cb_prof.currentText(),
-                                     self.chk_merge.isChecked())
+                                     self.chk_merge.isChecked(),
+                                     self.cb_strat.currentText() if self.cb_strat else NO_STRAT)
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
             return
@@ -830,6 +854,7 @@ class BoreholeDialog(QDialog):
             m2["strat"] = self.cb_ly["strat"].currentIndex() - 1       # -1 = none
             self.ly_header = list(h2)
             self.litho_col = h2[m2["litho"]]
+            self.strat_col = h2[m2["strat"]] if m2["strat"] >= 0 else ""
             self.boreholes, warns = core.build_boreholes(
                 h1, r1, m1, h2, r2, m2, self.cb_crs.currentData(),
                 self.chk_neg.isChecked(), self.chk_swap.isChecked())
@@ -944,20 +969,29 @@ class BoreholeDialog(QDialog):
             QMessageBox.warning(self, "No borehole", "Select at least one borehole with layers.")
         return picked
 
-    def _log_view(self, bhs, desc_col, prof_col, merge):
-        """Copies of the boreholes: litho = value of the profile column (colours, patterns),
-        desc = value of the description column; optionally identical neighbours merged."""
+    def _log_view(self, bhs, desc_col, prof_col, merge, strat_col):
+        """Copies of the boreholes: litho = value of the lithology column (colours, patterns),
+        desc = value of the description column, age = from the stratigraphy column; each item
+        is taken from its own column; optionally identical neighbours are merged."""
         def value(L, col):
             if col == self.litho_col:
                 return L.litho
             return ((L.extra or {}).get(col) or "").strip()
+
+        def age_of(L):
+            if strat_col == NO_STRAT:
+                return None
+            if strat_col == self.strat_col:
+                return L.age
+            raw = value(L, strat_col)
+            return core.parse_strat(raw) if raw else None
 
         out = []
         for b in bhs:
             lay = []
             for L in core.clean_layers(b.layers):
                 prof = value(L, prof_col) or "(unknown)"
-                lay.append(core.Layer(L.top, L.bottom, prof, L.age, L.extra,
+                lay.append(core.Layer(L.top, L.bottom, prof, age_of(L), L.extra,
                                       value(L, desc_col) or prof))
             out.append(replace(b, layers=core.merge_same_lithology(lay) if merge else lay))
         return out
@@ -978,15 +1012,15 @@ class BoreholeDialog(QDialog):
     def _open_log(self, kind, bhs):
         """Window with the profiles (kind 'profiles') or the sedimentary records of `bhs`."""
         mode, scale = self.cb_logmode.currentData(), self.sp_logscale.value()
-        show_pat, show_strat = self.chk_logpat.isChecked(), self.chk_logstrat.isChecked()
+        show_pat = self.chk_logpat.isChecked()
         pscale = self.sp_patscale.value()
 
-        def build(desc_col, prof_col, merge):
-            view = self._log_view(bhs, desc_col, prof_col, merge)
+        def build(desc_col, prof_col, merge, strat_col):
+            view = self._log_view(bhs, desc_col, prof_col, merge, strat_col)
             colors, grains, pats = self._log_style(view)
             if kind == "profiles":
                 cmds = logs.build_profiles(view, colors, pats, mode, scale, logs.qt_measure(),
-                                           show_pat, show_strat)
+                                           show_pat, strat_col != NO_STRAT)
             else:
                 cmds = logs.build_records(view, colors, grains, pats, scale, logs.qt_measure(),
                                           mode=mode)
@@ -995,7 +1029,9 @@ class BoreholeDialog(QDialog):
         names = ", ".join(b.name for b in bhs)
         title = ("Borehole profiles: " if kind == "profiles" else "Sedimentary record: ") + names
         col = self.litho_col
-        v = LogViewer(build(col, col, False), self, title, self.ly_header, col, col, False, build)
+        strat = self.strat_col if kind == "profiles" and self.chk_logstrat.isChecked() and self.strat_col else NO_STRAT
+        v = LogViewer(build(col, col, False, strat), self, title, kind, self.ly_header,
+                      {"prof": col, "desc": col, "merge": False, "strat": strat}, build)
         self._track_viewer(v)
         v.show()
 

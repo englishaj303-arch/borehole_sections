@@ -20,7 +20,7 @@ Requires QGIS 4.0 or newer (Qt6). Open **Plugins \> Borehole Geology \> Borehole
 ### 3. Borehole logs
 - Select one to four boreholes (also taken from the map) and create
     - *profiles*: the columns side by side with a depth (or altitude) ruler, the lithological description next to the column (labels of thin layers hang on slanted lines) and a stratigraphy column,
-    - *sedimentary records*: the width of the column follows the grain size and an *Index* legend lists the rock types.
+    - *sedimentary records*: the width of the column follows the grain size and a *Legend* lists the rock types.
 - Both windows have a side panel with the column of the layers table used for the lithological description, the column used for the profile (colours, patterns), merging of identical lithologies and a **Regenerate** button.
 - *A separate window for each borehole* works for profiles and for sedimentary records.
 - Export to PNG, SVG and PDF.

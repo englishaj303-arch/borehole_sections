@@ -8,7 +8,7 @@ Two figures are offered:
 * ``build_profiles``  - up to four borehole columns side by side with a depth ruler, a
                         lithology and a stratigraphy column and the description of every layer,
 * ``build_records``   - sedimentary records: the column width follows the grain size
-                        (clay / silt / sand / gravel) and an "Index" legend lists the rock types.
+                        (clay / silt / sand / gravel) and a "Legend" lists the rock types.
 """
 import math
 import string
@@ -264,7 +264,7 @@ REC_TOP = 110.0
 
 def build_records(bhs, colors, grains, patterns=None, px_per_m=0.0, measure=approx_measure,
                   letters=True, legend=True, mode="depth"):
-    """Sedimentary records side by side + an 'Index' legend (rock type and grain size).
+    """Sedimentary records side by side + a 'Legend' (rock type and grain size).
 
     grains: litho -> grain class (column width);  patterns: litho -> FGDC pattern code."""
     patterns = patterns or {}
@@ -317,7 +317,7 @@ def build_records(bhs, colors, grains, patterns=None, px_per_m=0.0, measure=appr
     if legend and used:
         lx = x0 + 10
         ly = REC_TOP - 8
-        cmds.append(_text("Index", lx, ly - 34, 14, "l", bold=True, italic=True, underline=True))
+        cmds.append(_text("Legend", lx, ly - 34, 14, "l", bold=True, italic=True, underline=True))
         row = 26.0
         for i, (lit, text) in enumerate(used):
             y = ly + i * row
