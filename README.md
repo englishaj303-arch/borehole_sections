@@ -1,39 +1,43 @@
 # Borehole Geology Sections (QGIS plugin)
 
 Borehole logs, sedimentary records, geological cross sections (2D) and 3D lithology models from borehole data stored in two CSV files.
+Requires QGIS 4.0 or newer (Qt6). Open **Plugins \> Borehole Geology \> Borehole Geology Sections** and follow the tabs 1-5.
 
-## What it does
+## Features
 
-1. **Data import** - two CSV files:
-    - *Boreholes*: name, X, Y, ground altitude, total depth (optional: azimuth 0–360° clockwise from North, dip/deviation 0–90° from vertical).
-    - *Layers*: borehole name, depth from, depth to, lithology (optional: stratigraphy). Columns are detected automatically and can be reassigned; delimiter and encoding are auto-detected. Coordinates may be S-JTSK (EPSG:5514, also without the minus sign), WGS84 or ETRS89. Boreholes can be added to the map as a point layer; lithology colours and grain sizes (clay, silt, sand, gravel) are editable (tab 2).
-2. **Borehole logs** (tab 3) - select one to four boreholes and create
-    - *profiles*: the columns side by side with a depth (or altitude) ruler and the description of each layer next to the column (thin layers get a slanted label),
-    - *sedimentary records*: the width of the column follows the grain size of each layer (Clay, Silt, Sand, Gravel) and an *Index* legend lists the rock types with their grain size. Optionally one window per borehole.
-    Both can be exported to PNG, SVG or PDF. The profiles have a stratigraphy column next to the lithology column.
-    Rocks are drawn with the FGDC lithologic patterns (e.g. 620 Clay or clay shale); the pattern of each lithology is set in tab 2 and the 2D section window can show them too.
-3. **2D cross section** (tab 4, **IN DEVELOPMENT**) - draw a line on the map (or use a selected line feature); boreholes within a chosen distance are projected onto it. Layers of the same lithology are correlated between neighbouring boreholes (dip following, pinch-outs, jagged lateral lithology change, bedrock surface, stratigraphic boundaries, faults). Vertical exaggeration is automatic or manual. Export to PNG, SVG or PDF.
-4. **3D model** (tab 5) for the QGIS 3D Map View (**IN DEVELOPMENT - NOT WORKING YET**)::
-    - *Grid model* - blocks interpolated from the nearest boreholes.
-    - *Fence model* - 3D slabs built from 2D sections, added manually or generated automatically (N-S and E-W).
+### 1. Data
+- Two CSV files:
+    - *Boreholes*: name, X, Y, ground altitude, total depth; optional azimuth (0-360 deg clockwise from North) and dip/deviation (0-90 deg from vertical) for inclined boreholes.
+    - *Layers*: borehole name, depth from, depth to, lithology; optional stratigraphy. Any further columns can be used later as descriptions in the borehole logs.
+- Columns, delimiter and encoding are detected automatically and can be changed.
+- Coordinates in S-JTSK (EPSG:5514, also written without the minus sign), WGS84 or ETRS89.
+- The boreholes can be added to the map as a point layer; boreholes selected in it can be used for the logs and the 3D models.
 
-## Usage
+### 2. Lithology (colour, grain size)
+- Colour, grain size class (clay, silt, sand, gravel) and an FGDC lithologic pattern for every lithology.
+- The pattern is guessed from the name of the lithology (e.g. clay = 620 Clay or clay shale) and can be changed.
 
-Open **Plugins \> Borehole Geology \> Borehole Geology Sections** and follow the tabs 1-5. For 3D, open **View \> New 3D Map View** and raise the vertical scale.
+### 3. Borehole logs
+- Select one to four boreholes (also taken from the map) and create
+    - *profiles*: the columns side by side with a depth (or altitude) ruler, the lithological description next to the column (labels of thin layers hang on slanted lines) and a stratigraphy column,
+    - *sedimentary records*: the width of the column follows the grain size and an *Index* legend lists the rock types.
+- Both windows have a side panel with the column of the layers table used for the lithological description, the column used for the profile (colours, patterns), merging of identical lithologies and a **Regenerate** button.
+- *A separate window for each borehole* works for profiles and for sedimentary records.
+- Export to PNG, SVG and PDF.
 
-Requires QGIS 4.0 or newer (Qt6).
+### 4. 2D section
+- Draw a section line on the map or use a selected line feature; boreholes within the chosen distance are projected onto it (inclined boreholes included).
+- Layers of the same lithology are correlated between neighbouring boreholes: dip following, pinch-outs, lateral lithology changes, bedrock surface, stratigraphic boundaries and user-defined faults; identical neighbouring layers can be merged.
+- Vertical exaggeration automatic or manual; optional lithologic patterns.
+- Boreholes that do not lie on the section line are drawn with a dashed outline on a white halo. A borehole lies on the line when the line passes through its map marker (marker size of the *Boreholes* layer at the current scale, or a distance set by hand).
+- *Min. spacing of boreholes*: of boreholes that are almost at the same point only the one nearer to the line is used.
+- Export to PNG, SVG and PDF.
 
-## 2D section (tab 4)
-
-- Boreholes that do not lie on the section line are drawn with dashed edges.
-- *Min. spacing of boreholes*: of boreholes that are almost at the same point, only the one nearer to the line is used.
-
-## Borehole logs (tab 3)
-
-- Profiles of 1-4 boreholes: depth ruler, log with FGDC lithologic patterns, lithological description (labels of thin layers hang on slanted lines) and a stratigraphy column.
-- Sedimentary records with the column width given by the grain size and an Index legend.
-- Both windows have a side panel: column for the lithological description, column for the lithological profile (colours, patterns), merging of identical lithologies, and a **Regenerate** button.
-- The checkbox *A separate window for each borehole* works for both profiles and sedimentary records.
+### 5. 3D model (for the QGIS 3D Map View)
+- *Fence model*: closed 3D solids built from the 2D sections between neighbouring boreholes (grid of nearest neighbours or Delaunay triangulation), so inclined boundaries, pinch-outs and the terrain of an optional DEM are smooth. Borehole columns follow inclined boreholes. *Fill the space between the sections* also calculates the volume between the panels: every triangle of boreholes is interpolated from its three sections.
+- *Grid model*: blocks interpolated from the nearest boreholes as closed 3D bodies; the top follows the ground surface and the base of the Quaternary is exact.
+- A list with tick boxes shows or hides single lithologies of the created models; *Show block edges* draws thin outlines (off by default).
+- After creating a model open **View \> New 3D Map View** and raise the vertical scale.
 
 ## License
 

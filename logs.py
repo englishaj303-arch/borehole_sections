@@ -282,7 +282,6 @@ def build_records(bhs, colors, grains, patterns=None, px_per_m=0.0, measure=appr
     used = []
     for n, bh in enumerate(bhs):
         layers = _clean(bh)
-        z0 = bh.z
         lo, hi = (v_top, v_bot) if mode == "depth" else (v_bot, v_top)
         _ruler(cmds, x0 - 6, y_of, lo, hi, k,
                lambda v: f"{v:g}")

@@ -1,12 +1,12 @@
 from qgis.PyQt.QtCore import Qt, QRectF, QSize, pyqtSignal
-from qgis.PyQt.QtGui import (QColor, QGuiApplication, QImage, QPainter, QPdfWriter, QPageSize,
-                             QPageLayout)
+from qgis.PyQt.QtGui import (QColor, QGuiApplication, QIcon, QImage, QPainter, QPdfWriter,
+                             QPageSize, QPageLayout, QPixmap)
 from qgis.PyQt.QtSvg import QSvgGenerator
 from qgis.PyQt.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QTabWidget, QWidget, QGroupBox, QFormLayout,
     QComboBox, QCheckBox, QPushButton, QLabel, QPlainTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QDoubleSpinBox, QGraphicsView, QFileDialog,
-    QMessageBox, QSplitter, QSpinBox, QScrollArea, QFrame,
+    QMessageBox, QSplitter, QSpinBox, QScrollArea, QFrame, QListWidget, QListWidgetItem,
 )
 from qgis.core import (
     Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsGeometry,
@@ -584,6 +584,16 @@ class BoreholeDialog(QDialog):
                                "section line is used (0 = use all). Boreholes off the line are "
                                "drawn with dashed edges.")
         form.addRow("Min. spacing of boreholes", self.sp_gap)
+        self.sp_dash = QDoubleSpinBox()
+        self.sp_dash.setRange(0, 1e5)
+        self.sp_dash.setValue(0)
+        self.sp_dash.setSuffix(" m")
+        self.sp_dash.setSpecialValueText("auto (size of the map marker)")
+        self.sp_dash.setToolTip("A borehole whose distance from the section line is larger than "
+                                "this is drawn with a dashed outline. Auto: the radius of the "
+                                "circular marker of the 'Boreholes' layer at the current map "
+                                "scale, i.e. the line passes through the marker.")
+        form.addRow("Dashed outline farther than", self.sp_dash)
         self.sp_vex = QDoubleSpinBox()
         self.sp_vex.setRange(0, 100)
         self.sp_vex.setSpecialValueText("Auto")
@@ -635,12 +645,65 @@ class BoreholeDialog(QDialog):
         self.sp_dz.setRange(0.25, 50)
         self.sp_dz.setValue(2.0)
         self.sp_dz.setSuffix(" m")
-        cf.addRow("Vertical step of the blocks", self.sp_dz)
+        cf.addRow("Vertical step (grid model, inclined borehole columns)", self.sp_dz)
+        self.chk_edges = QCheckBox("Show block edges")
+        self.chk_edges.setToolTip("Thin outlines of the blocks / panels in the 3D view "
+                                  "(off = smooth surfaces without a mesh).")
+        cf.addRow(self.chk_edges)
         self.chk_sel = QCheckBox("Use only boreholes selected in the 'Boreholes' map layer")
         cf.addRow(self.chk_sel)
         lay.addWidget(com)
 
-        ga = QGroupBox("A) Grid model - blocks interpolated on a square grid")
+        gn = QGroupBox("A) Fence model - network of 2D sections between neighbouring boreholes")
+        fn = QFormLayout(gn)
+        self.cb_net = QComboBox()
+        self.cb_net.addItems(["Grid-like (nearest borehole in each direction)",
+                              "Delaunay triangulation"])
+        fn.addRow("Connect boreholes", self.cb_net)
+        self.sp_maxe = QDoubleSpinBox()
+        self.sp_maxe.setRange(0, 100000)
+        self.sp_maxe.setSpecialValueText("auto")
+        self.sp_maxe.setSuffix(" m")
+        fn.addRow("Longest panel", self.sp_maxe)
+        self.sp_pw = QDoubleSpinBox()
+        self.sp_pw.setRange(0.2, 50)
+        self.sp_pw.setValue(1.0)
+        self.sp_pw.setSuffix(" m")
+        fn.addRow("Panel thickness", self.sp_pw)
+        self.sp_nslab = QDoubleSpinBox()
+        self.sp_nslab.setRange(0.5, 200)
+        self.sp_nslab.setValue(5.0)
+        self.sp_nslab.setSuffix(" m")
+        fn.addRow("Terrain sampling step (with a DEM)", self.sp_nslab)
+        self.sp_colw = QDoubleSpinBox()
+        self.sp_colw.setRange(0, 50)
+        self.sp_colw.setValue(3.0)
+        self.sp_colw.setSuffix(" m")
+        self.sp_colw.setSpecialValueText("off")
+        fn.addRow("Borehole columns (black pillars), width", self.sp_colw)
+        drow = QHBoxLayout()
+        self.cb_dem = QComboBox()
+        drow.addWidget(self.cb_dem, 1)
+        bdem = QPushButton("Refresh")
+        bdem.clicked.connect(self._refresh_dem)
+        drow.addWidget(bdem)
+        fn.addRow("DEM (ground between boreholes)", drow)
+        self._refresh_dem()
+        self.chk_fill = QCheckBox("Fill the space between the sections (volume model)")
+        self.chk_fill.setToolTip("Calculates the areas between the 2D sections: every triangle of "
+                                 "neighbouring boreholes is interpolated from its three sections.")
+        fn.addRow(self.chk_fill)
+        self.sp_fillcell = QDoubleSpinBox()
+        self.sp_fillcell.setRange(0, 1000)
+        self.sp_fillcell.setSpecialValueText("auto")
+        self.sp_fillcell.setSuffix(" m")
+        fn.addRow("Cell size of the filled volume", self.sp_fillcell)
+        bnet = QPushButton("Create network fence model")
+        bnet.clicked.connect(self.build_network)
+        fn.addRow(bnet)
+        lay.addWidget(gn)
+
+        ga = QGroupBox("B) Grid model - blocks interpolated on a square grid")
         fa = QFormLayout(ga)
         self.sp_cell = QDoubleSpinBox()
         self.sp_cell.setRange(0, 5000)
@@ -664,50 +727,63 @@ class BoreholeDialog(QDialog):
         fa.addRow(bg)
         lay.addWidget(ga)
 
-        gn = QGroupBox("B) Fence model - network of 2D sections between neighbouring boreholes")
-        fn = QFormLayout(gn)
-        self.cb_net = QComboBox()
-        self.cb_net.addItems(["Grid-like (nearest borehole in each direction)",
-                              "Delaunay triangulation"])
-        fn.addRow("Connect boreholes", self.cb_net)
-        self.sp_maxe = QDoubleSpinBox()
-        self.sp_maxe.setRange(0, 100000)
-        self.sp_maxe.setSpecialValueText("auto")
-        self.sp_maxe.setSuffix(" m")
-        fn.addRow("Longest panel", self.sp_maxe)
-        self.sp_pw = QDoubleSpinBox()
-        self.sp_pw.setRange(0.2, 50)
-        self.sp_pw.setValue(1.0)
-        self.sp_pw.setSuffix(" m")
-        fn.addRow("Panel thickness", self.sp_pw)
-        self.sp_nslab = QDoubleSpinBox()
-        self.sp_nslab.setRange(0.5, 200)
-        self.sp_nslab.setValue(5.0)
-        self.sp_nslab.setSuffix(" m")
-        fn.addRow("Slab length (horizontal resolution)", self.sp_nslab)
-        self.sp_colw = QDoubleSpinBox()
-        self.sp_colw.setRange(0, 50)
-        self.sp_colw.setValue(3.0)
-        self.sp_colw.setSuffix(" m")
-        self.sp_colw.setSpecialValueText("off")
-        fn.addRow("Borehole columns (black pillars), width", self.sp_colw)
-        drow = QHBoxLayout()
-        self.cb_dem = QComboBox()
-        drow.addWidget(self.cb_dem, 1)
-        bdem = QPushButton("Refresh")
-        bdem.clicked.connect(self._refresh_dem)
-        drow.addWidget(bdem)
-        fn.addRow("DEM (ground between boreholes)", drow)
-        self._refresh_dem()
-        bnet = QPushButton("Create network fence model")
-        bnet.clicked.connect(self.build_network)
-        fn.addRow(bnet)
-        lay.addWidget(gn)
-
+        lay.addWidget(self._lithology_visibility_box())
         lay.addWidget(QLabel("Open the result with View > New 3D Map View "
                              "(raise the vertical scale in the 3D view settings)."))
         lay.addStretch()
         return w
+
+    # ---- visibility of lithologies in the 3D models
+    def _lithology_visibility_box(self):
+        box = QGroupBox("Lithologies in the 3D models (tick = shown)")
+        v = QVBoxLayout(box)
+        self.lst_lit = QListWidget()
+        self.lst_lit.setMaximumHeight(170)
+        self.lst_lit.itemChanged.connect(self._apply_lithology_visibility)
+        v.addWidget(self.lst_lit)
+        row = QHBoxLayout()
+        for text, state in (("Show all", True), ("Hide all", False)):
+            b = QPushButton(text)
+            b.clicked.connect(lambda _c=False, s=state: self._set_all_lithologies(s))
+            row.addWidget(b)
+        v.addLayout(row)
+        self.model_layers = {}              # lithology -> ids of the 3D layers
+        return box
+
+    def _register_models(self, registry, colors):
+        """Add the lithologies of a new 3D model to the list."""
+        self.lst_lit.blockSignals(True)
+        for lit, ids in registry.items():
+            self.model_layers.setdefault(lit, []).extend(ids)
+            if not self.lst_lit.findItems(lit, Qt.MatchFlag.MatchExactly):
+                it = QListWidgetItem(lit)
+                it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+                it.setCheckState(Qt.CheckState.Checked)
+                c = colors.get(lit)
+                if c is not None:
+                    pm = QPixmap(14, 14)
+                    pm.fill(QColor(c))
+                    it.setIcon(QIcon(pm))
+                self.lst_lit.addItem(it)
+        self.lst_lit.blockSignals(False)
+        self._apply_lithology_visibility()
+
+    def _apply_lithology_visibility(self, _item=None):
+        root = QgsProject.instance().layerTreeRoot()
+        for i in range(self.lst_lit.count()):
+            it = self.lst_lit.item(i)
+            on = it.checkState() == Qt.CheckState.Checked
+            for lid in self.model_layers.get(it.text(), []):
+                node = root.findLayer(lid)
+                if node is not None:
+                    node.setItemVisibilityChecked(on)
+
+    def _set_all_lithologies(self, on):
+        self.lst_lit.blockSignals(True)
+        for i in range(self.lst_lit.count()):
+            self.lst_lit.item(i).setCheckState(Qt.CheckState.Checked if on else Qt.CheckState.Unchecked)
+        self.lst_lit.blockSignals(False)
+        self._apply_lithology_visibility()
 
     # ---- data
     def _msg(self, s):
@@ -1007,6 +1083,22 @@ class BoreholeDialog(QDialog):
         self.line_rb.setWidth(2)
         self.line_rb.setToGeometry(QgsGeometry.fromPolylineXY(list(pts)), None)
 
+    def _marker_radius(self):
+        """Radius (m) of the circular borehole marker on the map at the current scale."""
+        size_mm = 2.0
+        try:
+            for lyr in self._bh_layers():
+                rend = lyr.renderer() if hasattr(lyr, "renderer") else None
+                sym = rend.symbol() if rend is not None and hasattr(rend, "symbol") else None
+                if sym is not None and sym.size() > 0:
+                    size_mm = sym.size()
+                    break
+            scale = self.canvas.scale()
+        except Exception as e:
+            core.log_warning(f"Marker size not available: {type(e).__name__}: {e}")
+            return core.OFF_LINE_TOL
+        return max(size_mm / 2.0 * scale / 1000.0, 0.1)
+
     def create_section(self):
         if not self._need_data():
             return
@@ -1026,10 +1118,12 @@ class BoreholeDialog(QDialog):
         colors, opts, bedrock, strat = self._section_options()
         pats = self.current_patterns()
         line = list(self.section_pts)
+        tol = self.sp_dash.value() or self._marker_radius()
 
         def build(faults, proj=proj, colors=colors, opts=opts, bedrock=bedrock, strat=strat,
-                  line=line, pats=pats):
-            sc = core.build_section_scene(proj, colors, *opts, faults, bedrock, True, pats)
+                  line=line, pats=pats, tol=tol):
+            sc = core.build_section_scene(proj, colors, *opts, faults, bedrock, True, pats,
+                                          off_tol=tol)
             sc.geo["line"] = line
             return sc
 
@@ -1071,14 +1165,15 @@ class BoreholeDialog(QDialog):
 
     def _show_3d_result(self, count, n, err, what):
         self.iface.messageBar().pushMessage(
-            "3D", f"{what}: {n} blocks in {count} layers. Open View > New 3D Map View.",
+            "3D", f"{what}: {n} objects in {count} layers. Open View > New 3D Map View.",
             level=Qgis.MessageLevel.Success, duration=10)
         if err:
             QMessageBox.warning(
                 self, "3D style",
                 "The layers were created, but the 3D style could not be applied:\n\n" + err +
                 "\n\nSet it manually: Layer Properties > 3D View > single symbol, "
-                "altitude clamping 'absolute', extrusion = the height in the layer name.")
+                "altitude clamping 'absolute', extrusion 0 (the objects are closed bodies "
+                "made of PolygonZ faces).")
 
     def create_grid(self):
         if not self._need_data():
@@ -1091,7 +1186,11 @@ class BoreholeDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "3D grid model", str(e))
             return
-        count, n, err = model3d.build_layers(prisms, self.current_colors(), "3D grid model")
+        reg = {}
+        colors = self.current_colors()
+        count, n, err = model3d.build_layers(model3d.prisms_to_solids(prisms), colors, "3D grid model",
+                                             edges=self.chk_edges.isChecked(), registry=reg)
+        self._register_models(reg, colors)
         self._show_3d_result(count, n, err,
                              f"Grid model ({info['cells']} cells of {info['cell']:.1f} m)")
 
@@ -1124,7 +1223,7 @@ class BoreholeDialog(QDialog):
     def build_network(self):
         if not self._need_data():
             return
-        bhs = [b for b in self._bh_subset() if b.layers]
+        bhs = model3d.drop_coincident([b for b in self._bh_subset() if b.layers])
         try:
             edges = model3d.neighbour_edges(
                 bhs, "delaunay" if self.cb_net.currentIndex() == 1 else "grid", self.sp_maxe.value())
@@ -1144,15 +1243,20 @@ class BoreholeDialog(QDialog):
                                     bedrock)
         dem = self._dem_func()
         try:
-            prisms = model3d.network_prisms(
+            solids, volume = model3d.network_solids(
                 bhs, edges, make_geo, self.sp_pw.value(), self.sp_nslab.value(),
-                self.sp_dz.value(), dem, self.sp_colw.value())
+                self.sp_dz.value(), dem, self.sp_colw.value(), self.chk_fill.isChecked(),
+                self.sp_fillcell.value(), self.sp_maxe.value())
         except Exception as e:
             QMessageBox.warning(self, "3D fence model", str(e))
             return
         cols = dict(colors)
         cols["Borehole"] = core.QColor(20, 20, 20)
-        count, n, err = model3d.build_layers(prisms, cols, "3D fence network")
+        reg = {}
+        count, n, err = model3d.build_layers(solids, cols, "3D fence network",
+                                             edges=self.chk_edges.isChecked(), registry=reg,
+                                             volume=volume)
+        self._register_models(reg, cols)
         self._show_3d_result(count, n, err, f"Fence network ({len(edges)} panels"
                                             + (", DEM" if dem else "") + ")")
 

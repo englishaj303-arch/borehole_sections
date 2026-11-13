@@ -412,7 +412,7 @@ def _extend_polyline(points, ext):
     return pts
 
 
-OFF_LINE_TOL = 1.0     # m; boreholes farther from the section line are drawn with dashed edges
+OFF_LINE_TOL = 1.0     # m; default: boreholes farther from the section line are drawn dashed
 
 
 def drop_close_boreholes(proj, min_gap):
@@ -1544,7 +1544,7 @@ def hatch_brush(code):
 def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
                         curvature=0.6, roundness=0.6, merge_same=False,
                         use_dip=True, transitions=True, faults=None, bedrock_dip=0.0,
-                        strat_lines=True, patterns=None):
+                        strat_lines=True, patterns=None, off_tol=OFF_LINE_TOL):
     """Return a QGraphicsScene with the cross section. vexag<=0 -> auto."""
     scene = QGraphicsScene()
     scene.setBackgroundBrush(QBrush(Qt.GlobalColor.white))
@@ -1632,20 +1632,23 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
         col_geoms[id(bh)] = cg
         q_full = QPolygonF([QPointF(px, py) for px, py in cg["quad"](0.0, bh.depth)])
         # a borehole off the section line has dashed edges
-        dashed = p.offset > OFF_LINE_TOL
-        edge_style = Qt.PenStyle.DashLine if dashed else Qt.PenStyle.SolidLine
-        full_pen = QPen(Qt.GlobalColor.black, 1)
-        full_pen.setStyle(edge_style)
-        full = scene.addPolygon(q_full, full_pen, QBrush(Qt.GlobalColor.white))
+        dashed = p.offset > off_tol
+        full = scene.addPolygon(q_full, QPen(Qt.GlobalColor.black, 1), QBrush(Qt.GlobalColor.white))
         full.setZValue(1)
         for L in LAY[id(bh)]:
             c = colors.get(L.litho, QColor(Qt.GlobalColor.gray))
             q_lay = QPolygonF([QPointF(px, py) for px, py in cg["quad"](L.top, L.bottom)])
-            lay_pen = QPen(Qt.GlobalColor.black, 0.8)
-            lay_pen.setStyle(edge_style)
-            r = scene.addPolygon(q_lay, lay_pen, QBrush(c))
+            r = scene.addPolygon(q_lay, QPen(Qt.GlobalColor.black, 0.8), QBrush(c))
             r.setZValue(2)
             add_hatch(lambda b, q_lay=q_lay: scene.addPolygon(q_lay, no_pen, b), L.litho, 2.5)
+        if dashed:
+            # dashed outline on a white halo: stays readable above lithologic patterns
+            halo = scene.addPolygon(q_full, QPen(QColor(255, 255, 255), 4.0))
+            halo.setZValue(3.4)
+            dash = QPen(QColor(0, 0, 0), 1.8)
+            dash.setDashPattern([3.0, 2.0])
+            dash_it = scene.addPolygon(q_full, dash)
+            dash_it.setZValue(3.5)
         if labels:
             x_top, y_top = cg["x0"], cg["y0"]
             x_bot, y_bot = cg["x1"], cg["y1"]
