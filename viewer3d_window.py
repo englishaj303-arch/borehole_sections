@@ -32,17 +32,30 @@ def _webengine_flags():
 _webengine_flags()
 
 
+def _try_import(module_name, attr):
+    """Attribute `attr` of module `module_name`, or None when the module is not installed or
+    fails to initialise."""
+    try:
+        return getattr(importlib.import_module(module_name), attr, None)
+    except Exception:                              # not installed / failed to initialise
+        return None
+
+
+def _first_import(module_names, attr):
+    """First non-None `attr` found in the given modules (tried in order), else None."""
+    for name in module_names:
+        found = _try_import(name, attr)
+        if found is not None:
+            return found
+    return None
+
+
 def _engine():
-    """(QWebEngineView, module name) or (None, None) when QtWebEngine is not installed."""
+    """QWebEngineView class or None when QtWebEngine is not installed."""
     if "view" not in _ENGINE:
-        _ENGINE["view"] = None
-        for mod in ("qgis.PyQt.QtWebEngineWidgets", "PyQt6.QtWebEngineWidgets",
-                    "PyQt5.QtWebEngineWidgets"):
-            try:
-                _ENGINE["view"] = importlib.import_module(mod).QWebEngineView
-                break
-            except Exception:                      # not installed / failed to initialise
-                continue
+        _ENGINE["view"] = _first_import(
+            ("qgis.PyQt.QtWebEngineWidgets", "PyQt6.QtWebEngineWidgets",
+             "PyQt5.QtWebEngineWidgets"), "QWebEngineView")
     return _ENGINE["view"]
 
 
@@ -119,16 +132,9 @@ class Viewer3DWindow(QDialog):
     def _enable_webgl(self):
         try:
             mod = importlib.import_module(type(self.view).__module__)
-            core_mod = None
-            for name in ("qgis.PyQt.QtWebEngineCore", "PyQt6.QtWebEngineCore",
-                         "PyQt5.QtWebEngineWidgets"):
-                try:
-                    core_mod = importlib.import_module(name)
-                    if hasattr(core_mod, "QWebEngineSettings"):
-                        break
-                except Exception:
-                    continue
-            settings_cls = getattr(core_mod, "QWebEngineSettings", None) or getattr(
+            settings_cls = _first_import(
+                ("qgis.PyQt.QtWebEngineCore", "PyQt6.QtWebEngineCore",
+                 "PyQt5.QtWebEngineWidgets"), "QWebEngineSettings") or getattr(
                 mod, "QWebEngineSettings")
             attr = getattr(settings_cls, "WebAttribute", settings_cls)
             st = self.view.settings()
