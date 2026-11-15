@@ -12,24 +12,29 @@ from qgis.PyQt.QtGui import QDesktopServices
 from qgis.PyQt.QtWidgets import (QDialog, QFileDialog, QHBoxLayout, QLabel, QMessageBox,
                                  QPushButton, QVBoxLayout)
 
+from qgis.core import QgsSettings
+
 from . import core
 
 _ENGINE = {}
 
 
 def _webengine_flags():
-    """Recent Chromium versions switch WebGL off when there is no usable GPU driver (remote
+    """Called only when the plugin's 3D viewer window is created for the first time (NOT when
+    the plugin or QGIS starts), and can be switched off in the QGIS settings (key
+    borehole_sections/software_webgl = false).
+
+    Recent Chromium versions switch WebGL off when there is no usable GPU driver (remote
     desktops, virtual machines, old / blocklisted graphics cards) unless the software
     rasteriser (SwiftShader) is allowed explicitly.  The flags are read when QtWebEngine starts,
     so they work only if nothing in this QGIS session has started it yet (restart QGIS once)."""
+    if QgsSettings().value("borehole_sections/software_webgl", True, type=bool) is False:
+        return
     flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
     for f in ("--ignore-gpu-blocklist", "--enable-unsafe-swiftshader"):
         if f not in flags:
             flags += " " + f
     os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = flags.strip()
-
-
-_webengine_flags()
 
 
 def _try_import(module_name, attr):
@@ -120,6 +125,7 @@ class Viewer3DWindow(QDialog):
             b.clicked.connect(fn)
             bar.addWidget(b)
         lay.addLayout(bar)
+        _webengine_flags()                 # only effective before QtWebEngine starts
         self.view = _engine()(self)
         self._enable_webgl()
         lay.addWidget(self.view, 1)
@@ -199,9 +205,20 @@ class Viewer3DWindow(QDialog):
         except OSError as e:
             QMessageBox.warning(self, "Save", str(e))
 
+    def _is_own_download(self, item):
+        """The download profile is shared by the whole QGIS session: handle only downloads that
+        come from the page of THIS window (the active-window test is only the fallback)."""
+        page_of = getattr(item, "page", None)
+        if callable(page_of):
+            try:
+                return page_of() is self.view.page()
+            except Exception:                          # page already deleted
+                return False
+        return self.isActiveWindow()
+
     def _download(self, item):
         """Screenshot (PNG) button of the viewer."""
-        if not self.isActiveWindow():
+        if not self._is_own_download(item):
             return
         name = item.suggestedFileName() or "model3d.png"
         dst, _ = QFileDialog.getSaveFileName(self, "Save the image", name, "PNG (*.png)")

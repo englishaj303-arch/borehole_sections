@@ -11,7 +11,7 @@ from qgis.PyQt.QtCore import Qt, QPointF
 from qgis.PyQt.QtGui import QColor, QBrush, QPen, QPolygonF, QFont, QPainterPath
 from qgis.PyQt.QtWidgets import QGraphicsScene
 from qgis.core import (
-    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject, QgsFeature, QgsGeometry, QgsLineString, QgsPoint, QgsPointXY, QgsVectorLayer,
+    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject, QgsFeature, QgsGeometry, QgsPoint, QgsPointXY, QgsVectorLayer,
     QgsMessageLog, Qgis,
 )
 
@@ -134,7 +134,8 @@ def read_table(path, delimiter=None):
             if any(c.strip() for c in r)]
     if not rows:
         raise ValueError("File is empty: " + path)
-    return [h.strip() for h in rows[0]], rows[1:]
+    # a blank header would collide with other blank headers (and with "no column") later on
+    return [h.strip() or f"(column {i + 1})" for i, h in enumerate(rows[0])], rows[1:]
 
 
 def to_float(s):
@@ -254,6 +255,10 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
         if not name or None in (sx, sy, z):
             warnings.append(f"Boreholes file, line {n}: invalid values - skipped")
             continue
+        if depth is not None and depth < 0:
+            warnings.append(f"Boreholes file, line {n} ({name}): negative total depth {depth:g} "
+                            "- replaced by 0 (the depth of the layers is used)")
+            depth = 0.0
 
         raw_az = r[az_idx].strip() if 0 <= az_idx < len(r) else ""
         if not raw_az:
@@ -1080,6 +1085,8 @@ def fault_polygons(LA, LB, xa, xb, YA, YB, pos, dip_deg, direction, mA, mB, aspe
     pos 0..1 = fault position between the columns at the surface, direction
     +1/-1 = fault plane dips to the right/left (0 = vertical).
     Returns (polygons, ((x1, y1), (x2, y2)) fault line)."""
+    if not LA and not LB:
+        return [], None                 # nothing below the cover: no fault line to draw
     span = xb - xa
     if G is None:
         def G(x):
@@ -1470,6 +1477,8 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
                                          f.get("dip", 80.0), f.get("dir", 1), mA, mB, aspect,
                                          G, top)
             out += map_polys(polys)
+            if line is None:            # only Quaternary cover in both boreholes: no fault line
+                continue
             (fx1, fy1), (fx2, fy2) = line
             u1, u2 = fx1 / xb, fx2 / xb
             lines.append((((1.0 - u1) * x_A(fy1) + u1 * x_B(fy1), fy1),
@@ -1744,43 +1753,3 @@ def make_borehole_point_layer(boreholes):
     lyr.dataProvider().addFeatures(feats)
     lyr.updateExtents()
     return lyr
-
-
-def make_3d_interval_layer(boreholes):
-    lyr = QgsVectorLayer(
-        f"LineStringZ?crs={CRS_SJTSK}&field=name:string&field=litho:string"
-        "&field=top:double&field=bottom:double",
-        "Boreholes 3D (lithology)", "memory")
-    feats = []
-    for b in boreholes:
-        for L in clean_layers(b.layers):
-            f = QgsFeature(lyr.fields())
-            f.setGeometry(QgsGeometry(QgsLineString([
-                QgsPoint(*b.point_at(L.top)), QgsPoint(*b.point_at(L.bottom))])))
-            f.setAttributes([b.name, L.litho, L.top, L.bottom])
-            feats.append(f)
-    lyr.dataProvider().addFeatures(feats)
-    lyr.updateExtents()
-    return lyr
-
-
-def apply_3d_style(layer, colors, width):
-    """Rule-based 3D renderer: one tube symbol per lithology."""
-    from qgis._3d import QgsLine3DSymbol, QgsRuleBased3DRenderer
-    try:
-        from qgis._3d import QgsPhongMaterialSettings
-    except ImportError:         # older / alternative bindings
-        from qgis.core import QgsPhongMaterialSettings
-
-    root = QgsRuleBased3DRenderer.Rule(None)
-    for lit, col in colors.items():
-        sym = QgsLine3DSymbol()
-        sym.setWidth(width)
-        sym.setAltitudeClamping(Qgis.AltitudeClamping.Absolute)
-        mat = QgsPhongMaterialSettings()
-        mat.setDiffuse(col)
-        mat.setAmbient(col.darker(150))
-        sym.setMaterialSettings(mat)
-        esc = lit.replace("'", "''")
-        root.appendChild(QgsRuleBased3DRenderer.Rule(sym, f"\"litho\" = '{esc}'", lit))
-    layer.setRenderer3D(QgsRuleBased3DRenderer(root))

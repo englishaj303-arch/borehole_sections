@@ -10,6 +10,7 @@ import base64
 import json
 import math
 import os
+import stat
 import tempfile
 import time
 from array import array
@@ -320,25 +321,40 @@ def render_html(scene):
     return html.replace(PLACEHOLDER, data, 1)
 
 
-def output_dir():
-    d = os.path.join(tempfile.gettempdir(), "borehole_sections_3d")
-    os.makedirs(d, exist_ok=True)
-    return d
+_PREFIX = "borehole_3d_"
 
 
-def write_html(scene, name="model3d"):
-    """Write the viewer + scene to a temporary file and return its path.  Files older than
-    two days are removed."""
-    d = output_dir()
+def _remove_old_files(max_age=2 * 86400):
+    """Remove viewer files of this plugin older than two days from the temp directory (only
+    regular files owned by the current user; links and foreign files are never touched)."""
+    d = tempfile.gettempdir()
     now = time.time()
-    for f in os.listdir(d):
+    uid = os.getuid() if hasattr(os, "getuid") else None
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for f in names:
+        if not (f.startswith(_PREFIX) and f.endswith(".html")):
+            continue
         p = os.path.join(d, f)
         try:
-            if f.endswith(".html") and now - os.path.getmtime(p) > 2 * 86400:
+            st = os.lstat(p)
+            if not stat.S_ISREG(st.st_mode) or (uid is not None and st.st_uid != uid):
+                continue
+            if now - st.st_mtime > max_age:
                 os.remove(p)
         except OSError:
             pass
-    path = os.path.join(d, "%s_%d.html" % (name, int(now)))
-    with open(path, "w", encoding="utf-8") as fh:
-        fh.write(render_html(scene))
-    return path
+
+
+def write_html(scene):
+    """Write the viewer + scene to a NEW temporary file and return its path.  The file has a
+    unique, unpredictable name and is readable only by the current user (mode 0600), so no
+    other local user can pre-create it, replace it by a link or read the exported data."""
+    _remove_old_files()
+    html = render_html(scene)
+    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".html",
+                                     prefix=_PREFIX, delete=False) as fh:
+        fh.write(html)
+        return fh.name

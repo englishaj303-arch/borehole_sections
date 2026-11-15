@@ -26,6 +26,8 @@ class BoreholePlugin:
         if self.action:
             self.iface.removePluginMenu(MENU, self.action)
             self.iface.removeToolBarIcon(self.action)
+            self.action.deleteLater()
+            self.action = None
         if self.dlg:
             self.dlg.cleanup()
             self.dlg.deleteLater()

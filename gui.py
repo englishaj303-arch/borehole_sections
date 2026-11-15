@@ -10,11 +10,12 @@ from qgis.PyQt.QtWidgets import (
     QApplication,
 )
 from qgis.core import (
-    Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsGeometry,
+    Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsCsException, QgsGeometry,
     QgsPointXY, QgsProject, QgsRasterLayer,
 )
 from qgis.gui import QgsColorButton, QgsFileWidget, QgsMapTool, QgsRubberBand
 
+import math
 from dataclasses import replace
 
 from . import core, logs, model3d, patterns, viewer3d, viewer3d_window
@@ -1021,6 +1022,8 @@ class BoreholeDialog(QDialog):
         desc = value of the description column, age = from the stratigraphy column; each item
         is taken from its own column; optionally identical neighbours are merged."""
         def value(L, col):
+            if not col:                       # column without a header name: no value
+                return ""
             if col == self.litho_col:
                 return L.litho
             return ((L.extra or {}).get(col) or "").strip()
@@ -1028,7 +1031,7 @@ class BoreholeDialog(QDialog):
         def age_of(L):
             if strat_col == NO_STRAT:
                 return None
-            if strat_col == self.strat_col:
+            if self.strat_col and strat_col == self.strat_col:
                 return L.age
             raw = value(L, strat_col)
             return core.parse_strat(raw) if raw else None
@@ -1142,6 +1145,9 @@ class BoreholeDialog(QDialog):
         if g.isNull() or g.isEmpty():
             QMessageBox.warning(self, "Selection", "The selected feature has an empty geometry.")
             return
+        g = QgsGeometry(g)                      # arcs (CircularString, CompoundCurve) -> segments
+        if g.constGet() is not None and g.constGet().hasCurvedSegments():
+            g.convertToStraightSegment()
         parts = g.asMultiPolyline() if g.isMultipart() else [g.asPolyline()]
         pts = parts[0] if parts else []
         if len(pts) < 2:
@@ -1152,7 +1158,13 @@ class BoreholeDialog(QDialog):
     def _set_line(self, pts, src_crs):
         dst = QgsCoordinateReferenceSystem(core.CRS_SJTSK)
         tr = QgsCoordinateTransform(src_crs, dst, QgsProject.instance())
-        new_pts = [tr.transform(QgsPointXY(p)) for p in pts]
+        try:
+            new_pts = [tr.transform(QgsPointXY(p)) for p in pts]
+        except (QgsCsException, ValueError) as e:
+            QMessageBox.warning(self, "Section line",
+                                "The section line could not be transformed to S-JTSK "
+                                f"(layer or project without a valid CRS?):\n{e}")
+            return
         length = QgsGeometry.fromPolylineXY(new_pts).length() if len(new_pts) >= 2 else 0.0
         if length < 1e-6:
             QMessageBox.warning(self, "Section line",
@@ -1380,7 +1392,7 @@ class BoreholeDialog(QDialog):
         def f(x, y):
             try:
                 v, ok = prov.sample(tr.transform(QgsPointXY(x, y)), 1)
-                return v if ok else None
+                return float(v) if (ok and math.isfinite(v)) else None   # NoData may be NaN
             except Exception:
                 return None
         return f
@@ -1389,12 +1401,15 @@ class BoreholeDialog(QDialog):
         if not self._need_data():
             return
         bhs = model3d.drop_coincident([b for b in self._bh_subset() if b.layers])
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             edges = model3d.neighbour_edges(
                 bhs, "delaunay" if self.cb_net.currentIndex() == 1 else "grid", self.sp_maxe.value())
         except Exception as e:
+            QApplication.restoreOverrideCursor()
             QMessageBox.warning(self, "3D fence model", f"{type(e).__name__}: {e}")
             return
+        QApplication.restoreOverrideCursor()
         if not edges:
             QMessageBox.warning(self, "3D fence model",
                                 "No pair of neighbouring boreholes found - increase the longest panel.")
@@ -1407,6 +1422,7 @@ class BoreholeDialog(QDialog):
             return core.section_geo(proj, opts[0], opts[3], opts[4], opts[5], opts[6], opts[7],
                                     bedrock)
         dem = self._dem_func()
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
             solids, volume = model3d.network_solids(
                 bhs, edges, make_geo, self.sp_pw.value(), self.sp_nslab.value(),
@@ -1414,8 +1430,10 @@ class BoreholeDialog(QDialog):
                 self.sp_fillcell.value(), self.sp_maxe.value(), 60000,
                 "blocks" if self.cb_fillmode.currentIndex() == 1 else "smooth")
         except Exception as e:
+            QApplication.restoreOverrideCursor()
             QMessageBox.warning(self, "3D fence model", str(e))
             return
+        QApplication.restoreOverrideCursor()
         cols = dict(colors)
         cols["Borehole"] = core.QColor(20, 20, 20)
         self._finish_model({"Fence panels": solids, "Fence volume": volume}, cols,

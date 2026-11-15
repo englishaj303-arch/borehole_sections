@@ -109,6 +109,9 @@ def grid_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0,
             for i in range(i_top, i_min - 1, -1):
                 zc = (i + 0.5) * dz
                 dg = max(g - zc, 0.0)
+                if i == i_top and qt > 0:
+                    dg = 0.0        # the top block holds the ground surface: a Quaternary cover
+                                    # thinner than dz / 2 must not vanish
                 # weight boreholes by horizontal distance to their trace at elevation zc
                 z_dist = []
                 for b in bhs:
@@ -350,7 +353,9 @@ def delaunay_triangles(pts):
     miny, maxy = min(p[1] for p in pts), max(p[1] for p in pts)
     dm = max(maxx - minx, maxy - miny, 1.0) * 30.0
     mx, my = (minx + maxx) / 2.0, (miny + maxy) / 2.0
-    P = list(pts) + [(mx - dm, my - dm), (mx, my + dm), (mx + dm, my - dm)]
+    # work in a local origin: S-JTSK coordinates are ~1e6 m, their squares ~1e12 would eat the
+    # significant digits of float64 in the in-circle test
+    P = [(p[0] - mx, p[1] - my) for p in pts] + [(-dm, -dm), (0.0, dm), (dm, -dm)]
 
     def in_circle(p, t):
         (ax, ay), (bx, by), (cx, cy) = P[t[0]], P[t[1]], P[t[2]]
@@ -682,7 +687,8 @@ def fill_smooth(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, max_solids
     into closed bodies with SLOPED top and bottom faces, so boundaries are smooth surfaces,
     dipping layers stay inclined and a layer that is missing at one node pinches out
     over one mesh cell.  Nodes on the border of two triangles are shared, so the volumes
-    meet without gaps.  Returns [(faces, litho)]."""
+    meet without gaps (all triangles use the same number of divisions n, so the nodes on a
+    shared edge coincide; no T-junctions).  Returns [(faces, litho)]."""
     pts = [(b.x, b.y) for b in bhs]
     if len(bhs) < 3:
         return []
@@ -697,7 +703,12 @@ def fill_smooth(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, max_solids
         lens = [math.hypot(pts[a][0] - pts[b][0], pts[a][1] - pts[b][1])
                 for t in tris for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0]))]
         cell = max(_median(lens) / 8.0, 0.5)
-    cache = {}                       # node position -> {lithology: [(top, bottom), ...]}
+    # ONE division for every triangle (from the longest side of the whole mesh): two triangles
+    # that share an edge then have the same nodes on it
+    longest = max(math.hypot(pts[a][0] - pts[b][0], pts[a][1] - pts[b][1])
+                  for t in tris for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])))
+    n = max(1, int(math.ceil(longest / cell)))
+    cache = {}                       # node position -> ({lithology: [(top, bottom), ...]}, g, zbot)
     out = []
 
     def column(w3, x, y, bh3, idx):
@@ -720,8 +731,8 @@ def fill_smooth(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, max_solids
                 return max(votes, key=votes.get) if votes else None
             for top, bot, lit in _column_runs(vote, g, zbot, dz):
                 by.setdefault(lit, []).append((top, bot))
-        cache[key] = by
-        return by
+        cache[key] = (by, g, zbot)
+        return cache[key]
 
     def join(v3):
         _join_nodes(v3, out)
@@ -739,17 +750,15 @@ def fill_smooth(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, max_solids
             idx[1], idx[2] = idx[2], idx[1]
             A, B, C = (pts[k] for k in idx)
         bh3 = [bhs[k] for k in idx]
-        side = max(math.hypot(B[0] - A[0], B[1] - A[1]), math.hypot(C[0] - B[0], C[1] - B[1]),
-                   math.hypot(A[0] - C[0], A[1] - C[1]))
-        n = max(1, int(math.ceil(side / cell)))
         nodes = {}
 
-        def node(i, j, n=n, A=A, B=B, C=C, bh3=bh3, idx=idx, nodes=nodes):
+        def node(i, j, A=A, B=B, C=C, bh3=bh3, idx=idx, nodes=nodes):
             if (i, j) not in nodes:
                 a, b, c = (n - i - j) / n, i / n, j / n
                 x = a * A[0] + b * B[0] + c * C[0]
                 y = a * A[1] + b * B[1] + c * C[1]
-                nodes[(i, j)] = (x, y, column((a, b, c), x, y, bh3, idx))
+                by, g, zbot = column((a, b, c), x, y, bh3, idx)
+                nodes[(i, j)] = (x, y, by, g, zbot)
             return nodes[(i, j)]
 
         for i in range(n):
@@ -764,10 +773,12 @@ def _join_nodes(v3, out):
     """Join three neighbouring mesh nodes (x, y, {lithology: [(top, bottom), ...]}) layer by
     layer into closed bodies with sloped top and bottom faces and append them to `out`.
     The k-th occurrence of a lithology in a column continues into the k-th occurrence in the
-    next one; a layer missing at one node pinches out towards it."""
+    next one; a layer missing at one node pinches out towards it (inside the node's ground /
+    bottom range, so the wedge never sticks out above the terrain).
+    Nodes are (x, y, layers[, ground, bottom])."""
     lits = set()
-    for _x, _y, by in v3:
-        lits.update(by)
+    for v in v3:
+        lits.update(v[2])
     xy = [(v[0], v[1]) for v in v3]
     for lit in sorted(lits, key=str):
         lists = [v[2].get(lit, []) for v in v3]
@@ -775,7 +786,15 @@ def _join_nodes(v3, out):
             runs = [q[k] if k < len(q) else None for q in lists]
             have = [r for r in runs if r]
             mid = sum((r[0] + r[1]) / 2.0 for r in have) / len(have)
-            tb = [r if r else (mid, mid) for r in runs]
+            tb = []
+            for r, v in zip(runs, v3):
+                if r:
+                    tb.append(r)
+                    continue
+                z0 = mid                         # pinch-out of the missing layer at this node;
+                if len(v) > 4:                   # never above the ground, never below the bottom
+                    z0 = max(min(z0, v[3]), min(v[4], v[3]))
+                tb.append((z0, z0))
             if all(r[0] - r[1] < 1e-6 for r in tb):
                 continue
             out.append((_wedge(xy, tb), lit))
@@ -867,7 +886,7 @@ def smooth_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0
         by = {}
         for top, bot, lit in _column_runs(vote, g, zbot, dz):
             by.setdefault(lit, []).append((top, bot))
-        cache[key] = (x, y, by)
+        cache[key] = (x, y, by, g, zbot)
         return cache[key]
 
     out = []
