@@ -6,8 +6,9 @@ Two models are offered:
                  closed 3D solids (PolygonZ faces, no extrusion): the outline of every
                  correlated layer is moved by half of the panel thickness to both sides,
                  so inclined boundaries, pinch-outs and the terrain of a DEM are smooth.
-                 Optionally the space between the panels is filled: every triangle of
-                 neighbouring boreholes is interpolated from its three sections,
+                 Optionally the layers are interpolated between the panels: every triangle of
+                 neighbouring boreholes is interpolated from its three sections into smooth
+                 solids with sloped tops and bottoms (the older block method is still offered),
 * grid model   - square grid chosen from the boreholes; every grid cell gets a
                  column of blocks whose lithology is interpolated from the nearest
                  boreholes.  Blocks are closed 3D boxes as well, so no extrusion style
@@ -618,6 +619,325 @@ def fill_between_sections(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, 
     return out
 
 
+def _section_refs(w3, idx, edge_of):
+    """The three sections around a triangle of boreholes as (sampler, distance d, weight) for the
+    point with barycentric coordinates w3 (the line from each corner through the point hits the
+    opposite section)."""
+    refs = []
+    for v in range(3):
+        u, w = (v + 1) % 3, (v + 2) % 3
+        den = w3[u] + w3[w]
+        tt = w3[w] / den if den > 1e-9 else 0.5
+        i1, i2 = idx[u], idx[w]
+        sampler, length = edge_of(min(i1, i2), max(i1, i2))
+        if i1 > i2:
+            tt = 1.0 - tt
+        if sampler is None:
+            continue
+        refs.append((sampler, tt * length, 1.0 / (w3[v] ** 2 + 0.02)))
+    return refs
+
+
+def _clean_ring(ring, tol=1e-6):
+    """Ring of (x, y, z) without repeated neighbouring points; [] when it has no area."""
+    out = []
+    for p in ring:
+        if not out or math.dist(p, out[-1]) > tol:
+            out.append(p)
+    while len(out) > 1 and math.dist(out[0], out[-1]) <= tol:
+        out.pop()
+    if len(out) < 3:
+        return []
+    nx = ny = nz = 0.0
+    for k in range(len(out)):
+        x1, y1, z1 = out[k]
+        x2, y2, z2 = out[(k + 1) % len(out)]
+        nx += (y1 - y2) * (z1 + z2)
+        ny += (z1 - z2) * (x1 + x2)
+        nz += (x1 - x2) * (y1 + y2)
+    return out if math.sqrt(nx * nx + ny * ny + nz * nz) > 1e-9 else []
+
+
+def _wedge(xy, tb):
+    """Closed body over a triangle: sloped top and bottom, tb = [(top, bottom)] per corner."""
+    top = [(x, y, t[0]) for (x, y), t in zip(xy, tb)]
+    bot = [(x, y, t[1]) for (x, y), t in zip(xy, tb)]
+    faces = [top, list(reversed(bot))]
+    for k in range(3):
+        k2 = (k + 1) % 3
+        ring = _clean_ring([bot[k], bot[k2], top[k2], top[k]])
+        if ring:
+            faces.append(ring)
+    return faces
+
+
+def fill_smooth(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, max_solids=60000):
+    """Interpolated layers between the sections WITHOUT blocks.
+
+    Every Delaunay triangle of neighbouring boreholes is divided into a fine triangular mesh.
+    At every mesh node the stack of layers is read from the three surrounding sections (the
+    same voting as the block method; layer boundaries are refined by bisection, so they are
+    exact and not rounded to dz).  Neighbouring nodes are then joined layer by layer (the k-th
+    occurrence of a lithology in a column continues into the k-th occurrence in the next one)
+    into closed bodies with SLOPED top and bottom faces, so boundaries are smooth surfaces,
+    dipping layers stay inclined and a layer that is missing at one node pinches out
+    over one mesh cell.  Nodes on the border of two triangles are shared, so the volumes
+    meet without gaps.  Returns [(faces, litho)]."""
+    pts = [(b.x, b.y) for b in bhs]
+    if len(bhs) < 3:
+        return []
+    if maxlen <= 0:
+        maxlen = _default_maxlen(pts)
+    tris = [t for t in delaunay_triangles(pts)
+            if all(math.hypot(pts[a][0] - pts[b][0], pts[a][1] - pts[b][1]) <= maxlen
+                   for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])))]
+    if not tris:
+        return []
+    if cell <= 0:
+        lens = [math.hypot(pts[a][0] - pts[b][0], pts[a][1] - pts[b][1])
+                for t in tris for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0]))]
+        cell = max(_median(lens) / 8.0, 0.5)
+    cache = {}                       # node position -> {lithology: [(top, bottom), ...]}
+    out = []
+
+    def column(w3, x, y, bh3, idx):
+        key = (round(x, 3), round(y, 3))
+        if key in cache:
+            return cache[key]
+        g = dem(x, y) if dem is not None else None
+        if g is None:
+            g = sum(w * b.z for w, b in zip(w3, bh3))
+        zbot = sum(w * b.z_at(b.depth) for w, b in zip(w3, bh3))
+        refs = _section_refs(w3, idx, edge_of)
+        by = {}
+        if refs:
+            def vote(z, refs=refs):
+                votes = {}
+                for sampler, d, wt in refs:
+                    lit = sampler.lit_at(d, z)
+                    if lit is not None:
+                        votes[lit] = votes.get(lit, 0.0) + wt
+                return max(votes, key=votes.get) if votes else None
+            for top, bot, lit in _column_runs(vote, g, zbot, dz):
+                by.setdefault(lit, []).append((top, bot))
+        cache[key] = by
+        return by
+
+    def join(v3):
+        _join_nodes(v3, out)
+        if len(out) > max_solids:
+            raise ValueError("The interpolated volume would contain too many bodies - "
+                             "increase the mesh size of the volume.")
+
+    for t in tris:
+        idx = list(t)
+        A, B, C = (pts[k] for k in idx)
+        det = (B[0] - A[0]) * (C[1] - A[1]) - (B[1] - A[1]) * (C[0] - A[0])
+        if abs(det) < 1e-9:
+            continue
+        if det < 0:
+            idx[1], idx[2] = idx[2], idx[1]
+            A, B, C = (pts[k] for k in idx)
+        bh3 = [bhs[k] for k in idx]
+        side = max(math.hypot(B[0] - A[0], B[1] - A[1]), math.hypot(C[0] - B[0], C[1] - B[1]),
+                   math.hypot(A[0] - C[0], A[1] - C[1]))
+        n = max(1, int(math.ceil(side / cell)))
+        nodes = {}
+
+        def node(i, j, n=n, A=A, B=B, C=C, bh3=bh3, idx=idx, nodes=nodes):
+            if (i, j) not in nodes:
+                a, b, c = (n - i - j) / n, i / n, j / n
+                x = a * A[0] + b * B[0] + c * C[0]
+                y = a * A[1] + b * B[1] + c * C[1]
+                nodes[(i, j)] = (x, y, column((a, b, c), x, y, bh3, idx))
+            return nodes[(i, j)]
+
+        for i in range(n):
+            for j in range(n - i):
+                join([node(i, j), node(i + 1, j), node(i, j + 1)])
+                if i + j < n - 1:
+                    join([node(i + 1, j), node(i + 1, j + 1), node(i, j + 1)])
+    return out
+
+
+def _join_nodes(v3, out):
+    """Join three neighbouring mesh nodes (x, y, {lithology: [(top, bottom), ...]}) layer by
+    layer into closed bodies with sloped top and bottom faces and append them to `out`.
+    The k-th occurrence of a lithology in a column continues into the k-th occurrence in the
+    next one; a layer missing at one node pinches out towards it."""
+    lits = set()
+    for _x, _y, by in v3:
+        lits.update(by)
+    xy = [(v[0], v[1]) for v in v3]
+    for lit in sorted(lits, key=str):
+        lists = [v[2].get(lit, []) for v in v3]
+        for k in range(max(len(q) for q in lists)):
+            runs = [q[k] if k < len(q) else None for q in lists]
+            have = [r for r in runs if r]
+            mid = sum((r[0] + r[1]) / 2.0 for r in have) / len(have)
+            tb = [r if r else (mid, mid) for r in runs]
+            if all(r[0] - r[1] < 1e-6 for r in tb):
+                continue
+            out.append((_wedge(xy, tb), lit))
+
+
+def _shepard(dists, k):
+    """Weights of the nearest boreholes that fall to ZERO at the distance of the (k+1)-th one
+    (modified Shepard), so the interpolated layers change smoothly when the set of nearest
+    boreholes changes.  dists = [(distance, borehole)] sorted; returns [(weight, borehole)]."""
+    R = dists[k][0] if len(dists) > k else dists[-1][0] * 1.5 + 1.0
+    out = []
+    for d, b in dists:
+        if d >= R:
+            break
+        out.append((((R - d) / (R * math.hypot(d, 1.0))) ** 2, b))
+    return out or [(1.0, dists[0][1])]
+
+
+def smooth_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0,
+                 extent="hull", maxlen=0.0, margin=0.1, max_solids=80000):
+    """FULL 3D model made directly from the boreholes (no 2D sections needed) with SMOOTH layers.
+
+    The layer stack of a mesh node is interpolated from the nearest boreholes with the same
+    rules as the block model (mode "elevation" = horizontal layers, "depth" = layers parallel to
+    the ground; the Quaternary cover always follows the ground), but with continuous weights, and
+    layer boundaries are refined by bisection - they are exact surfaces, not multiples of dz.
+    Neighbouring nodes are joined layer by layer into closed bodies with sloped tops and bottoms
+    (see _join_nodes).  extent "hull": the triangles between the boreholes (Delaunay,
+    triangles with a side longer than `maxlen` - 0 = 2 x maxdist or automatic - are left out);
+    extent "rectangle": a rectangle around the boreholes extended by `margin`, nodes farther than
+    `maxdist` from a borehole are left out.  Returns (solids [(faces, litho)], info)."""
+    bhs = drop_coincident([b for b in boreholes if b.layers])
+    if len(bhs) < 3:
+        raise ValueError("At least three boreholes with layers (at different places) are needed.")
+    lay = {id(b): core.clean_layers(b.layers) for b in bhs}
+    cos_dip = {id(b): max(math.cos(math.radians(b.dip)), 1e-4) for b in bhs}
+    qth, qvth = {}, {}
+    for b in bhs:
+        n = core._quat_run(lay[id(b)])
+        qth[id(b)] = lay[id(b)][n - 1].bottom if n else 0.0
+        qvth[id(b)] = qth[id(b)] * cos_dip[id(b)]
+    pts = [(b.x, b.y) for b in bhs]
+    xs = [b.x for b in bhs] + [b.point_at(b.depth)[0] for b in bhs]
+    ys = [b.y for b in bhs] + [b.point_at(b.depth)[1] for b in bhs]
+    ext = max(max(xs) - min(xs), max(ys) - min(ys), 1.0)
+    if cell <= 0:
+        cell = max(ext / 25.0, 1.0)
+    cand_n = max(2 * k, 8)
+    cache = {}
+
+    def column(x, y):
+        key = (round(x, 3), round(y, 3))
+        if key in cache:
+            return cache[key]
+        dl = sorted(((math.hypot(b.x - x, b.y - y), b) for b in bhs), key=lambda t: t[0])
+        cands = [b for _, b in dl[:cand_n]]
+        wc = _shepard(dl, max(1, k))
+        ws = sum(w for w, _ in wc)
+        g = sum(w * b.z for w, b in wc) / ws                       # ground elevation
+        qt = sum(w * qvth[id(b)] for w, b in wc) / ws             # vertical Quaternary thickness
+        zbot = sum(w * b.z_at(b.depth) for w, b in wc) / ws
+
+        def vote(z):
+            dg = max(g - z, 0.0)
+            zd = []
+            for b in cands:                       # distance of the borehole trace at elevation z
+                md = max(0.0, min(b.depth, (b.z - z) / cos_dip[id(b)]))
+                bx, by, _ = b.point_at(md)
+                zd.append((math.hypot(bx - x, by - y), b))
+            zd.sort(key=lambda t: t[0])
+            votes = {}
+            quat = qt > 0 and dg <= qt
+            for w, b in _shepard(zd, max(1, k)):
+                cd = cos_dip[id(b)]
+                if quat:                                            # Quaternary cover
+                    qv = qvth[id(b)]
+                    if qv <= 0:
+                        continue
+                    L = unit_at(lay[id(b)], (dg * qv / qt) / cd)
+                    ok = L is not None and L.age == (0, 0)
+                else:
+                    dep = qth[id(b)] + (dg - qt) / cd if mode == "depth" else (b.z - z) / cd
+                    L = unit_at(lay[id(b)], dep)
+                    ok = L is not None and L.age != (0, 0)
+                if ok:
+                    votes[L.litho] = votes.get(L.litho, 0.0) + w
+            return max(votes, key=votes.get) if votes else None
+
+        by = {}
+        for top, bot, lit in _column_runs(vote, g, zbot, dz):
+            by.setdefault(lit, []).append((top, bot))
+        cache[key] = (x, y, by)
+        return cache[key]
+
+    out = []
+    ntri = [0]
+
+    def join(a, b, c):
+        _join_nodes([a, b, c], out)
+        ntri[0] += 1
+        if len(out) > max_solids:
+            raise ValueError("The model would contain too many bodies - increase the mesh "
+                             "size or the vertical step.")
+
+    if extent == "rectangle":
+        pad = margin * ext
+        x0, y0 = min(xs) - pad, min(ys) - pad
+        nx = int(math.ceil((max(xs) + pad - x0) / cell))
+        ny = int(math.ceil((max(ys) + pad - y0) / cell))
+        if nx * ny > 40000:
+            raise ValueError(f"Mesh of {nx} x {ny} cells is too large - increase the mesh size.")
+        ok = {}
+
+        def valid(i, j):
+            if (i, j) not in ok:
+                x, y = x0 + i * cell, y0 + j * cell
+                ok[(i, j)] = (maxdist <= 0
+                              or min(math.hypot(b.x - x, b.y - y) for b in bhs) <= maxdist)
+            return ok[(i, j)]
+
+        def node(i, j):
+            return column(x0 + i * cell, y0 + j * cell)
+        for i in range(nx):
+            for j in range(ny):
+                if not (valid(i, j) and valid(i + 1, j) and valid(i + 1, j + 1) and valid(i, j + 1)):
+                    continue
+                join(node(i, j), node(i + 1, j), node(i + 1, j + 1))
+                join(node(i, j), node(i + 1, j + 1), node(i, j + 1))
+    else:
+        if maxlen <= 0:
+            maxlen = 2.0 * maxdist if maxdist > 0 else _default_maxlen(pts)
+        tris = [t for t in delaunay_triangles(pts)
+                if all(math.hypot(pts[a][0] - pts[b][0], pts[a][1] - pts[b][1]) <= maxlen
+                       for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])))]
+        if not tris:
+            raise ValueError("No triangle of neighbouring boreholes - increase the maximum "
+                             "distance from a borehole.")
+        for t in tris:
+            idx = list(t)
+            A, B, C = (pts[q] for q in idx)
+            det = (B[0] - A[0]) * (C[1] - A[1]) - (B[1] - A[1]) * (C[0] - A[0])
+            if abs(det) < 1e-9:
+                continue
+            if det < 0:
+                idx[1], idx[2] = idx[2], idx[1]
+                A, B, C = (pts[q] for q in idx)
+            side = max(math.hypot(B[0] - A[0], B[1] - A[1]), math.hypot(C[0] - B[0], C[1] - B[1]),
+                       math.hypot(A[0] - C[0], A[1] - C[1]))
+            n = max(1, int(math.ceil(side / cell)))
+
+            def node(i, j, n=n, A=A, B=B, C=C):
+                a, b, c = (n - i - j) / n, i / n, j / n
+                return column(a * A[0] + b * B[0] + c * C[0], a * A[1] + b * B[1] + c * C[1])
+            for i in range(n):
+                for j in range(n - i):
+                    join(node(i, j), node(i + 1, j), node(i, j + 1))
+                    if i + j < n - 1:
+                        join(node(i + 1, j), node(i + 1, j + 1), node(i, j + 1))
+    return out, {"cell": cell, "nodes": len(cache), "triangles": ntri[0], "bodies": len(out),
+                 "extent": extent}
+
+
 def _column_runs(vote, ztop, zbot, dz):
     """Runs (top, bottom, lithology) of one column; boundaries are refined by bisection."""
     if ztop - zbot < 1e-6:
@@ -649,11 +969,13 @@ def _column_runs(vote, ztop, zbot, dz):
 
 
 def network_solids(bhs, edges, make_geo, width=1.0, step=5.0, dz=2.0, dem=None,
-                   colw=3.0, fill=False, cell=0.0, maxlen=0.0, max_solids=60000):
+                   colw=3.0, fill=False, cell=0.0, maxlen=0.0, max_solids=60000,
+                   fill_mode="smooth"):
     """Thin vertical panels between neighbouring boreholes as 3D solids [(faces, litho)] and,
     with fill=True, the volume between the panels.
     make_geo(A, B, L) -> 2D section geometry (core.section_geo) of the pair;
     dem(x, y) -> ground elevation or None (optional terrain following, sampled every `step` m).
+    fill_mode "smooth" (sloped solids, default) or "blocks" (columns of boxes, versions <= 0.18.2).
     Returns (panel_and_column_solids, volume_solids)."""
     solids = []
     cache = {}
@@ -694,7 +1016,10 @@ def network_solids(bhs, edges, make_geo, width=1.0, step=5.0, dz=2.0, dem=None,
             if (i, j) not in samplers:
                 samplers[(i, j)] = sampler_of(i, j)
             return samplers[(i, j)]
-        volume = fill_between_sections(bhs, cached, dz, cell, maxlen, dem)
+        if fill_mode == "blocks":
+            volume = fill_between_sections(bhs, cached, dz, cell, maxlen, dem)
+        else:
+            volume = fill_smooth(bhs, cached, dz, cell, maxlen, dem)
     if colw > 0:
         used = {k for e in edges for k in e}
         solids += column_solids([bhs[k] for k in sorted(used)], colw, dz)

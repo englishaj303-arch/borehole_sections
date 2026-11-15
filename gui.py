@@ -7,6 +7,7 @@ from qgis.PyQt.QtWidgets import (
     QComboBox, QCheckBox, QPushButton, QLabel, QPlainTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QDoubleSpinBox, QGraphicsView, QFileDialog,
     QMessageBox, QSplitter, QSpinBox, QScrollArea, QFrame, QListWidget, QListWidgetItem,
+    QApplication,
 )
 from qgis.core import (
     Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsGeometry,
@@ -16,7 +17,7 @@ from qgis.gui import QgsColorButton, QgsFileWidget, QgsMapTool, QgsRubberBand
 
 from dataclasses import replace
 
-from . import core, logs, model3d, patterns
+from . import core, logs, model3d, patterns, viewer3d, viewer3d_window
 
 
 # ---------------------------------------------------------------- map tool
@@ -424,6 +425,8 @@ class BoreholeDialog(QDialog):
         self.bh_layer_id = None
         self.viewers = []
         self.forms = {}
+        self.scene3d, self.scene3d_colors, self.scene3d_bhs = {}, {}, {}   # models of the own 3D viewer
+        self._viewer3d = None
 
         tabs = QTabWidget()
         lay = QVBoxLayout(self)
@@ -663,6 +666,28 @@ class BoreholeDialog(QDialog):
     def _tab_3d(self):
         w = QWidget()
         lay = QVBoxLayout(w)
+        vw = QGroupBox("Output and 3D viewer")
+        vf = QFormLayout(vw)
+        self.cb_out = QComboBox()
+        self.cb_out.addItems(["Plugin's 3D viewer + QGIS 3D layers",
+                              "Plugin's 3D viewer only",
+                              "QGIS 3D layers only (for the QGIS 3D Map View)"])
+        self.cb_out.setToolTip("The plugin's own viewer (WebGL) rotates, cuts and measures the model "
+                               "without the QGIS 3D Map View; the QGIS layers stay in the project.")
+        vf.addRow("Show the created model in", self.cb_out)
+        self.chk_browser = QCheckBox("Open the viewer in the web browser instead of a QGIS window")
+        if not viewer3d_window.webengine_available():
+            self.chk_browser.setChecked(True)
+            self.chk_browser.setEnabled(False)
+            self.chk_browser.setToolTip("This QGIS has no QtWebEngine, the viewer opens in your "
+                                        "default web browser (no installation needed).")
+        else:
+            self.chk_browser.setToolTip("Needs a browser with WebGL 2 (Chrome, Edge, Firefox, Safari).")
+        vf.addRow(self.chk_browser)
+        bview = QPushButton("Open 3D viewer (models created in this session)")
+        bview.clicked.connect(self.open_viewer)
+        vf.addRow(bview)
+        lay.addWidget(vw)
         com = QGroupBox("Common settings")
         cf = QFormLayout(com)
         self.sp_dz = QDoubleSpinBox()
@@ -713,46 +738,68 @@ class BoreholeDialog(QDialog):
         drow.addWidget(bdem)
         fn.addRow("DEM (ground between boreholes)", drow)
         self._refresh_dem()
-        self.chk_fill = QCheckBox("Fill the space between the sections (volume model)")
-        self.chk_fill.setToolTip("Calculates the areas between the 2D sections: every triangle of "
+        self.chk_fill = QCheckBox("Interpolate layers between the sections (volume model)")
+        self.chk_fill.setToolTip("Calculates the layers between the 2D sections: every triangle of \n"
                                  "neighbouring boreholes is interpolated from its three sections.")
         fn.addRow(self.chk_fill)
+        self.cb_fillmode = QComboBox()
+        self.cb_fillmode.addItems(["Smooth layers (sloped solids)", "Blocks (columns of boxes, old method)"])
+        self.cb_fillmode.setToolTip("Smooth layers: layer boundaries are interpolated surfaces, dipping layers stay\n"
+                                    "inclined and layers pinch out smoothly. Blocks: the method of versions up to 0.18.")
+        fn.addRow("Interpolation", self.cb_fillmode)
         self.sp_fillcell = QDoubleSpinBox()
         self.sp_fillcell.setRange(0, 1000)
         self.sp_fillcell.setSpecialValueText("auto")
         self.sp_fillcell.setSuffix(" m")
-        fn.addRow("Cell size of the filled volume", self.sp_fillcell)
+        self.sp_fillcell.setToolTip("Mesh size of the interpolated volume (auto = 1/8 of the median distance of boreholes).")
+        fn.addRow("Mesh size of the interpolated volume", self.sp_fillcell)
         bnet = QPushButton("Create network fence model")
         bnet.clicked.connect(self.build_network)
         fn.addRow(bnet)
         lay.addWidget(gn)
 
-        ga = QGroupBox("B) Grid model - blocks interpolated on a square grid")
+        ga = QGroupBox("B) Full model from boreholes (all boreholes interpolated, no sections needed)")
         fa = QFormLayout(ga)
+        self.cb_gmethod = QComboBox()
+        self.cb_gmethod.addItems(["Smooth layers (sloped solids)", "Blocks (bricks on a square grid)"])
+        self.cb_gmethod.setToolTip("Smooth layers: the layer stack is interpolated at the nodes of a fine mesh and the \n"
+                                   "layers are joined into smooth bodies - layer boundaries are exact surfaces and \n"
+                                   "dipping layers stay inclined. Blocks: the older brick model.")
+        fa.addRow("Method", self.cb_gmethod)
+        self.cb_extent = QComboBox()
+        self.cb_extent.addItems(["Between the boreholes (their hull)", "Rectangle around the boreholes"])
+        self.cb_extent.setToolTip("Hull: only the triangles between neighbouring boreholes (no extrapolation).\n"
+                                  "Rectangle: the model is extended around the boreholes (limited by the\n"
+                                  "maximum distance from a borehole).")
+        fa.addRow("Extent of the smooth model", self.cb_extent)
+        self.cb_gmethod.currentIndexChanged.connect(lambda i: self.cb_extent.setEnabled(i == 0))
         self.sp_cell = QDoubleSpinBox()
         self.sp_cell.setRange(0, 5000)
         self.sp_cell.setSpecialValueText("auto")
         self.sp_cell.setSuffix(" m")
-        fa.addRow("Grid cell size", self.sp_cell)
+        self.sp_cell.setToolTip("Mesh size (smooth layers) or cell size (blocks); auto = 1/25 of the extent.")
+        fa.addRow("Mesh / grid cell size", self.sp_cell)
         self.cb_gmode = QComboBox()
         self.cb_gmode.addItems(["Horizontal layers", "Layers parallel to the ground surface"])
         fa.addRow("Layer geometry (Quaternary always follows the surface)", self.cb_gmode)
         self.sp_k = QSpinBox()
         self.sp_k.setRange(1, 12)
         self.sp_k.setValue(4)
-        fa.addRow("Nearest boreholes used for a cell", self.sp_k)
+        fa.addRow("Nearest boreholes used for a node / cell", self.sp_k)
         self.sp_maxd = QDoubleSpinBox()
         self.sp_maxd.setRange(0, 100000)
         self.sp_maxd.setSpecialValueText("unlimited")
         self.sp_maxd.setSuffix(" m")
+        self.sp_maxd.setToolTip("Hull: triangles with a side longer than twice this distance are left out.\n"
+                                "Rectangle / blocks: nodes or cells farther than this from a borehole are left out.")
         fa.addRow("Max. distance from a borehole", self.sp_maxd)
-        bg = QPushButton("Create grid model")
+        bg = QPushButton("Create full model")
         bg.clicked.connect(self.create_grid)
         fa.addRow(bg)
         lay.addWidget(ga)
 
         lay.addWidget(self._lithology_visibility_box())
-        lay.addWidget(QLabel("Open the result with View > New 3D Map View "
+        lay.addWidget(QLabel("QGIS layers: open them with View > New 3D Map View "
                              "(raise the vertical scale in the 3D view settings)."))
         lay.addStretch()
         return w
@@ -1214,21 +1261,103 @@ class BoreholeDialog(QDialog):
     def create_grid(self):
         if not self._need_data():
             return
+        bhs = self._bh_subset()
+        mode = "depth" if self.cb_gmode.currentIndex() == 1 else "elevation"
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
         try:
-            prisms, info = model3d.grid_model(
-                self._bh_subset(), self.sp_cell.value(), self.sp_dz.value(),
-                "depth" if self.cb_gmode.currentIndex() == 1 else "elevation",
-                self.sp_k.value(), self.sp_maxd.value())
+            if self.cb_gmethod.currentIndex() == 0:
+                solids, info = model3d.smooth_model(
+                    bhs, self.sp_cell.value(), self.sp_dz.value(), mode, self.sp_k.value(),
+                    self.sp_maxd.value(),
+                    "rectangle" if self.cb_extent.currentIndex() == 1 else "hull")
+                name, layer_group = "Full model", "3D full model"
+                what = (f"Full model ({info['bodies']} smooth bodies, mesh {info['cell']:.1f} m)")
+            else:
+                prisms, info = model3d.grid_model(bhs, self.sp_cell.value(), self.sp_dz.value(),
+                                                  mode, self.sp_k.value(), self.sp_maxd.value())
+                solids = model3d.prisms_to_solids(prisms)
+                name, layer_group = "Grid blocks", "3D grid model"
+                what = f"Grid model ({info['cells']} cells of {info['cell']:.1f} m)"
         except Exception as e:
-            QMessageBox.warning(self, "3D grid model", str(e))
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "3D full model", str(e))
             return
-        reg = {}
-        colors = self.current_colors()
-        count, n, err = model3d.build_layers(model3d.prisms_to_solids(prisms), colors, "3D grid model",
-                                             edges=self.chk_edges.isChecked(), registry=reg)
-        self._register_models(reg, colors)
-        self._show_3d_result(count, n, err,
-                             f"Grid model ({info['cells']} cells of {info['cell']:.1f} m)")
+        QApplication.restoreOverrideCursor()
+        # one of the two methods replaces the other result in the viewer
+        for old in ("Full model", "Grid blocks"):
+            if old != name:
+                self.scene3d.pop(old, None)
+        self._finish_model({name: solids}, self.current_colors(), layer_group, solids, None, bhs, what)
+
+    def _textures(self, lithos):
+        """Hatching patterns (tab 2) of the lithologies for the 3D viewer: {litho: (code, PNG, aspect)}."""
+        pats = self.current_patterns()
+        codes = {lit: pats.get(lit, patterns.default_pattern(lit)) for lit in lithos}
+        try:
+            tiles = viewer3d_window.pattern_tiles([c for c in codes.values() if c])
+        except Exception as e:                       # textures are optional
+            core.log_warning(f"3D viewer textures not available: {type(e).__name__}: {e}")
+            return {}
+        return {lit: (c, *tiles[c]) for lit, c in codes.items() if c in tiles}
+
+    def _finish_model(self, groups, colors, layer_group, solids, volume, bhs, what):
+        """Put a new model into QGIS layers and / or the plugin's own 3D viewer."""
+        mode = self.cb_out.currentIndex()
+        if mode in (0, 2):
+            reg = {}
+            count, n, err = model3d.build_layers(solids, colors, layer_group,
+                                                 edges=self.chk_edges.isChecked(),
+                                                 registry=reg, volume=volume)
+            self._register_models(reg, colors)
+            self._show_3d_result(count, n, err, what)
+        if mode in (0, 1):
+            for name, sol in groups.items():
+                if sol:
+                    self.scene3d[name] = sol
+                else:
+                    self.scene3d.pop(name, None)
+            self.scene3d_colors.update(colors)
+            self.scene3d_bhs.update({b.name: b for b in bhs})
+            if mode == 1:
+                self.iface.messageBar().pushMessage("3D", f"{what} - opening the 3D viewer.",
+                                                    level=Qgis.MessageLevel.Success, duration=6)
+            self.open_viewer()
+
+    def open_viewer(self, _checked=False):
+        """Show all models created in this session in the plugin's own WebGL viewer."""
+        if not self.scene3d:
+            QMessageBox.information(self, "3D viewer",
+                                    "Create a fence model or a full model first.")
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            cols = dict(self.scene3d_colors)
+            cols.setdefault("Borehole", core.QColor(20, 20, 20))
+            title = "Boreholes - " + " + ".join(self.scene3d)
+            lithos = {lit for sol in self.scene3d.values() for _faces, lit in sol}
+            scene = viewer3d.build_scene(list(self.scene3d.items()), cols,
+                                         list(self.scene3d_bhs.values()), title,
+                                         edges=self.chk_edges.isChecked(),
+                                         textures=self._textures(lithos))
+            path = viewer3d.write_html(scene)
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            QMessageBox.warning(self, "3D viewer", f"{type(e).__name__}: {e}")
+            return
+        QApplication.restoreOverrideCursor()
+        if self.chk_browser.isChecked() or not viewer3d_window.webengine_available():
+            if not viewer3d_window.open_in_browser(path):
+                QMessageBox.warning(self, "3D viewer", f"The web browser could not be started. "
+                                                       f"Open this file manually:\n{path}")
+            return
+        try:
+            if self._viewer3d is None:
+                self._viewer3d = viewer3d_window.Viewer3DWindow(self)
+                self._viewer3d.webgl_failed.connect(lambda: self.chk_browser.setChecked(True))
+            self._viewer3d.load(path, title)
+        except Exception as e:                       # embedded browser failed: use the system one
+            core.log_warning(f"3D viewer window failed: {type(e).__name__}: {e}")
+            viewer3d_window.open_in_browser(path)
 
     def _refresh_dem(self):
         self.cb_dem.clear()
@@ -1282,19 +1411,16 @@ class BoreholeDialog(QDialog):
             solids, volume = model3d.network_solids(
                 bhs, edges, make_geo, self.sp_pw.value(), self.sp_nslab.value(),
                 self.sp_dz.value(), dem, self.sp_colw.value(), self.chk_fill.isChecked(),
-                self.sp_fillcell.value(), self.sp_maxe.value())
+                self.sp_fillcell.value(), self.sp_maxe.value(), 60000,
+                "blocks" if self.cb_fillmode.currentIndex() == 1 else "smooth")
         except Exception as e:
             QMessageBox.warning(self, "3D fence model", str(e))
             return
         cols = dict(colors)
         cols["Borehole"] = core.QColor(20, 20, 20)
-        reg = {}
-        count, n, err = model3d.build_layers(solids, cols, "3D fence network",
-                                             edges=self.chk_edges.isChecked(), registry=reg,
-                                             volume=volume)
-        self._register_models(reg, cols)
-        self._show_3d_result(count, n, err, f"Fence network ({len(edges)} panels"
-                                            + (", DEM" if dem else "") + ")")
+        self._finish_model({"Fence panels": solids, "Fence volume": volume}, cols,
+                           "3D fence network", solids, volume, bhs,
+                           f"Fence network ({len(edges)} panels" + (", DEM" if dem else "") + ")")
 
     def cleanup(self):
         try:
@@ -1304,6 +1430,10 @@ class BoreholeDialog(QDialog):
         for v in list(self.viewers):
             v.close()
         self.viewers.clear()
+        if self._viewer3d is not None:
+            self._viewer3d.close()
+            self._viewer3d.deleteLater()
+            self._viewer3d = None
         self._drop_line_rb()
         self.canvas.unsetMapTool(self.tool)
         sc = self.canvas.scene()

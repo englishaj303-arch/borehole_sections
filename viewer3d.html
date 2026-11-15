@@ -1,0 +1,805 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Borehole Geology - 3D viewer</title>
+<style>
+:root{--bg:#e9eaee;--fg:#1c1f26;--panel:#f4f4f7;--box:#fbfbfd;--line:#c4c8d0;--accent:#2b6cb0;--sel:#d6e6fa;--lab:#111}
+body.dark{--bg:#1d2026;--fg:#e6e8ee;--panel:#262930;--box:#2d3038;--line:#464b57;--accent:#6aa9ff;--sel:#2c4666;--lab:#f2f2f2}
+body.white{--bg:#ffffff}
+*{box-sizing:border-box}
+html,body{margin:0;height:100%;overflow:hidden;background:var(--panel);color:var(--fg);
+  font:12px/1.35 "Segoe UI",system-ui,-apple-system,Roboto,"Helvetica Neue",Arial,sans-serif}
+#app{display:flex;height:100%;width:100%}
+#stage{position:relative;flex:1;min-width:120px;background:var(--bg);overflow:hidden}
+#gl{position:absolute;inset:0;width:100%;height:100%;display:block;outline:none;touch-action:none}
+#labels{position:absolute;inset:0;pointer-events:none;overflow:hidden}
+.lab{position:absolute;white-space:nowrap;font-size:11px;color:var(--lab);transform:translate(-50%,-100%);
+  text-shadow:0 0 3px var(--bg),0 0 3px var(--bg),0 0 3px var(--bg)}
+.zt{transform:translate(-100%,-50%);font-size:10.5px;opacity:.85;padding-right:4px}
+#gizmo{position:absolute;left:8px;top:8px;width:96px;height:96px;pointer-events:none}
+#status{position:absolute;left:8px;bottom:6px;max-width:calc(100% - 60px);padding:2px 8px;border-radius:5px;
+  background:var(--panel);border:1px solid var(--line);font-size:11.5px;pointer-events:none;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+#status:empty{display:none}
+#ptoggle{position:absolute;right:8px;top:8px;z-index:3}
+#err{position:absolute;inset:0;display:none;align-items:center;justify-content:center;text-align:center;padding:30px;font-size:14px}
+#split{flex:0 0 5px;cursor:col-resize;background:var(--line);opacity:.5}
+#split:hover{opacity:1;background:var(--accent)}
+#side{flex:0 0 340px;width:340px;min-width:240px;max-width:75%;overflow:auto;padding:8px 8px 14px;background:var(--panel)}
+body.noside #side,body.noside #split{display:none}
+#title{font-weight:600;font-size:13px;margin:0 2px 6px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+fieldset{border:1px solid var(--line);border-radius:5px;margin:0 0 8px;padding:4px 8px 8px;background:var(--box)}
+legend{padding:0 4px;font-weight:600;font-size:11.5px}
+button,select,input{font:inherit;color:inherit}
+button{background:var(--panel);border:1px solid var(--line);border-radius:4px;padding:2px 8px;cursor:pointer}
+button:hover{border-color:var(--accent);color:var(--accent)}
+select{background:var(--box);border:1px solid var(--line);border-radius:4px;padding:1px 3px}
+.row{display:flex;align-items:center;gap:6px;margin:4px 0}
+.row label{flex:0 0 92px;opacity:.9}
+.row input[type=range]{flex:1;min-width:0}
+.row .val{flex:0 0 44px;text-align:right;font-variant-numeric:tabular-nums}
+.chk{display:flex;align-items:center;gap:6px;margin:3px 0;cursor:pointer}
+.btns{display:flex;flex-wrap:wrap;gap:4px;margin:5px 0 0}
+#layers{max-height:260px;overflow:auto;border:1px solid var(--line);border-radius:4px;background:var(--box);user-select:none}
+.lit{display:flex;align-items:center;gap:6px;padding:2px 5px;border-bottom:1px solid transparent;cursor:default}
+.lit.sel{background:var(--sel)}
+.lit.off .nm,.lit.off .pc{opacity:.4;text-decoration:line-through}
+.lit input[type=color]{width:18px;height:18px;padding:0;border:1px solid var(--line);background:none;cursor:pointer;flex:0 0 18px}
+.lit .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.lit .pc{flex:0 0 38px;text-align:right;font-size:11px;opacity:.75;font-variant-numeric:tabular-nums}
+.lit .ey{flex:0 0 16px;width:16px;height:16px;margin:0;cursor:pointer}
+.hint{opacity:.7;font-size:11px;margin:4px 0 0}
+.lit img.pt{flex:0 0 26px;width:26px;height:18px;border:1px solid var(--line);background:#fff;object-fit:cover}
+#opinfo{font-size:11.5px;margin:2px 0 4px;min-height:1.4em}
+</style>
+</head>
+<body>
+<div id="app">
+  <div id="stage">
+    <canvas id="gl" tabindex="0"></canvas>
+    <div id="labels"></div>
+    <canvas id="gizmo" width="192" height="192"></canvas>
+    <div id="status"></div>
+    <div id="err"></div>
+    <button id="ptoggle" title="Show / hide the side panel">Panel &#9656;</button>
+  </div>
+  <div id="split" title="Drag to change the width of the panel"></div>
+  <aside id="side">
+    <div id="title">3D model</div>
+
+    <fieldset><legend>View</legend>
+      <div class="btns" style="margin-top:2px">
+        <button data-v="fit">Fit</button><button data-v="iso">3D</button><button data-v="top">Top</button>
+        <button data-v="S">From S</button><button data-v="N">From N</button>
+        <button data-v="E">From E</button><button data-v="W">From W</button>
+      </div>
+      <div class="row"><label for="zs">Vertical scale</label><input id="zs" type="range" min="0.5" max="30" step="0.5"><span class="val" id="zsv"></span></div>
+      <div class="row"><label for="proj">Projection</label>
+        <select id="proj"><option value="p">Perspective</option><option value="o">Orthographic</option></select></div>
+      <div class="row"><label for="bgsel">Background</label>
+        <select id="bgsel"><option value="">Light grey</option><option value="white">White</option><option value="dark">Dark</option></select></div>
+      <label class="chk"><input type="checkbox" id="edges"> Edges</label>
+      <label class="chk" id="texrow" title="Hatching patterns of the lithologies (the patterns chosen in tab 2 of the plugin)"><input type="checkbox" id="tex"> Lithology textures (hatching)</label>
+      <div class="row" id="texsrow"><label for="texs">Texture size</label><input id="texs" type="range" min="20" max="400" step="5" value="100"><span class="val" id="texsv">100%</span></div>
+      <label class="chk"><input type="checkbox" id="grid" checked> Grid, bounding box and elevation scale</label>
+    </fieldset>
+
+    <fieldset><legend>Layers (lithology)</legend>
+      <div id="layers"></div>
+      <div class="hint">Tick = visible. Click a row (or a layer in the model) to select it; Ctrl / Shift for several.</div>
+      <div class="btns">
+        <button id="selall">Select all</button><button id="selnone">Clear selection</button>
+        <button id="hidesel">Hide selected</button><button id="showsel">Show selected</button>
+        <button id="onlysel">Show only selected</button><button id="showall">Show all</button>
+      </div>
+    </fieldset>
+
+    <fieldset><legend>Opacity of layers</legend>
+      <div id="opinfo"></div>
+      <div class="row"><label for="op">Opacity</label><input id="op" type="range" min="0" max="100" step="5" value="100"><span class="val" id="opv">100%</span></div>
+      <div class="btns"><button id="opreset">Selected: opaque</button><button id="opall">All layers: opaque</button></div>
+      <div class="hint">The slider changes the selected layers (all layers when nothing is selected).</div>
+    </fieldset>
+
+    <fieldset id="gfs"><legend>Models</legend><div id="groups"></div></fieldset>
+
+    <fieldset><legend>Section plane (cut)</legend>
+      <div class="row"><label for="cax">Cut along</label>
+        <select id="cax"><option value="-1">Off</option><option value="0">X (east - west)</option>
+        <option value="1">Y (north - south)</option><option value="2">Z (horizontal)</option></select></div>
+      <div class="row"><label for="cpos">Position</label><input id="cpos" type="range" min="0" max="1000" value="500"><span class="val" id="cposv"></span></div>
+      <label class="chk"><input type="checkbox" id="cflip"> Keep the other side</label>
+    </fieldset>
+
+    <fieldset><legend>Boreholes</legend>
+      <div class="row"><label for="bhm">Traces</label>
+        <select id="bhm"><option value="2">On top</option><option value="1">Normal</option><option value="0">Hidden</option></select></div>
+      <label class="chk"><input type="checkbox" id="bhl" checked> Names</label>
+    </fieldset>
+
+    <fieldset><legend>Export</legend>
+      <div class="btns" style="margin-top:2px"><button id="shot">Save PNG</button></div>
+      <div class="hint">Left button: rotate &middot; right button / Shift: pan &middot; wheel: zoom &middot;
+        double-click: centre on the point &middot; F: fit, T: top.</div>
+    </fieldset>
+  </aside>
+</div>
+<script>
+const SCENE = /*SCENE_JSON*/null;
+(function () {
+'use strict';
+const S = SCENE;
+const $ = id => document.getElementById(id);
+const canvas = $('gl');
+function fail(msg) { const e = $('err'); e.style.display = 'flex'; e.textContent = msg; document.body.classList.add('noside'); $('ptoggle').style.display = 'none'; }
+if (!S || !S.meshes || !S.meshes.length) { window.__webgl2_ok = true; fail('No model data.'); return; }
+const gl = canvas.getContext('webgl2', {antialias: true, preserveDrawingBuffer: true, alpha: false});
+if (!gl) {
+  window.__webgl2_ok = false;
+  try { const t = document.createElement('canvas'); window.__webgl_info = 'WebGL 1: ' + (t.getContext('webgl') ? 'available' : 'not available'); } catch (e) { window.__webgl_info = 'WebGL 1: unknown'; }
+  fail('WebGL 2 is not available in this window. Open the viewer in a web browser (Chrome, Edge, Firefox, Safari) instead.');
+  return;
+}
+window.__webgl2_ok = true;
+$('title').textContent = S.title || '3D model';
+document.title = (S.title || '3D model') + ' - Borehole Geology';
+
+// ------------------------------------------------------------------ matrices (column-major)
+function mul(a, b) {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) for (let r = 0; r < 4; r++) {
+    let s = 0; for (let k = 0; k < 4; k++) s += a[k * 4 + r] * b[c * 4 + k]; o[c * 4 + r] = s;
+  }
+  return o;
+}
+function persp(fovy, asp, n, f) {
+  const t = 1 / Math.tan(fovy / 2), m = new Float32Array(16);
+  m[0] = t / asp; m[5] = t; m[10] = (f + n) / (n - f); m[11] = -1; m[14] = 2 * f * n / (n - f); return m;
+}
+function ortho(l, r, b, t, n, f) {
+  const m = new Float32Array(16);
+  m[0] = 2 / (r - l); m[5] = 2 / (t - b); m[10] = -2 / (f - n);
+  m[12] = -(r + l) / (r - l); m[13] = -(t + b) / (t - b); m[14] = -(f + n) / (f - n); m[15] = 1; return m;
+}
+const sub = (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]];
+const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
+const crs = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
+const nrm = a => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
+function lookAt(e, c, u) {
+  const z = nrm(sub(e, c)), x = nrm(crs(u, z)), y = crs(z, x), m = new Float32Array(16);
+  m[0] = x[0]; m[1] = y[0]; m[2] = z[0]; m[4] = x[1]; m[5] = y[1]; m[6] = z[1];
+  m[8] = x[2]; m[9] = y[2]; m[10] = z[2];
+  m[12] = -dot(x, e); m[13] = -dot(y, e); m[14] = -dot(z, e); m[15] = 1; return m;
+}
+function inv(a) {
+  const o = new Float32Array(16);
+  const a00 = a[0], a01 = a[1], a02 = a[2], a03 = a[3], a10 = a[4], a11 = a[5], a12 = a[6], a13 = a[7],
+    a20 = a[8], a21 = a[9], a22 = a[10], a23 = a[11], a30 = a[12], a31 = a[13], a32 = a[14], a33 = a[15];
+  const b00 = a00 * a11 - a01 * a10, b01 = a00 * a12 - a02 * a10, b02 = a00 * a13 - a03 * a10,
+    b03 = a01 * a12 - a02 * a11, b04 = a01 * a13 - a03 * a11, b05 = a02 * a13 - a03 * a12,
+    b06 = a20 * a31 - a21 * a30, b07 = a20 * a32 - a22 * a30, b08 = a20 * a33 - a23 * a30,
+    b09 = a21 * a32 - a22 * a31, b10 = a21 * a33 - a23 * a31, b11 = a22 * a33 - a23 * a32;
+  let det = b00 * b11 - b01 * b10 + b02 * b09 + b03 * b08 - b04 * b07 + b05 * b06;
+  if (!det) return null; det = 1 / det;
+  o[0] = (a11 * b11 - a12 * b10 + a13 * b09) * det; o[1] = (a02 * b10 - a01 * b11 - a03 * b09) * det;
+  o[2] = (a31 * b05 - a32 * b04 + a33 * b03) * det; o[3] = (a22 * b04 - a21 * b05 - a23 * b03) * det;
+  o[4] = (a12 * b08 - a10 * b11 - a13 * b07) * det; o[5] = (a00 * b11 - a02 * b08 + a03 * b07) * det;
+  o[6] = (a32 * b02 - a30 * b05 - a33 * b01) * det; o[7] = (a20 * b05 - a22 * b02 + a23 * b01) * det;
+  o[8] = (a10 * b10 - a11 * b08 + a13 * b06) * det; o[9] = (a01 * b08 - a00 * b10 - a03 * b06) * det;
+  o[10] = (a30 * b04 - a31 * b02 + a33 * b00) * det; o[11] = (a21 * b02 - a20 * b04 - a23 * b00) * det;
+  o[12] = (a11 * b07 - a10 * b09 - a12 * b06) * det; o[13] = (a00 * b09 - a01 * b07 + a02 * b06) * det;
+  o[14] = (a31 * b01 - a30 * b03 - a32 * b00) * det; o[15] = (a20 * b03 - a21 * b01 + a22 * b00) * det;
+  return o;
+}
+window.__test = {mul, inv, lookAt, persp};
+
+// ------------------------------------------------------------------ shaders
+const VS = `#version 300 es
+in vec3 aPos;
+uniform mat4 uV; uniform mat4 uP; uniform float uZs;
+out vec3 vWorld; out vec3 vPosV; out vec3 vWS;
+void main(){
+  vWorld = aPos;
+  vWS = vec3(aPos.xy, aPos.z * uZs);
+  vec4 v = uV * vec4(aPos.x, aPos.y, aPos.z * uZs, 1.0);
+  vPosV = v.xyz;
+  gl_Position = uP * v;
+}`;
+const FS = `#version 300 es
+precision highp float;
+in vec3 vWorld; in vec3 vPosV; in vec3 vWS;
+uniform mediump sampler2DArray uTex; uniform float uTexLayer; uniform float uTexScale; uniform float uTexAsp;
+uniform vec3 uColor; uniform float uAlpha; uniform int uMode; uniform vec2 uId;
+uniform int uClipAxis; uniform float uClipPos; uniform float uClipSign;
+layout(location=0) out vec4 o0;
+layout(location=1) out vec4 o1;
+void main(){
+  if (uClipAxis >= 0) {
+    float c = uClipAxis == 0 ? vWorld.x : (uClipAxis == 1 ? vWorld.y : vWorld.z);
+    if ((c - uClipPos) * uClipSign > 0.0) discard;
+  }
+  if (uMode == 1) {
+    o0 = vec4(uId, 0.0, 1.0);
+    vec3 e = fract(gl_FragCoord.z * vec3(1.0, 255.0, 65025.0));
+    e -= e.yzz * vec3(1.0/255.0, 1.0/255.0, 0.0);
+    o1 = vec4(e, 1.0);
+    return;
+  }
+  if (uMode == 2) { o0 = vec4(uColor, uAlpha); o1 = vec4(0.0); return; }
+  vec3 n = normalize(cross(dFdx(vPosV), dFdy(vPosV)));
+  vec3 L1 = normalize(vec3(-0.35, 0.55, 0.75));
+  vec3 L2 = normalize(vec3(0.6, -0.2, 0.5));
+  float l = 0.38 + 0.50 * max(dot(n, L1), 0.0) + 0.22 * max(dot(n, L2), 0.0) + 0.12 * abs(n.z);
+  vec3 col = uColor;
+  if (uTexLayer >= 0.0) {          // pattern in world coordinates: plan view on tops, along the wall on vertical faces
+    vec3 wn = normalize(cross(dFdx(vWS), dFdy(vWS)));
+    vec2 t = vec2(-wn.y, wn.x);
+    float tl = length(t);
+    t = tl > 1e-4 ? t / tl : vec2(1.0, 0.0);
+    if (t.x < 0.0 || (t.x == 0.0 && t.y < 0.0)) t = -t;
+    vec2 uv = abs(wn.z) > 0.7 ? vWS.xy : vec2(dot(vWS.xy, t), vWS.z);
+    float a = texture(uTex, vec3(uv / (uTexScale * vec2(uTexAsp, 1.0)), uTexLayer)).a;
+    col = mix(col, vec3(0.04), a * 0.9);
+  }
+  o0 = vec4(col * min(l, 1.15), uAlpha);
+  o1 = vec4(0.0);
+}`;
+function compile(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(s));
+  return s;
+}
+let prog;
+try {
+  prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl.VERTEX_SHADER, VS));
+  gl.attachShader(prog, compile(gl.FRAGMENT_SHADER, FS));
+  gl.bindAttribLocation(prog, 0, 'aPos');
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+} catch (e) { fail('Shader error: ' + e.message); return; }
+const U = {};
+['uV', 'uP', 'uZs', 'uColor', 'uAlpha', 'uMode', 'uId', 'uClipAxis', 'uClipPos', 'uClipSign', 'uTex', 'uTexLayer', 'uTexScale', 'uTexAsp']
+  .forEach(n => U[n] = gl.getUniformLocation(prog, n));
+
+// ------------------------------------------------------------------ data
+function b64(s, T) {
+  if (!s) return new T(0);
+  const bin = atob(s), u8 = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i++) u8[i] = bin.charCodeAt(i);
+  return new T(u8.buffer);
+}
+const colors = Object.assign({}, S.colors);
+const lithos = [];
+let bmin = [Infinity, Infinity, Infinity], bmax = [-Infinity, -Infinity, -Infinity];
+const meshes = S.meshes.map((m, i) => {
+  const pos = b64(m.pos, Float32Array);
+  for (let k = 0; k < pos.length; k += 3) for (let a = 0; a < 3; a++) {
+    const v = pos[k + a]; if (v < bmin[a]) bmin[a] = v; if (v > bmax[a]) bmax[a] = v;
+  }
+  const vbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vbo); gl.bufferData(gl.ARRAY_BUFFER, pos, gl.STATIC_DRAW);
+  const mk = idx => {
+    const vao = gl.createVertexArray(); gl.bindVertexArray(vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, vbo); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0);
+    const ib = gl.createBuffer(); gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, ib); gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, idx, gl.STATIC_DRAW);
+    gl.bindVertexArray(null); return vao;
+  };
+  const tri = b64(m.tri, Uint32Array), edg = b64(m.edge, Uint32Array);
+  if (!colors[m.litho]) colors[m.litho] = '#888888';
+  if (lithos.indexOf(m.litho) < 0) lithos.push(m.litho);
+  let cx = 0, cy = 0, cz = 0; const nv = pos.length / 3 || 1;
+  for (let k = 0; k < pos.length; k += 3) { cx += pos[k]; cy += pos[k + 1]; cz += pos[k + 2]; }
+  return {group: m.group, litho: m.litho, vaoT: mk(tri), nT: tri.length, vaoE: edg.length ? mk(edg) : null, nE: edg.length, id: i + 1,
+    c: [cx / nv, cy / nv, cz / nv], tex: -1, asp: 1};
+});
+for (let a = 0; a < 3; a++) if (!isFinite(bmin[a])) { bmin[a] = 0; bmax[a] = 1; }
+const traces = S.boreholes || [];
+for (const t of traces) for (let k = 0; k < t.pts.length; k += 3) for (let a = 0; a < 3; a++) {
+  const v = t.pts[k + a]; if (v < bmin[a]) bmin[a] = v; if (v > bmax[a]) bmax[a] = v;
+}
+const sizeX = bmax[0] - bmin[0], sizeY = bmax[1] - bmin[1], sizeZ = Math.max(bmax[2] - bmin[2], 1e-3);
+const horiz = Math.max(sizeX, sizeY, 1);
+
+// borehole line buffer
+let bhVao = null, bhCount = 0;
+{
+  const a = [];
+  for (const t of traces) for (let k = 0; k + 5 < t.pts.length; k += 3) a.push(...t.pts.slice(k, k + 6));
+  if (a.length) {
+    const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(a), gl.STATIC_DRAW);
+    bhVao = gl.createVertexArray(); gl.bindVertexArray(bhVao);
+    gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0); gl.bindVertexArray(null);
+    bhCount = a.length / 3;
+  }
+}
+// grid / bounding box buffer (rebuilt when the model is shown / hidden is not needed: static)
+function niceStep(range) {
+  const raw = range / 8, p = Math.pow(10, Math.floor(Math.log10(raw))), f = raw / p;
+  return (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * p;
+}
+const gstep = niceStep(horiz);
+const texBase = niceStep(horiz * 1.2);
+let gridVao, gridCount;
+{
+  const pad = horiz * 0.04, x0 = Math.floor((bmin[0] - pad) / gstep) * gstep, x1 = Math.ceil((bmax[0] + pad) / gstep) * gstep;
+  const y0 = Math.floor((bmin[1] - pad) / gstep) * gstep, y1 = Math.ceil((bmax[1] + pad) / gstep) * gstep;
+  const z0 = bmin[2], z1 = bmax[2], a = [];
+  const L = (p, q) => a.push(p[0], p[1], p[2], q[0], q[1], q[2]);
+  for (let x = x0; x <= x1 + 1e-6; x += gstep) L([x, y0, z0], [x, y1, z0]);
+  for (let y = y0; y <= y1 + 1e-6; y += gstep) L([x0, y, z0], [x1, y, z0]);
+  const c = [[x0, y0], [x1, y0], [x1, y1], [x0, y1]];
+  for (let i = 0; i < 4; i++) {
+    const p = c[i], q = c[(i + 1) % 4];
+    L([p[0], p[1], z1], [q[0], q[1], z1]); L([p[0], p[1], z0], [p[0], p[1], z1]);
+  }
+  const vb = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, vb); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(a), gl.STATIC_DRAW);
+  gridVao = gl.createVertexArray(); gl.bindVertexArray(gridVao);
+  gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0); gl.bindVertexArray(null);
+  gridCount = a.length / 3;
+  window.__gridBox = {x0, x1, y0, y1, z0, z1};
+}
+const GB = window.__gridBox;
+
+// ------------------------------------------------------------------ lithology textures
+const texIndex = {};
+let texArr = gl.createTexture();
+(function () {
+  const T = S.tex || [], N = 256;
+  gl.bindTexture(gl.TEXTURE_2D_ARRAY, texArr);
+  gl.texStorage3D(gl.TEXTURE_2D_ARRAY, T.length ? 9 : 1, gl.RGBA8, T.length ? N : 1, T.length ? N : 1, Math.max(T.length, 1));
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.REPEAT);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.REPEAT);
+  const ae = gl.getExtension('EXT_texture_filter_anisotropic');
+  if (ae) gl.texParameterf(gl.TEXTURE_2D_ARRAY, ae.TEXTURE_MAX_ANISOTROPY_EXT, 8);
+  T.forEach((t, i) => {
+    texIndex[t.code] = i;
+    const img = new Image();
+    img.onload = () => {
+      const c = document.createElement('canvas'); c.width = c.height = N;
+      const x = c.getContext('2d'); x.clearRect(0, 0, N, N); x.drawImage(img, 0, 0, N, N);
+      const d = x.getImageData(0, 0, N, N);
+      gl.bindTexture(gl.TEXTURE_2D_ARRAY, texArr);
+      gl.texSubImage3D(gl.TEXTURE_2D_ARRAY, 0, 0, 0, i, N, N, 1, gl.RGBA, gl.UNSIGNED_BYTE, d.data);
+      gl.generateMipmap(gl.TEXTURE_2D_ARRAY); dirty();
+    };
+    img.src = t.png;
+  });
+})();
+function texOf(litho) { const c = (S.litho_tex || {})[litho]; return c !== undefined && texIndex[c] !== undefined ? texIndex[c] : -1; }
+function texAsp(litho) { const c = (S.litho_tex || {})[litho]; const t = (S.tex || []).find(q => q.code === c); return t ? t.asp : 1; }
+
+meshes.forEach(m => { m.tex = texOf(m.litho); m.asp = texAsp(m.litho); });
+// ------------------------------------------------------------------ state
+const st = {
+  zs: 1, edges: !!S.edges_on, grid: true, ortho: false, bg: '', clipAxis: -1, clipFlip: false, clipFrac: 0.5,
+  bhMode: 2, bhNames: true, vis: {}, gvis: {}, op: {}, sel: [], tex: false, texSize: 100
+};
+lithos.forEach(l => { st.vis[l] = true; st.op[l] = 1; });
+(S.groups || []).forEach(g => st.gvis[g] = true);
+{ const r = horiz / sizeZ; st.zs = r <= 3 ? 1 : Math.min(30, Math.max(1, Math.round(r / 3 * 2) / 2)); }
+const cam = {az: -0.6, el: 0.5, dist: 1, target: [0, 0, 0], fov: 45 * Math.PI / 180, ortho: false};
+function radius() { return 0.5 * Math.hypot(sizeX, sizeY, sizeZ * st.zs); }
+function center() { return [(bmin[0] + bmax[0]) / 2, (bmin[1] + bmax[1]) / 2, (bmin[2] + bmax[2]) / 2 * st.zs]; }
+function fit() { cam.target = center(); cam.dist = radius() / Math.sin(cam.fov / 2) * 1.05; dirty(); }
+function setView(az, el) { cam.az = az; cam.el = el; fit(); }
+
+let dirtyFlag = true;
+function dirty() { dirtyFlag = true; }
+
+// ------------------------------------------------------------------ camera matrices
+function eyePos() {
+  const ce = Math.cos(cam.el);
+  return [cam.target[0] + cam.dist * Math.sin(cam.az) * ce, cam.target[1] - cam.dist * Math.cos(cam.az) * ce,
+    cam.target[2] + cam.dist * Math.sin(cam.el)];
+}
+let W = 1, H = 1, V = null, P = null;
+function updateMatrices() {
+  V = lookAt(eyePos(), cam.target, [0, 0, 1]);
+  const R = radius(), asp = W / H;
+  if (cam.ortho) {
+    const hh = cam.dist * Math.tan(cam.fov / 2), hw = hh * asp;
+    P = ortho(-hw, hw, -hh, hh, cam.dist - 3 * R - 1, cam.dist + 3 * R + 1);
+  } else {
+    P = persp(cam.fov, asp, Math.max(cam.dist * 0.01, R * 0.002), cam.dist + 3 * R);
+  }
+}
+function hex(c) { const n = parseInt(c.slice(1), 16); return [(n >> 16 & 255) / 255, (n >> 8 & 255) / 255, (n & 255) / 255]; }
+function clipUniforms() {
+  const ax = st.clipAxis;
+  gl.uniform1i(U.uClipAxis, ax);
+  if (ax >= 0) {
+    const lo = bmin[ax], hi = bmax[ax];
+    gl.uniform1f(U.uClipPos, lo + (hi - lo) * st.clipFrac);
+    gl.uniform1f(U.uClipSign, st.clipFlip ? -1 : 1);
+  }
+}
+function visible(m) { return st.vis[m.litho] && st.gvis[m.group] !== false && st.op[m.litho] > 0.001; }
+
+// ------------------------------------------------------------------ picking target
+let fbo = null, fbTex0 = null, fbTex1 = null, fbDepth = null, fbW = 0, fbH = 0;
+function ensureFbo() {
+  if (fbo && fbW === canvas.width && fbH === canvas.height) return;
+  if (fbo) { gl.deleteFramebuffer(fbo); gl.deleteTexture(fbTex0); gl.deleteTexture(fbTex1); gl.deleteRenderbuffer(fbDepth); }
+  fbW = canvas.width; fbH = canvas.height;
+  const tex = () => { const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA8, fbW, fbH, 0, gl.RGBA, gl.UNSIGNED_BYTE, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST); return t; };
+  fbTex0 = tex(); fbTex1 = tex();
+  fbDepth = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, fbDepth);
+  gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, fbW, fbH);
+  fbo = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, fbTex0, 0);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, fbTex1, 0);
+  gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, fbDepth);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+}
+
+// ------------------------------------------------------------------ drawing
+function bgColor() { return st.bg === 'dark' ? [0.114, 0.125, 0.149] : st.bg === 'white' ? [1, 1, 1] : [0.914, 0.918, 0.933]; }
+function setCommon() {
+  gl.useProgram(prog);
+  gl.uniformMatrix4fv(U.uV, false, V); gl.uniformMatrix4fv(U.uP, false, P); gl.uniform1f(U.uZs, st.zs);
+  gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, texArr);
+  gl.uniform1i(U.uTex, 0); gl.uniform1f(U.uTexScale, texBase * st.texSize / 100);
+}
+function drawMeshes(mode) {
+  const list = meshes.filter(visible);
+  gl.uniform1i(U.uMode, mode); clipUniforms();
+  const one = m => {
+    gl.uniform3fv(U.uColor, hex(colors[m.litho]));
+    gl.uniform1f(U.uTexLayer, st.tex ? m.tex : -1); gl.uniform1f(U.uTexAsp, m.asp);
+    gl.uniform2f(U.uId, (m.id & 255) / 255, (m.id >> 8) / 255);
+    gl.bindVertexArray(m.vaoT); gl.drawElements(gl.TRIANGLES, m.nT, gl.UNSIGNED_INT, 0);
+  };
+  gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(1, 1);
+  if (mode === 1) { gl.uniform1f(U.uAlpha, 1); list.forEach(one); gl.disable(gl.POLYGON_OFFSET_FILL); return; }
+  const opaque = list.filter(m => st.op[m.litho] >= 0.999);
+  const clear = list.filter(m => st.op[m.litho] < 0.999 && st.op[m.litho] > 0.001);
+  gl.uniform1f(U.uAlpha, 1); opaque.forEach(one);
+  if (clear.length) {
+    const e = eyePos(), zs = st.zs;
+    const dist = m => Math.hypot(m.c[0] - e[0], m.c[1] - e[1], m.c[2] * zs - e[2]);
+    clear.sort((a, b) => dist(b) - dist(a));
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
+    for (const m of clear) { gl.uniform1f(U.uAlpha, st.op[m.litho]); one(m); }
+    gl.depthMask(true); gl.disable(gl.BLEND);
+  }
+  gl.disable(gl.POLYGON_OFFSET_FILL);
+  if (st.edges) {
+    gl.uniform1i(U.uMode, 2);
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    for (const m of list) if (m.vaoE && st.op[m.litho] > 0.001) {
+      const c = hex(colors[m.litho]); gl.uniform3f(U.uColor, c[0] * 0.45, c[1] * 0.45, c[2] * 0.45);
+      gl.uniform1f(U.uAlpha, Math.max(st.op[m.litho], 0.25));
+      gl.bindVertexArray(m.vaoE); gl.drawElements(gl.LINES, m.nE, gl.UNSIGNED_INT, 0);
+    }
+    gl.disable(gl.BLEND);
+  }
+}
+function drawLines() {
+  gl.uniform1i(U.uMode, 2); gl.uniform1i(U.uClipAxis, -1); gl.uniform1f(U.uAlpha, 1);
+  const dark = st.bg === 'dark';
+  if (st.grid) {
+    const c = dark ? 0.45 : 0.62; gl.uniform3f(U.uColor, c, c, c + 0.02);
+    gl.bindVertexArray(gridVao); gl.drawArrays(gl.LINES, 0, gridCount);
+  }
+  if (bhVao && st.bhMode > 0) {
+    if (st.bhMode === 2) gl.disable(gl.DEPTH_TEST);
+    gl.uniform3f(U.uColor, dark ? 1 : 0.05, dark ? 1 : 0.05, dark ? 1 : 0.05);
+    clipUniforms();
+    gl.bindVertexArray(bhVao); gl.drawArrays(gl.LINES, 0, bhCount);
+    if (st.bhMode === 2) gl.enable(gl.DEPTH_TEST);
+  }
+}
+function render() {
+  updateMatrices();
+  const b = bgColor();
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.disable(gl.SCISSOR_TEST);
+  gl.clearColor(b[0], b[1], b[2], 1); gl.clearDepth(1);
+  gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  setCommon();
+  drawMeshes(0);
+  drawLines();
+  gl.bindVertexArray(null);
+  overlay();
+}
+
+// ------------------------------------------------------------------ overlay (labels, gizmo)
+const labelsDiv = $('labels');
+const bhLabels = traces.map(t => { const d = document.createElement('div'); d.className = 'lab'; d.textContent = t.name; labelsDiv.appendChild(d); return d; });
+const ztick = []; for (let i = 0; i < 14; i++) { const d = document.createElement('div'); d.className = 'lab zt'; labelsDiv.appendChild(d); ztick.push(d); }
+function project(p) {
+  const x = p[0], y = p[1], z = p[2] * st.zs;
+  const vx = V[0] * x + V[4] * y + V[8] * z + V[12], vy = V[1] * x + V[5] * y + V[9] * z + V[13],
+    vz = V[2] * x + V[6] * y + V[10] * z + V[14], vw = V[3] * x + V[7] * y + V[11] * z + V[15];
+  const cx = P[0] * vx + P[4] * vy + P[8] * vz + P[12] * vw, cy = P[1] * vx + P[5] * vy + P[9] * vz + P[13] * vw,
+    cw = P[3] * vx + P[7] * vy + P[11] * vz + P[15] * vw, cz = P[2] * vx + P[6] * vy + P[10] * vz + P[14] * vw;
+  if (cw <= 1e-6) return null;
+  return [(cx / cw * 0.5 + 0.5) * W, (1 - (cy / cw * 0.5 + 0.5)) * H, cz / cw];
+}
+function overlay() {
+  const showNames = st.bhNames && st.bhMode > 0;
+  traces.forEach((t, i) => {
+    const el = bhLabels[i];
+    if (!showNames) { el.style.display = 'none'; return; }
+    if (st.clipAxis >= 0) {
+      const c = t.pts[st.clipAxis], lim = bmin[st.clipAxis] + (bmax[st.clipAxis] - bmin[st.clipAxis]) * st.clipFrac;
+      if ((c - lim) * (st.clipFlip ? -1 : 1) > 0) { el.style.display = 'none'; return; }
+    }
+    const p = project([t.pts[0], t.pts[1], t.pts[2]]);
+    if (!p || p[0] < -40 || p[0] > W + 40 || p[1] < -20 || p[1] > H + 20) { el.style.display = 'none'; return; }
+    el.style.display = 'block'; el.style.left = p[0] + 'px'; el.style.top = (p[1] - 3) + 'px';
+  });
+  // elevation scale on the bottom-grid corner that is leftmost on the screen
+  if (st.grid) {
+    let best = null;
+    for (const c of [[GB.x0, GB.y0], [GB.x1, GB.y0], [GB.x1, GB.y1], [GB.x0, GB.y1]]) {
+      const p = project([c[0], c[1], GB.z0]); if (p && (!best || p[0] < best.p[0])) best = {c, p};
+    }
+    const zs = niceStep(sizeZ * 1.2), z0 = Math.ceil(bmin[2] / zs) * zs;
+    let n = 0;
+    const pa = best && project([best.c[0], best.c[1], bmin[2]]), pb = best && project([best.c[0], best.c[1], bmax[2]]);
+    if (best && pa && pb && Math.abs(pa[1] - pb[1]) > 60) for (let z = z0; z <= bmax[2] + 1e-6 && n < ztick.length; z += zs, n++) {
+      const p = project([best.c[0], best.c[1], z]), el = ztick[n];
+      if (!p) { el.style.display = 'none'; continue; }
+      el.style.display = 'block'; el.style.left = p[0] + 'px'; el.style.top = p[1] + 'px';
+      el.textContent = (Math.round(z * 100) / 100) + ' m';
+    }
+    for (; n < ztick.length; n++) ztick[n].style.display = 'none';
+  } else ztick.forEach(e => e.style.display = 'none');
+  gizmo();
+}
+function gizmo() {
+  const g = $('gizmo'), c = g.getContext('2d'), w = g.width, cx = w / 2, cy = w / 2, L = w * 0.34;
+  c.clearRect(0, 0, w, w);
+  const fg = getComputedStyle(document.body).color;
+  const axes = [{v: [0, 1, 0], t: 'N', col: '#d33'}, {v: [1, 0, 0], t: 'E', col: '#2a8'}, {v: [0, 0, 1], t: 'Z', col: '#37c'}];
+  const pr = axes.map(a => ({t: a.t, col: a.col, x: V[0] * a.v[0] + V[4] * a.v[1] + V[8] * a.v[2], y: V[1] * a.v[0] + V[5] * a.v[1] + V[9] * a.v[2], z: V[2] * a.v[0] + V[6] * a.v[1] + V[10] * a.v[2]}));
+  pr.sort((a, b) => a.z - b.z);
+  c.lineWidth = 3; c.font = 'bold 22px sans-serif'; c.textAlign = 'center'; c.textBaseline = 'middle';
+  for (const a of pr) {
+    const x = cx + a.x * L, y = cy - a.y * L;
+    c.strokeStyle = a.col; c.beginPath(); c.moveTo(cx, cy); c.lineTo(x, y); c.stroke();
+    c.fillStyle = a.col; c.fillText(a.t, cx + a.x * (L + 16), cy - a.y * (L + 16));
+  }
+  c.fillStyle = fg; c.beginPath(); c.arc(cx, cy, 3, 0, 7); c.fill();
+}
+
+// ------------------------------------------------------------------ picking
+function pick(px, py) {
+  // px, py in canvas (device) pixels, origin top-left; returns {m, p:[x,y,z]} or null
+  ensureFbo(); updateMatrices();
+  const x = Math.floor(px), y = canvas.height - 1 - Math.floor(py);
+  if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) return null;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]);
+  gl.viewport(0, 0, canvas.width, canvas.height);
+  gl.enable(gl.SCISSOR_TEST); gl.scissor(x, y, 1, 1);
+  gl.clearColor(0, 0, 0, 0); gl.clearDepth(1); gl.enable(gl.DEPTH_TEST); gl.depthFunc(gl.LEQUAL);
+  gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  setCommon(); drawMeshes(1);
+  const a = new Uint8Array(4), d = new Uint8Array(4);
+  gl.readBuffer(gl.COLOR_ATTACHMENT0); gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, a);
+  gl.readBuffer(gl.COLOR_ATTACHMENT1); gl.readPixels(x, y, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, d);
+  gl.disable(gl.SCISSOR_TEST); gl.bindVertexArray(null);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.NONE]);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+  gl.drawBuffers([gl.BACK]);
+  const id = a[0] | (a[1] << 8);
+  if (!id || a[3] === 0) return null;
+  const depth = d[0] / 255 + d[1] / 255 / 255 + d[2] / 255 / 65025;
+  const ip = inv(mul(P, V)); if (!ip) return null;
+  const nx = (px / canvas.width) * 2 - 1, ny = 1 - (py / canvas.height) * 2, nz = depth * 2 - 1;
+  const q = [ip[0] * nx + ip[4] * ny + ip[8] * nz + ip[12], ip[1] * nx + ip[5] * ny + ip[9] * nz + ip[13],
+    ip[2] * nx + ip[6] * ny + ip[10] * nz + ip[14], ip[3] * nx + ip[7] * ny + ip[11] * nz + ip[15]];
+  return {m: meshes[id - 1], p: [q[0] / q[3], q[1] / q[3], q[2] / q[3] / st.zs]};
+}
+window.__pick = pick;
+const statusEl = $('status');
+function fmt(v, d) { return v.toFixed(d).replace(/\B(?=(\d{3})+(?!\d))/g, ' '); }
+function describe(r) {
+  if (!r) return '';
+  const E = r.p[0] + S.origin[0], N = r.p[1] + S.origin[1];
+  return r.m.litho + '  \u2022  ' + r.m.group + '  \u2022  X ' + fmt(E, 1) + '  Y ' + fmt(N, 1) + '  \u2022  elevation ' + fmt(r.p[2], 2) + ' m';
+}
+
+// ------------------------------------------------------------------ input
+let drag = null, hoverT = 0, hoverPending = null;
+const dpr = () => window.devicePixelRatio || 1;
+canvas.addEventListener('contextmenu', e => e.preventDefault());
+canvas.addEventListener('pointerdown', e => {
+  canvas.focus(); canvas.setPointerCapture(e.pointerId);
+  drag = {x: e.clientX, y: e.clientY, pan: e.button === 2 || e.button === 1 || e.shiftKey || e.ctrlKey, moved: 0};
+});
+canvas.addEventListener('pointerup', e => {
+  const d = drag; drag = null; try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+  if (d && !d.pan && d.moved < 4) {                // a click (no drag) selects the layer under the cursor
+    const r = canvas.getBoundingClientRect(), k = dpr();
+    const hit = pick((e.clientX - r.left) * k, (e.clientY - r.top) * k);
+    if (hit) selectLayer(hit.m.litho, e.ctrlKey || e.metaKey); else if (!(e.ctrlKey || e.metaKey)) setSel([]);
+  }
+});
+canvas.addEventListener('pointermove', e => {
+  if (drag) {
+    const dx = e.clientX - drag.x, dy = e.clientY - drag.y; drag.x = e.clientX; drag.y = e.clientY; drag.moved += Math.abs(dx) + Math.abs(dy);
+    if (drag.pan) {
+      const f = (cam.ortho ? 2 : 2) * cam.dist * Math.tan(cam.fov / 2) / H;
+      const ex = eyePos(), fw = nrm(sub(cam.target, ex)), r = nrm(crs(fw, [0, 0, 1])), u = crs(r, fw);
+      for (let a = 0; a < 3; a++) cam.target[a] += -r[a] * dx * f + u[a] * dy * f;
+    } else {
+      cam.az -= dx * 0.006;
+      cam.el = Math.max(-1.55, Math.min(1.55, cam.el + dy * 0.006));
+    }
+    dirty(); return;
+  }
+  hoverPending = [e.clientX, e.clientY];
+});
+canvas.addEventListener('pointerleave', () => { hoverPending = null; statusEl.textContent = ''; });
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const k = Math.exp((e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY) * 0.0012);
+  cam.dist = Math.max(radius() * 0.02, Math.min(radius() * 60, cam.dist * k)); dirty();
+}, {passive: false});
+canvas.addEventListener('dblclick', e => {
+  const r = canvas.getBoundingClientRect(), k = dpr();
+  const hit = pick((e.clientX - r.left) * k, (e.clientY - r.top) * k);
+  if (hit) { cam.target = [hit.p[0], hit.p[1], hit.p[2] * st.zs]; dirty(); }
+});
+canvas.addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === 'f') fit(); else if (k === 't') setView(0, 1.5);
+});
+setInterval(() => {
+  if (!hoverPending || drag) return;
+  const r = canvas.getBoundingClientRect(), k = dpr();
+  const hit = pick((hoverPending[0] - r.left) * k, (hoverPending[1] - r.top) * k);
+  hoverPending = null; statusEl.textContent = describe(hit);
+}, 90);
+
+// ------------------------------------------------------------------ panel
+const body = document.body;
+$('ptoggle').onclick = () => { body.classList.toggle('noside'); $('ptoggle').innerHTML = body.classList.contains('noside') ? '&#9666; Panel' : 'Panel &#9656;'; dirty(); };
+(function () {                                           // drag the splitter to resize the panel
+  const split = $('split'), side = $('side'); let sx = null, sw = 0;
+  split.addEventListener('pointerdown', e => { sx = e.clientX; sw = side.offsetWidth; split.setPointerCapture(e.pointerId); });
+  split.addEventListener('pointermove', e => { if (sx !== null) { side.style.flexBasis = side.style.width = Math.max(240, sw + sx - e.clientX) + 'px'; dirty(); } });
+  split.addEventListener('pointerup', () => { sx = null; });
+})();
+// camera azimuth: eye = target + d*(sin az, -cos az): S -> az 0, E -> +90 deg, N -> 180, W -> -90
+const VIEWS = {iso: [-0.6, 0.5], top: [0, 1.5], S: [0, 0.12], E: [1.5708, 0.12], N: [3.1416, 0.12], W: [-1.5708, 0.12]};
+document.querySelectorAll('[data-v]').forEach(b => b.onclick = () => {
+  const v = b.dataset.v;
+  if (v === 'fit') fit(); else setView(VIEWS[v][0], VIEWS[v][1]);
+});
+const zsEl = $('zs');
+zsEl.value = st.zs; $('zsv').textContent = st.zs + '\u00d7';
+zsEl.oninput = () => {
+  const n = parseFloat(zsEl.value), o = st.zs;
+  cam.target[2] *= n / o; st.zs = n; $('zsv').textContent = n + '\u00d7'; dirty();
+};
+$('proj').onchange = e => { cam.ortho = e.target.value === 'o'; dirty(); };
+$('bgsel').onchange = e => { st.bg = e.target.value; document.body.className = st.bg + (body.classList.contains('noside') ? ' noside' : ''); dirty(); };
+$('edges').checked = st.edges; if (!S.edges) { $('edges').disabled = true; $('edges').parentNode.title = 'Edges were not exported (very large model).'; }
+$('edges').onchange = e => { st.edges = e.target.checked; dirty(); };
+$('grid').onchange = e => { st.grid = e.target.checked; dirty(); };
+if (!(S.tex || []).length) { $('texrow').style.display = 'none'; $('texsrow').style.display = 'none'; }
+$('tex').onchange = e => { st.tex = e.target.checked; dirty(); };
+$('texs').oninput = e => { st.texSize = parseInt(e.target.value); $('texsv').textContent = st.texSize + '%'; dirty(); };
+function clipLabel() {
+  const ax = st.clipAxis; if (ax < 0) { $('cposv').textContent = ''; return; }
+  const v = bmin[ax] + (bmax[ax] - bmin[ax]) * st.clipFrac;
+  $('cposv').textContent = ax === 2 ? v.toFixed(1) : Math.round(v + S.origin[ax]);
+}
+$('cax').onchange = e => { st.clipAxis = parseInt(e.target.value); clipLabel(); dirty(); };
+$('cpos').oninput = e => { st.clipFrac = parseInt(e.target.value) / 1000; clipLabel(); dirty(); };
+$('cflip').onchange = e => { st.clipFlip = e.target.checked; dirty(); };
+$('bhm').onchange = e => { st.bhMode = parseInt(e.target.value); dirty(); };
+$('bhl').onchange = e => { st.bhNames = e.target.checked; dirty(); };
+if (!traces.length) { $('bhm').disabled = true; $('bhl').disabled = true; }
+
+// models (groups)
+const gbox = $('groups');
+if ((S.groups || []).length <= 1) $('gfs').style.display = 'none';
+(S.groups || []).forEach(g => {
+  const l = document.createElement('label'); l.className = 'chk';
+  const c = document.createElement('input'); c.type = 'checkbox'; c.checked = true;
+  c.onchange = () => { st.gvis[g] = c.checked; dirty(); };
+  l.appendChild(c); l.appendChild(document.createTextNode(' ' + g)); gbox.appendChild(l);
+});
+
+// layers: visibility, colour, selection, opacity
+const order = lithos.slice().sort((a, b) => a.localeCompare(b));
+const rows = {}, eyes = {};
+const layersDiv = $('layers');
+let lastClicked = null;
+order.forEach(l => {
+  const row = document.createElement('div'); row.className = 'lit';
+  const ey = document.createElement('input'); ey.type = 'checkbox'; ey.checked = true; ey.className = 'ey'; ey.title = 'Show / hide this lithology';
+  ey.onclick = e => e.stopPropagation();
+  ey.onchange = () => { st.vis[l] = ey.checked; syncRows(); dirty(); };
+  const col = document.createElement('input'); col.type = 'color'; col.value = colors[l].slice(0, 7); col.title = 'Colour';
+  col.onclick = e => e.stopPropagation();
+  col.oninput = () => { colors[l] = col.value; dirty(); };
+  const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = l; nm.title = l;
+  const pc = document.createElement('span'); pc.className = 'pc';
+  const tc = (S.litho_tex || {})[l], tt = (S.tex || []).find(q => q.code === tc);
+  if (tt) { const im = document.createElement('img'); im.className = 'pt'; im.src = tt.png; im.title = 'Pattern ' + tt.code; row.append(ey, col, im, nm, pc); }
+  else row.append(ey, col, nm, pc);
+  row.onclick = e => {
+    if (e.shiftKey && lastClicked !== null) {
+      const a = order.indexOf(lastClicked), b = order.indexOf(l), lo = Math.min(a, b), hi = Math.max(a, b);
+      setSel(order.slice(lo, hi + 1));
+    } else selectLayer(l, e.ctrlKey || e.metaKey);
+    lastClicked = l;
+  };
+  row.ondblclick = () => { showOnly([l]); };
+  layersDiv.appendChild(row); rows[l] = {row, pc}; eyes[l] = ey;
+});
+function syncRows() {
+  order.forEach(l => {
+    const r = rows[l]; r.row.classList.toggle('sel', st.sel.indexOf(l) >= 0);
+    r.row.classList.toggle('off', !st.vis[l]); eyes[l].checked = !!st.vis[l];
+    r.pc.textContent = Math.round(st.op[l] * 100) + '%';
+  });
+  const t = st.sel.length ? st.sel : null;
+  $('opinfo').textContent = t ? ('Selected: ' + (t.length > 3 ? t.length + ' layers' : t.join(', '))) : 'Nothing selected - the slider changes all layers';
+  const ref = t ? st.op[t[0]] : (order.length ? st.op[order[0]] : 1);
+  $('op').value = Math.round(ref * 100); $('opv').textContent = Math.round(ref * 100) + '%';
+}
+function setSel(list) { st.sel = list.slice(); syncRows(); }
+function selectLayer(l, add) {
+  if (add) { const i = st.sel.indexOf(l); if (i >= 0) st.sel.splice(i, 1); else st.sel.push(l); setSel(st.sel); }
+  else setSel([l]);
+  lastClicked = l;
+  const r = rows[l]; if (r) r.row.scrollIntoView({block: 'nearest'});
+}
+function target() { return st.sel.length ? st.sel : order; }
+function showOnly(list) { order.forEach(l => st.vis[l] = list.indexOf(l) >= 0); syncRows(); dirty(); }
+$('selall').onclick = () => setSel(order);
+$('selnone').onclick = () => setSel([]);
+$('hidesel').onclick = () => { st.sel.forEach(l => st.vis[l] = false); syncRows(); dirty(); };
+$('showsel').onclick = () => { st.sel.forEach(l => st.vis[l] = true); syncRows(); dirty(); };
+$('onlysel').onclick = () => { if (st.sel.length) showOnly(st.sel); };
+$('showall').onclick = () => { order.forEach(l => st.vis[l] = true); syncRows(); dirty(); };
+$('op').oninput = e => {
+  const v = parseInt(e.target.value) / 100; target().forEach(l => st.op[l] = v);
+  $('opv').textContent = Math.round(v * 100) + '%';
+  order.forEach(l => rows[l].pc.textContent = Math.round(st.op[l] * 100) + '%'); dirty();
+};
+$('opreset').onclick = () => { target().forEach(l => st.op[l] = 1); syncRows(); dirty(); };
+$('opall').onclick = () => { order.forEach(l => st.op[l] = 1); syncRows(); dirty(); };
+syncRows();
+window.__ui = {selectLayer, setSel, showOnly};
+
+$('shot').onclick = () => {
+  render();
+  canvas.toBlob(b => {
+    const a = document.createElement('a'); a.href = URL.createObjectURL(b);
+    a.download = ((S.title || 'model3d').replace(/[^\w\-]+/g, '_')) + '.png';
+    document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+  }, 'image/png');
+};
+
+// ------------------------------------------------------------------ main loop
+function resize() {
+  const k = dpr(), w = Math.max(1, Math.floor(canvas.clientWidth * k)), h = Math.max(1, Math.floor(canvas.clientHeight * k));
+  if (canvas.width !== w || canvas.height !== h) { canvas.width = w; canvas.height = h; dirty(); }
+  W = canvas.clientWidth || 1; H = canvas.clientHeight || 1;
+}
+window.addEventListener('resize', dirty);
+if (window.ResizeObserver) new ResizeObserver(dirty).observe($('stage'));
+function loop() { resize(); if (dirtyFlag) { dirtyFlag = false; render(); } requestAnimationFrame(loop); }
+fit(); clipLabel();
+window.__state = {st, cam, meshes, bmin, bmax};
+loop();
+})();
+</script>
+</body>
+</html>
