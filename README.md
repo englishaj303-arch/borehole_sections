@@ -37,10 +37,10 @@ Requires QGIS 4.0 or newer (Qt6). Open **Plugins \> Borehole Geology \> Borehole
 - *Fence model*: closed 3D solids built from the 2D sections between neighbouring boreholes (grid of nearest neighbours or Delaunay triangulation), so inclined boundaries, pinch-outs and the terrain of an optional DEM are smooth. Borehole columns follow inclined boreholes. *Interpolate layers between the sections* also calculates the layers between the panels: every triangle of boreholes is interpolated from its three sections into smooth closed solids with sloped tops and bottoms (dipping layers stay inclined, layers pinch out smoothly, no blocks). *Interpolation > Blocks* keeps the old column-of-boxes method; *Mesh size* sets the fineness.
 - *Full model from boreholes* (group B): a complete 3D volume made directly from the boreholes, no sections needed. *Smooth layers* (default): the layer stack is interpolated at the nodes of a fine triangular mesh from the nearest boreholes (weights fall to zero smoothly, so layers do not jump) and joined layer by layer into closed bodies with sloped tops and bottoms; layer boundaries are exact surfaces (not multiples of the vertical step), dipping layers stay inclined and lenses pinch out. *Extent*: the hull of the boreholes (only triangles between neighbouring boreholes) or a rectangle around them (limited by *Max. distance from a borehole*). *Layer geometry* chooses horizontal layers or layers parallel to the ground; the Quaternary cover always follows the ground and its base is exact. *Blocks* keeps the older brick model (square grid).
 - A list with tick boxes shows or hides single lithologies of the created models; *Show block edges* draws thin outlines (off by default).
-- *Show the created model in*: the plugin's own 3D viewer, the QGIS 3D layers, or both. For the QGIS layers open **View \> New 3D Map View** and raise the vertical scale.
+- *Open the created model in*: choose the viewer BEFORE creating the model - the plugin's own 3D viewer (opens in the web browser) or the QGIS 3D layers (opens in the native QGIS 3D Map View; raise the vertical scale there). The model is created for the chosen viewer only and opens automatically; *Reopen 3D viewer* opens the models of this session again.
 
 #### Own 3D viewer
-A viewer built into the plugin (WebGL 2, own code, no libraries to install). Fence and full models are shown together; **Open 3D viewer** reopens the models created in the current session.
+A viewer built into the plugin (WebGL 2, own code, no libraries to install). Fence and full models are shown together; **Reopen 3D viewer** reopens the models created in the current session.
 - Rotate (left button), pan (right button or Shift), zoom (wheel), double-click centres the view on the clicked point; buttons for top / side views; perspective or orthographic projection.
 - Docked side panel (like in the 2D section windows; the splitter changes its width, *Panel* hides it): vertical scale (set automatically for flat models), edges, light / white / dark background, grid with an elevation scale and a N-E-Z gizmo.
 - *Section plane*: cut the model along X, Y or Z with a slider to look inside.
@@ -48,9 +48,9 @@ A viewer built into the plugin (WebGL 2, own code, no libraries to install). Fen
 - *Opacity of layers*: a slider sets the opacity of the selected layers (all layers when none is selected); every layer shows its own opacity. Tick boxes also show or hide the fence panels, the interpolated volume, the full model and the grid blocks.
 - *Lithology textures (hatching)*: draws the FGDC hatching patterns on the surfaces (the patterns chosen for the lithologies in tab 2; lithologies without a pattern stay plain). The patterns follow the model in world coordinates - in plan on horizontal faces, along the wall on vertical faces - and *Texture size* scales them. The layer list shows a small thumbnail of the pattern.
 - Borehole traces (also inclined) with names; hovering shows the lithology, S-JTSK coordinates and elevation under the cursor.
-- *Save PNG* and, in the window of QGIS, *Save as HTML...* (one file with the whole model that opens in any browser and can be sent to colleagues).
+- *Save PNG* and *Save as HTML...* (one file with the whole model that opens in any browser and can be sent to colleagues).
 
-Requirements: nothing has to be installed. The viewer opens in an embedded window when QGIS has QtWebEngine (Python module `qgis.PyQt.QtWebEngineWidgets`); otherwise, or when *Open the viewer in the web browser* is ticked, it opens in the default browser (Chrome, Edge, Firefox or Safari with WebGL 2). Models with up to about 100 000 blocks stay smooth on an ordinary graphics card.
+Requirements: nothing has to be installed. The viewer opens in the default web browser (Chrome, Edge, Firefox or Safari with WebGL 2). Models with up to about 100 000 blocks stay smooth on an ordinary graphics card.
 
 ## License
 

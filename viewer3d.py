@@ -10,6 +10,7 @@ import base64
 import json
 import math
 import os
+import re
 import stat
 import tempfile
 import time
@@ -46,8 +47,10 @@ def _ear_clip(P, eps=1e-9):
         a, c = prev[i], nxt[i]
         nxt[a], prev[c] = c, a
         reflex.discard(i)
-        for k in (a, c):
-            if k in reflex and cross(k) > eps:
+        for k in (a, c):                       # the neighbours change their angle: classify again
+            if cross(k) < -eps:
+                reflex.add(k)
+            else:
                 reflex.discard(k)
         return c
 
@@ -70,6 +73,8 @@ def _ear_clip(P, eps=1e-9):
                 p = P[j]
                 if p[0] < lox or p[0] > hix or p[1] < loy or p[1] > hiy:
                     continue
+                if any(abs(p[0] - q[0]) <= eps and abs(p[1] - q[1]) <= eps for q in (A, B, C)):
+                    continue                    # a duplicate of the ear's own vertex (hole bridge)
                 d1 = (B[0] - A[0]) * (p[1] - A[1]) - (B[1] - A[1]) * (p[0] - A[0])
                 d2 = (C[0] - B[0]) * (p[1] - B[1]) - (C[1] - B[1]) * (p[0] - B[0])
                 d3 = (A[0] - C[0]) * (p[1] - C[1]) - (A[1] - C[1]) * (p[0] - C[0])
@@ -101,6 +106,29 @@ def _ear_clip(P, eps=1e-9):
     return tris
 
 
+def _newell(pts):
+    """Newell normal (not normalised) of a planar polygon given as a list of (x, y, z)."""
+    nx = ny = nz = 0.0
+    n = len(pts)
+    for k in range(n):
+        x1, y1, z1 = pts[k]
+        x2, y2, z2 = pts[(k + 1) % n]
+        nx += (y1 - y2) * (z1 + z2)
+        ny += (z1 - z2) * (x1 + x2)
+        nz += (x1 - x2) * (y1 + y2)
+    return nx, ny, nz
+
+
+def _tri_ok(p, t, nrm):
+    """True when the triangle t of the polygon p has the same orientation as the polygon
+    (a triangle on the other side - or a zero one - means a diagonal outside a concave quad)."""
+    a, b, c = (p[k] for k in t)
+    ux, uy, uz = b[0] - a[0], b[1] - a[1], b[2] - a[2]
+    vx, vy, vz = c[0] - a[0], c[1] - a[1], c[2] - a[2]
+    cx, cy, cz = uy * vz - uz * vy, uz * vx - ux * vz, ux * vy - uy * vx
+    return cx * nrm[0] + cy * nrm[1] + cz * nrm[2] > 0.0
+
+
 def triangulate_face(ring, verts):
     """Triangles (index triples into `verts`, a flat [x, y, z, ...] list) of one planar face
     given as a ring of vertex indices."""
@@ -114,14 +142,20 @@ def triangulate_face(ring, verts):
         j = 3 * ring[k]
         return verts[j], verts[j + 1], verts[j + 2]
 
-    if n == 4:                                  # quad: split along the shorter diagonal
+    if n == 4:                                  # quad: split along the shorter VALID diagonal
         p = [xyz(k) for k in range(4)]
-        d02 = sum((p[0][t] - p[2][t]) ** 2 for t in range(3))
-        d13 = sum((p[1][t] - p[3][t]) ** 2 for t in range(3))
         r = ring
-        if d02 <= d13:
-            return [(r[0], r[1], r[2]), (r[0], r[2], r[3])]
-        return [(r[1], r[2], r[3]), (r[1], r[3], r[0])]
+        nrm = _newell(p)
+        ok02 = _tri_ok(p, (0, 1, 2), nrm) and _tri_ok(p, (0, 2, 3), nrm)
+        ok13 = _tri_ok(p, (1, 2, 3), nrm) and _tri_ok(p, (1, 3, 0), nrm)
+        if ok02 or ok13:
+            d02 = sum((p[0][t] - p[2][t]) ** 2 for t in range(3))
+            d13 = sum((p[1][t] - p[3][t]) ** 2 for t in range(3))
+            if ok02 and (d02 <= d13 or not ok13):
+                return [(r[0], r[1], r[2]), (r[0], r[2], r[3])]
+            return [(r[1], r[2], r[3]), (r[1], r[3], r[0])]
+        # a concave quad whose shorter diagonal lies outside is handled above; a degenerate
+        # one falls through to the general ear clipping
     pts = [xyz(k) for k in range(n)]
     nx = ny = nz = 0.0                          # Newell normal
     for k in range(n):
@@ -147,28 +181,73 @@ def triangulate_face(ring, verts):
     else:
         order = list(range(n))
     tris = _ear_clip([uv[k] for k in order])
+    if sgn < 0:                                 # keep the winding of the ring: reverse the triangles
+        return [(ring[order[a]], ring[order[c]], ring[order[b]]) for a, b, c in tris]
     return [(ring[order[a]], ring[order[b]], ring[order[c]]) for a, b, c in tris]
 
 
 # ---------------------------------------------------------------- meshes
+# Two tolerances are kept apart:
+#  * the MERGE tolerance decides which vertices are one vertex (shared corners of neighbouring
+#    solids; needed so that the walls between blocks of one lithology cancel and the solids have
+#    no gaps).  It is a distance (every coordinate differs by at most the tolerance), not the
+#    rounding of the coordinates, so two points 0.0001 m apart are never split by a rounding
+#    boundary, and the stored coordinates are the real ones (they are not snapped to a grid);
+#  * the RENDER precision is that of the float32 buffers sent to WebGL (the coordinates are
+#    relative to the model centre).  A merge finer than that would only create triangles that
+#    degenerate in the GPU, so the merge tolerance is never smaller than the float32 spacing at
+#    the largest coordinate of the model (see merge_tolerance).
+MERGE_TOL_MIN = 1e-4                 # m; 0.1 mm - thin layers (cm) are never merged
+_F32_REL = 2.0 ** -23                # relative spacing of float32
+
+
+def merge_tolerance(max_abs):
+    """Merge tolerance [m] for a model whose largest coordinate (after the shift to the model
+    centre; elevations are not shifted) is `max_abs` m: twice the float32 spacing there, at
+    least MERGE_TOL_MIN."""
+    try:
+        m = abs(float(max_abs))
+    except (TypeError, ValueError):
+        m = 0.0
+    if not math.isfinite(m):
+        m = 0.0
+    return max(MERGE_TOL_MIN, 2.0 * m * _F32_REL)
+
+
 class _Mesh:
-    def __init__(self):
-        self.vmap = {}
-        self.verts = []                          # flat x, y, z (float)
+    def __init__(self, tol=MERGE_TOL_MIN):
+        self.tol = float(tol) if tol and tol > 0 else MERGE_TOL_MIN
+        self._h = 8.0 * self.tol                 # cell of the lookup grid; merge radius = h / 8
+        self.cells = {}                          # grid cell -> indices of the vertices in it
+        self.verts = []                          # flat x, y, z (float, real coordinates)
         self.faces = []                          # rings of vertex indices
 
     def vertex(self, x, y, z):
-        key = (round(x, 3), round(y, 3), round(z, 3))
-        i = self.vmap.get(key)
-        if i is None:
-            i = len(self.verts) // 3
-            self.vmap[key] = i
-            self.verts.extend(key)
+        h, tol, verts = self._h, self.tol, self.verts
+        fx, fy, fz = x / h, y / h, z / h
+        cx, cy, cz = math.floor(fx), math.floor(fy), math.floor(fz)
+        # a point within tol of a cell border can have its partner in the neighbouring cell
+        ox = (0, -1) if fx - cx < 0.125 else ((0, 1) if fx - cx > 0.875 else (0,))
+        oy = (0, -1) if fy - cy < 0.125 else ((0, 1) if fy - cy > 0.875 else (0,))
+        oz = (0, -1) if fz - cz < 0.125 else ((0, 1) if fz - cz > 0.875 else (0,))
+        for dx in ox:
+            for dy in oy:
+                for dz in oz:
+                    for i in self.cells.get((cx + dx, cy + dy, cz + dz), ()):
+                        k = 3 * i
+                        if (abs(verts[k] - x) <= tol and abs(verts[k + 1] - y) <= tol
+                                and abs(verts[k + 2] - z) <= tol):
+                            return i
+        i = len(verts) // 3
+        self.cells.setdefault((cx, cy, cz), []).append(i)
+        verts.extend((float(x), float(y), float(z)))
         return i
 
     def add_face(self, ring3d, ox, oy):
         ring = []
         for x, y, z in ring3d:
+            if not math.isfinite(x + y + z):
+                return                           # NaN / Inf: the face cannot be placed, drop it
             i = self.vertex(x - ox, y - oy, z)
             if not ring or ring[-1] != i:
                 ring.append(i)
@@ -205,14 +284,23 @@ def _b64(arr):
     return base64.b64encode(arr.tobytes()).decode("ascii")
 
 
+_HEX_RE = re.compile(r"^#[0-9a-fA-F]{6}([0-9a-fA-F]{2})?$")
+
+
 def _hex(c):
+    """Colour as '#rrggbb' (QColor, (r, g, b) or a hex string); anything else is rejected, so a
+    colour can never carry markup into the page."""
     if isinstance(c, str):
-        return c
-    try:
-        return c.name()                          # QColor
-    except AttributeError:
-        r, g, b = c
-        return "#%02x%02x%02x" % (r, g, b)
+        h = c
+    else:
+        try:
+            h = c.name()                         # QColor
+        except AttributeError:
+            r, g, b = c
+            h = "#%02x%02x%02x" % (int(r), int(g), int(b))
+    if not _HEX_RE.match(h):
+        raise ValueError(f"Invalid colour: {h!r}")
+    return h
 
 
 def build_scene(models, colors, boreholes=None, title="3D model", edges=True,
@@ -224,12 +312,15 @@ def build_scene(models, colors, boreholes=None, title="3D model", edges=True,
     Returns a JSON-able dict."""
     xs0 = ys0 = math.inf
     xs1 = ys1 = -math.inf
+    zabs = 0.0
     nfaces = 0
     for _g, solids in models:
         for faces, _lit in solids:
             for ring in faces:
                 nfaces += 1
-                for x, y, _z in ring:
+                for x, y, z in ring:
+                    if abs(z) > zabs:
+                        zabs = abs(z)
                     if x < xs0:
                         xs0 = x
                     if x > xs1:
@@ -247,6 +338,8 @@ def build_scene(models, colors, boreholes=None, title="3D model", edges=True,
         raise ValueError("The model is empty.")
     ox, oy = round((xs0 + xs1) / 2.0), round((ys0 + ys1) / 2.0)
     want_edges = nfaces <= MAX_EDGE_FACES          # edge lines are exported unless the model is huge
+    # vertices are merged within a distance that is not finer than the float32 buffers of WebGL
+    tol = merge_tolerance(max(xs1 - ox, ox - xs0, ys1 - oy, oy - ys0, zabs))
 
     meshes = []
     zmin = zmax = None
@@ -257,7 +350,7 @@ def build_scene(models, colors, boreholes=None, title="3D model", edges=True,
         for faces, lit in solids:
             by_lit.setdefault(lit, []).append(faces)
         for lit, bodies in sorted(by_lit.items(), key=lambda kv: str(kv[0])):
-            mesh = _Mesh()
+            mesh = _Mesh(tol)
             for faces in bodies:
                 for ring in faces:
                     mesh.add_face(ring, ox, oy)
@@ -317,15 +410,35 @@ def render_html(scene):
         html = fh.read()
     if PLACEHOLDER not in html:
         raise RuntimeError("viewer3d.html is damaged (scene placeholder missing).")
-    data = json.dumps(scene, separators=(",", ":")).replace("</", "<\\/")
+    # "<" only occurs inside JSON strings, where \u003c means the same: no "</script>", "<!--"
+    # or "<script" sequence from the data can ever reach the HTML parser
+    data = (json.dumps(scene, separators=(",", ":"), allow_nan=False)
+            .replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+            .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"))
     return html.replace(PLACEHOLDER, data, 1)
 
 
 _PREFIX = "borehole_3d_"
 
 
-def _remove_old_files(max_age=2 * 86400):
-    """Remove viewer files of this plugin older than two days from the temp directory (only
+def remove_file(path):
+    """Delete a viewer file made by write_html (never any other file)."""
+    try:
+        if (os.path.basename(path).startswith(_PREFIX)
+                and os.path.dirname(os.path.abspath(path)) == os.path.abspath(tempfile.gettempdir())
+                and not os.path.islink(path)):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def remove_old_files(*a, **k):
+    """Public name of the age cleanup (used when the plugin starts)."""
+    _remove_old_files(*a, **k)
+
+
+def _remove_old_files(max_age=2 * 3600):
+    """Remove viewer files of this plugin older than two hours (the browser timer is one hour) from the temp directory (only
     regular files owned by the current user; links and foreign files are never touched)."""
     d = tempfile.gettempdir()
     now = time.time()

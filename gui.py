@@ -1,5 +1,6 @@
-from qgis.PyQt.QtCore import Qt, QRectF, QSize, pyqtSignal
+from qgis.PyQt.QtCore import Qt, QRectF, QSize, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import (QColor, QGuiApplication, QIcon, QImage, QPainter, QPdfWriter,
+                             QStandardItem, QStandardItemModel,
                              QPageSize, QPageLayout, QPixmap)
 from qgis.PyQt.QtSvg import QSvgGenerator
 from qgis.PyQt.QtWidgets import (
@@ -7,7 +8,7 @@ from qgis.PyQt.QtWidgets import (
     QComboBox, QCheckBox, QPushButton, QLabel, QPlainTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QDoubleSpinBox, QGraphicsView, QFileDialog,
     QMessageBox, QSplitter, QSpinBox, QScrollArea, QFrame, QListWidget, QListWidgetItem,
-    QApplication,
+    QApplication, QInputDialog,
 )
 from qgis.core import (
     Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsCsException, QgsGeometry,
@@ -15,10 +16,22 @@ from qgis.core import (
 )
 from qgis.gui import QgsColorButton, QgsFileWidget, QgsMapTool, QgsRubberBand
 
+import contextlib
+import os
 import math
 from dataclasses import replace
 
 from . import core, logs, model3d, patterns, viewer3d, viewer3d_window
+
+
+@contextlib.contextmanager
+def _busy():
+    """Wait cursor that is always restored, whatever happens inside."""
+    QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+    try:
+        yield
+    finally:
+        QApplication.restoreOverrideCursor()
 
 
 # ---------------------------------------------------------------- map tool
@@ -128,7 +141,7 @@ class SectionViewer(QDialog):
             split.addWidget(side)
             split.setStretchFactor(0, 3)
             split.setStretchFactor(1, 2)
-        lay.addWidget(split)
+        lay.addWidget(split, 1)
         row = QHBoxLayout()
         for label, fn in (("Fit", self.fit), ("Export PNG", self.export_png),
                           ("Export SVG", self.export_svg), ("Export PDF", self.export_pdf)):
@@ -172,6 +185,21 @@ class SectionViewer(QDialog):
     def showEvent(self, e):
         super().showEvent(e)
         self.fit()
+        QTimer.singleShot(0, self._trim_height)
+
+    def _trim_height(self):
+        """The section is wide and low: shrink the window so that no empty band is left below
+        the drawing and below the buttons."""
+        if self.isMaximized() or self.isFullScreen():
+            return
+        r = self.scene.sceneRect()
+        vp = self.view.viewport()
+        if r.width() <= 0 or r.height() <= 0 or vp.width() <= 0:
+            return
+        extra = vp.height() - int(vp.width() * r.height() / r.width()) - 6
+        if extra > 20:
+            self.resize(self.width(), max(self.height() - extra, 300))
+            self.fit()
 
     def fit(self):
         self.view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
@@ -182,21 +210,55 @@ class SectionViewer(QDialog):
             path += ext
         return path
 
+    MAX_PNG_PIXELS = 100_000_000          # 400 MB of ARGB32; more would freeze or crash QGIS
+    MAX_PNG_SIDE = 30000                  # the raster paint engine works up to 32767 px
+
     def export_png(self):
+        r = self.scene.sceneRect()
+        if not (math.isfinite(r.width()) and math.isfinite(r.height())) \
+                or r.width() <= 0 or r.height() <= 0:
+            QMessageBox.warning(self, "Export", "The scene is empty - nothing to export.")
+            return
+        items = ["1x (screen size)", "2x (default)", "3x", "4x"]
+        choice, ok = QInputDialog.getItem(self, "PNG export", "Resolution:", items, 1, False)
+        if not ok:
+            return
+        scale = float(items.index(choice) + 1)
+        # the largest scale that keeps the image within the pixel and side limits
+        fit = min(scale, math.sqrt(self.MAX_PNG_PIXELS / (r.width() * r.height())),
+                  self.MAX_PNG_SIDE / max(r.width(), r.height()))
+        if fit < 0.25:
+            QMessageBox.warning(self, "Export", "The section is too large for a PNG image even "
+                                "at a low resolution. Export it to SVG or PDF instead.")
+            return
+        if fit < scale:
+            w, h = int(r.width() * fit), int(r.height() * fit)
+            if QMessageBox.question(
+                    self, "Export",
+                    f"At {scale:g}x the image would be too large. Export it at a reduced "
+                    f"resolution ({w} x {h} px) instead?") != QMessageBox.StandardButton.Yes:
+                return
+            scale = fit
         path = self._ask("PNG (*.png)", ".png")
         if not path:
             return
-        r = self.scene.sceneRect()
-        if r.width() <= 0 or r.height() <= 0:
-            QMessageBox.warning(self, "Export", "The scene is empty - nothing to export.")
+        w, h = max(1, int(r.width() * scale)), max(1, int(r.height() * scale))
+        try:
+            img = QImage(w, h, QImage.Format.Format_ARGB32)
+        except (MemoryError, ValueError, OverflowError):
+            img = None
+        if img is None or img.isNull():                  # no memory / over the QImage limit
+            QMessageBox.warning(self, "Export", "The image could not be created (not enough "
+                                "memory). Choose a lower resolution or export to SVG or PDF.")
             return
-        img = QImage(int(r.width() * 2), int(r.height() * 2), QImage.Format.Format_ARGB32)
         img.fill(Qt.GlobalColor.white)
         p = QPainter(img)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        self.scene.render(p, QRectF(img.rect()), r)
-        p.end()
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            self.scene.render(p, QRectF(img.rect()), r)
+        finally:
+            p.end()
         if not img.save(path):
             QMessageBox.warning(self, "Export", f"Could not write the file:\n{path}")
 
@@ -205,11 +267,25 @@ class SectionViewer(QDialog):
         if not path:
             return
         r = self.scene.sceneRect()
+        if r.width() <= 0 or r.height() <= 0:
+            QMessageBox.warning(self, "Export", "The scene is empty - nothing to export.")
+            return
+        try:
+            with open(path, "ab"):                  # can the file be written (not locked)?
+                pass
+        except OSError as e:
+            QMessageBox.warning(self, "Export", f"Could not write the file:\n{path}\n{e}")
+            return
         g = QSvgGenerator()
         g.setFileName(path)
         g.setSize(r.size().toSize())
         g.setViewBox(QRectF(0, 0, r.width(), r.height()))
         p = QPainter(g)
+        if not p.isActive():
+            QMessageBox.warning(self, "Export", f"Could not write the SVG:\n{path}")
+            return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         self.scene.render(p, QRectF(0, 0, r.width(), r.height()), r)
         p.end()
@@ -218,9 +294,12 @@ class SectionViewer(QDialog):
         path = self._ask("PDF (*.pdf)", ".pdf")
         if not path:
             return
+        r = self.scene.sceneRect()
+        if r.width() <= 0 or r.height() <= 0:
+            QMessageBox.warning(self, "Export", "The scene is empty - nothing to export.")
+            return
         w = QPdfWriter(path)
         w.setPageSize(QPageSize(QPageSize.PageSizeId.A4))
-        r = self.scene.sceneRect()
         w.setPageOrientation(QPageLayout.Orientation.Portrait if r.height() > r.width()
                              else QPageLayout.Orientation.Landscape)
         p = QPainter()
@@ -228,6 +307,8 @@ class SectionViewer(QDialog):
             QMessageBox.warning(self, "Export",
                                 f"Could not write the PDF (is it open in another program?):\n{path}")
             return
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
         p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
         target = QRectF(0, 0, p.device().width(), p.device().height())
         self.scene.render(p, target, self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
@@ -239,7 +320,7 @@ NO_STRAT = "(none)"
 
 class LogViewer(SectionViewer):
     """Window of borehole profiles / sedimentary records with a side panel. Every drop-down
-    changes only its own item and redraws the log:
+    changes only its own item; the log is redrawn by the Regenerate button:
       profiles:  Lithology (column of the profile + merging), Lithological description,
                  Stratigraphy (column of the stratigraphy column, none = hidden);
       records:   Lithology (column of the record + merging), Legend (text of the legend)."""
@@ -285,10 +366,7 @@ class LogViewer(SectionViewer):
         self.split.addWidget(side)
         self.split.setStretchFactor(0, 4)
         self.split.setStretchFactor(1, 1)
-        for cb in (self.cb_prof, self.cb_desc, self.cb_strat):
-            if cb is not None:
-                cb.currentIndexChanged.connect(self.regenerate_log)
-        self.chk_merge.toggled.connect(self.regenerate_log)
+        # the log is redrawn only by the Regenerate button, not when a parameter is changed
 
     def regenerate_log(self, *_):
         try:
@@ -418,6 +496,7 @@ class BoreholeDialog(QDialog):
         _fit_to_screen(self, 720, 600)
         self.boreholes, self.colors, self.section_pts = [], {}, None
         self.hdr = {"bh": None, "ly": None}
+        self.hdr_idx = {"bh": None, "ly": None}      # file column of every drop-down entry
         self.line_rb = None
         self.tool = SectionLineTool(self.canvas)
         self.tool.lineFinished.connect(self._line_done)
@@ -427,7 +506,6 @@ class BoreholeDialog(QDialog):
         self.viewers = []
         self.forms = {}
         self.scene3d, self.scene3d_colors, self.scene3d_bhs = {}, {}, {}   # models of the own 3D viewer
-        self._viewer3d = None
 
         tabs = QTabWidget()
         lay = QVBoxLayout(self)
@@ -622,6 +700,24 @@ class BoreholeDialog(QDialog):
                                 "circular marker of the 'Boreholes' layer at the current map "
                                 "scale, i.e. the line passes through the marker.")
         form.addRow("Dashed outline farther than", self.sp_dash)
+        self.cb_xdip = QComboBox()
+        self.cb_xdip.addItem("Auto (ground slope across the line)", "auto")
+        self.cb_xdip.addItem("Manual (angle below)", "manual")
+        self.cb_xdip.addItem("Off (real elevations)", "off")
+        self.cb_xdip.setToolTip(
+            "An inclined borehole crosses the section plane in one point only; its layers lie "
+            "at a distance from the plane (known from the azimuth, the inclination and the "
+            "distances of the collar and of the bottom from the line). The elevations of the "
+            "layer boundaries are moved into the plane along the strata, which rise "
+            "perpendicular to the section by the chosen cross slope.")
+        form.addRow("Heights of layers in the section plane", self.cb_xdip)
+        self.sp_xdip = QDoubleSpinBox()
+        self.sp_xdip.setRange(-80, 80)
+        self.sp_xdip.setDecimals(1)
+        self.sp_xdip.setSuffix(" deg")
+        self.sp_xdip.setToolTip("Manual cross slope of the strata: + = rising to the left of "
+                                "the section line (looking from its start to its end).")
+        form.addRow("Cross slope of the strata (manual)", self.sp_xdip)
         self.sp_vex = QDoubleSpinBox()
         self.sp_vex.setRange(0, 100)
         self.sp_vex.setSpecialValueText("Auto")
@@ -653,11 +749,14 @@ class BoreholeDialog(QDialog):
         self.chk_trans.setChecked(True)
         self.chk_lab = QCheckBox("Show labels")
         self.chk_lab.setChecked(True)
+        self.chk_strat = QCheckBox("Show stratigraphic boundaries when the section opens")
+        self.chk_strat.setChecked(False)
         lay.addWidget(self.chk_corr)
         lay.addWidget(self.chk_merge)
         lay.addWidget(self.chk_dip)
         lay.addWidget(self.chk_trans)
         lay.addWidget(self.chk_lab)
+        lay.addWidget(self.chk_strat)
         b3 = QPushButton("Create cross section")
         b3.clicked.connect(self.create_section)
         lay.addWidget(b3)
@@ -670,22 +769,20 @@ class BoreholeDialog(QDialog):
         vw = QGroupBox("Output and 3D viewer")
         vf = QFormLayout(vw)
         self.cb_out = QComboBox()
-        self.cb_out.addItems(["Plugin's 3D viewer + QGIS 3D layers",
-                              "Plugin's 3D viewer only",
-                              "QGIS 3D layers only (for the QGIS 3D Map View)"])
-        self.cb_out.setToolTip("The plugin's own viewer (WebGL) rotates, cuts and measures the model "
-                               "without the QGIS 3D Map View; the QGIS layers stay in the project.")
-        vf.addRow("Show the created model in", self.cb_out)
-        self.chk_browser = QCheckBox("Open the viewer in the web browser instead of a QGIS window")
-        if not viewer3d_window.webengine_available():
-            self.chk_browser.setChecked(True)
-            self.chk_browser.setEnabled(False)
-            self.chk_browser.setToolTip("This QGIS has no QtWebEngine, the viewer opens in your "
-                                        "default web browser (no installation needed).")
-        else:
-            self.chk_browser.setToolTip("Needs a browser with WebGL 2 (Chrome, Edge, Firefox, Safari).")
-        vf.addRow(self.chk_browser)
-        bview = QPushButton("Open 3D viewer (models created in this session)")
+        self.cb_out.addItems(["Plugin's 3D viewer (in the web browser)",
+                              "QGIS 3D layers (for the QGIS 3D Map View)"])
+        self.cb_out.setCurrentIndex(0)                 # default: the plugin's viewer
+        self.cb_out.setToolTip("The model is created for the viewer chosen here: the plugin's own "
+                               "viewer (WebGL, in the web browser) or the native QGIS 3D Map View with the "
+                               "3D layers of the model. The model is created only "
+                               "for the viewer chosen here and opens in it automatically.")
+        vf.addRow("Open the created model in", self.cb_out)
+        note = QLabel("Before creating the model, select the 3D viewer in which the results "
+                      "will be displayed")
+        note.setWordWrap(True)
+        vf.addRow(note)
+        bview = QPushButton("Reopen 3D viewer (models created in this session)")
+        bview.setToolTip("Opens again the models created in this session for the viewer chosen in 'Open the created model in'.")
         bview.clicked.connect(self.open_viewer)
         vf.addRow(bview)
         lay.addWidget(vw)
@@ -862,14 +959,18 @@ class BoreholeDialog(QDialog):
         self.log.appendPlainText(s)
 
     def _file_changed(self, key, path):
-        if not path:
+        if not path or not os.path.isfile(path):       # e.g. a path that is being typed
             return
         try:
-            header, _ = core.read_table(path, self.delims[key].currentData())
+            header, _ = core.read_table(path, self.delims[key].currentData(), max_rows=1)
         except Exception as e:
             self._msg(f"Cannot read {path}: {e}")
             return
+        # only columns with a heading are offered (blank headers were named "(column N)")
+        kept = [i for i, h in enumerate(header) if not core.is_blank_header(h)]
+        header = [header[i] for i in kept]
         self.hdr[key] = header
+        self.hdr_idx[key] = kept
         combos = self.forms[key][1]
         crs_key = self.cb_crs.currentData() if hasattr(self, "cb_crs") else "sjtsk"
         for k, _, kw in self.fields[key]:
@@ -887,6 +988,13 @@ class BoreholeDialog(QDialog):
                 cb.addItems(header)
                 cb.setCurrentIndex(core.guess_column(header, kw))
 
+    def _file_col(self, key, i):
+        """Column of the file for the index of a drop-down entry (-1 stays -1 = none)."""
+        idx = self.hdr_idx.get(key)
+        if i < 0:
+            return -1
+        return idx[i] if idx is not None and i < len(idx) else i
+
     def load_data(self):
         p1, p2 = self.fw_bh.filePath(), self.fw_ly.filePath()
         if not p1 or not p2:
@@ -895,11 +1003,14 @@ class BoreholeDialog(QDialog):
         try:
             h1, r1 = core.read_table(p1, self.delims["bh"].currentData())
             h2, r2 = core.read_table(p2, self.delims["ly"].currentData())
-            m1 = {k: c.currentIndex() for k, c in self.cb_bh.items()}
-            m1["azimuth"] = self.cb_bh["azimuth"].currentIndex() - 1   # -1 = none
-            m1["dip"] = self.cb_bh["dip"].currentIndex() - 1           # -1 = none
-            m2 = {k: c.currentIndex() for k, c in self.cb_ly.items()}
-            m2["strat"] = self.cb_ly["strat"].currentIndex() - 1       # -1 = none
+            if any(c.currentIndex() < 0 for c in list(self.cb_bh.values()) + list(self.cb_ly.values())
+                   if c not in (self.cb_bh["azimuth"], self.cb_bh["dip"], self.cb_ly["strat"])):
+                raise ValueError("Choose a column for every required field (a drop-down is empty).")
+            m1 = {k: self._file_col("bh", c.currentIndex()) for k, c in self.cb_bh.items()}
+            m1["azimuth"] = self._file_col("bh", self.cb_bh["azimuth"].currentIndex() - 1)  # -1 = none
+            m1["dip"] = self._file_col("bh", self.cb_bh["dip"].currentIndex() - 1)
+            m2 = {k: self._file_col("ly", c.currentIndex()) for k, c in self.cb_ly.items()}
+            m2["strat"] = self._file_col("ly", self.cb_ly["strat"].currentIndex() - 1)
             self.ly_header = list(h2)
             self.litho_col = h2[m2["litho"]]
             self.strat_col = h2[m2["strat"]] if m2["strat"] >= 0 else ""
@@ -910,6 +1021,11 @@ class BoreholeDialog(QDialog):
             QMessageBox.critical(self, "Error", str(e))
             return
         self.log.clear()
+        self.scene3d.clear()                 # models of the previous data set
+        self.scene3d_colors.clear()
+        self.scene3d_bhs.clear()
+        self.model_layers.clear()
+        self.lst_lit.clear()
         n_l = sum(len(b.layers) for b in self.boreholes)
         self._msg(f"Loaded {len(self.boreholes)} boreholes, {n_l} layers "
                   f"(input CRS: {self.cb_crs.currentText()}).")
@@ -922,6 +1038,7 @@ class BoreholeDialog(QDialog):
         defaults = core.default_colors(lithos)
         self.tbl.setRowCount(len(lithos))
         self.btns, self.grain_boxes, self.pat_boxes = {}, {}, {}
+        pat_model = self._pattern_model()
         for i, lit in enumerate(lithos):
             it = QTableWidgetItem(lit)
             it.setFlags(Qt.ItemFlag.ItemIsEnabled)
@@ -939,13 +1056,7 @@ class BoreholeDialog(QDialog):
             pb = QComboBox()
             pb.setIconSize(QSize(48, 36))
             pb.setMaxVisibleItems(12)
-            pb.addItem("(none)", "")
-            for code in patterns.NAMES:
-                ic = patterns.icon(code)
-                if ic is not None:
-                    pb.addItem(ic, patterns.label(code), code)
-                else:
-                    pb.addItem(patterns.label(code), code)
+            pb.setModel(pat_model)               # one model (133 icons) for all rows
             pb.setCurrentIndex(max(pb.findData(patterns.default_pattern(lit)), 0))
             self.tbl.setCellWidget(i, 3, pb)
             self.pat_boxes[lit] = pb
@@ -956,6 +1067,24 @@ class BoreholeDialog(QDialog):
                 cb.addItem(b.name, b.name)
             if i == 0 and self.boreholes:
                 cb.setCurrentIndex(1)
+
+    def _pattern_model(self):
+        """ONE item model with the pattern icons, shared by the combos of all lithologies."""
+        model = QStandardItemModel(self)
+        none = QStandardItem("(none)")
+        none.setData("", Qt.ItemDataRole.UserRole)
+        model.appendRow(none)
+        for code in patterns.NAMES:
+            ic = patterns.icon(code)
+            item = QStandardItem(ic, patterns.label(code)) if ic is not None \
+                else QStandardItem(patterns.label(code))
+            item.setData(code, Qt.ItemDataRole.UserRole)
+            model.appendRow(item)
+        old = getattr(self, "_pat_model", None)
+        if old is not None:
+            old.deleteLater()                # the previous set of combos is being replaced
+        self._pat_model = model
+        return model
 
     def current_colors(self):
         return {lit: b.color() for lit, b in getattr(self, "btns", {}).items()}
@@ -984,14 +1113,27 @@ class BoreholeDialog(QDialog):
         lyr = QgsProject.instance().mapLayer(self.bh_layer_id) if self.bh_layer_id else None
         return [lyr] if lyr is not None else QgsProject.instance().mapLayersByName("Boreholes")
 
+    @staticmethod
+    def _selected_names(lyr):
+        """Names (attribute 'name') of the selected features; a foreign layer called
+        'Boreholes' without such an attribute gives nothing."""
+        if not hasattr(lyr, "selectedFeatures") or lyr.fields().indexFromName("name") < 0:
+            return []
+        names = []
+        for f in lyr.selectedFeatures():
+            v = f["name"]
+            if v is None or (hasattr(v, "isNull") and v.isNull()):     # NULL in the table
+                continue
+            names.append(str(v))
+        return names
+
     # ---- borehole logs
     def logs_from_selection(self):
         if not self._need_data():
             return
         names = []
         for lyr in self._bh_layers():
-            if hasattr(lyr, "selectedFeatures"):
-                names += [str(f["name"]) for f in lyr.selectedFeatures()]
+            names += self._selected_names(lyr)
         names = [n for n in dict.fromkeys(names) if any(b.name == n for b in self.boreholes)]
         if not names:
             QMessageBox.information(self, "Selection",
@@ -1139,17 +1281,17 @@ class BoreholeDialog(QDialog):
             QMessageBox.warning(self, "Selection", "Select a line feature in the active layer.")
             return
         g = lyr.selectedFeatures()[0].geometry()
+        if g is None or g.isNull() or g.isEmpty():
+            QMessageBox.warning(self, "Selection", "The selected feature has an empty geometry.")
+            return
         if g.type() != Qgis.GeometryType.Line:
             QMessageBox.warning(self, "Selection", "Selected feature is not a line.")
             return
-        if g.isNull() or g.isEmpty():
-            QMessageBox.warning(self, "Selection", "The selected feature has an empty geometry.")
-            return
         g = QgsGeometry(g)                      # arcs (CircularString, CompoundCurve) -> segments
         if g.constGet() is not None and g.constGet().hasCurvedSegments():
-            g.convertToStraightSegment()
+            g = g.convertToStraightSegment()    # returns a NEW geometry
         parts = g.asMultiPolyline() if g.isMultipart() else [g.asPolyline()]
-        pts = parts[0] if parts else []
+        pts = next((p for p in parts if len(p) >= 2), [])      # first usable part
         if len(pts) < 2:
             QMessageBox.warning(self, "Selection", "The selected line needs at least two vertices.")
             return
@@ -1157,7 +1299,13 @@ class BoreholeDialog(QDialog):
 
     def _set_line(self, pts, src_crs):
         dst = QgsCoordinateReferenceSystem(core.CRS_SJTSK)
-        tr = QgsCoordinateTransform(src_crs, dst, QgsProject.instance())
+        tr = QgsCoordinateTransform(src_crs, dst, QgsProject.instance().transformContext())
+        if not src_crs.isValid() or not tr.isValid():       # invalid CRS would pass unchanged
+            QMessageBox.warning(self, "Section line",
+                                "The layer (or the project) has no valid coordinate system, so "
+                                "the section line cannot be transformed to S-JTSK. Assign a CRS "
+                                "to the layer first.")
+            return
         try:
             new_pts = [tr.transform(QgsPointXY(p)) for p in pts]
         except (QgsCsException, ValueError) as e:
@@ -1176,7 +1324,7 @@ class BoreholeDialog(QDialog):
         self.line_rb = QgsRubberBand(self.canvas, Qgis.GeometryType.Line)
         self.line_rb.setColor(QColor(220, 0, 0))
         self.line_rb.setWidth(2)
-        self.line_rb.setToGeometry(QgsGeometry.fromPolylineXY(list(pts)), None)
+        self.line_rb.setToGeometry(QgsGeometry.fromPolylineXY(list(pts)), src_crs)
 
     def _marker_radius(self):
         """Radius (m) of the circular borehole marker on the map at the current scale."""
@@ -1203,6 +1351,7 @@ class BoreholeDialog(QDialog):
         try:
             proj = core.project_boreholes(self.section_pts, self.boreholes, self.sp_off.value(),
                                           self.sp_gap.value())
+            core.apply_cross_dip(proj, self.cb_xdip.currentData(), self.sp_xdip.value())
         except Exception as e:
             QMessageBox.warning(self, "2D section", f"{type(e).__name__}: {e}")
             return
@@ -1217,9 +1366,11 @@ class BoreholeDialog(QDialog):
 
         def build(faults, proj=proj, colors=colors, opts=opts, bedrock=bedrock, strat=strat,
                   line=line, pats=pats, tol=tol):
+            core.take_geometry_issues()                  # forget the problems of older builds
             sc = core.build_section_scene(proj, colors, *opts, faults, bedrock, True, pats,
                                           off_tol=tol)
             sc.geo["line"] = line
+            self._report_geometry_issues()
             return sc
 
         try:
@@ -1229,6 +1380,16 @@ class BoreholeDialog(QDialog):
             return
         self._track_viewer(v)
         v.show()
+
+    def _report_geometry_issues(self):
+        """Tell the user that a geometric correction failed (core.geometry_issue)."""
+        issues = core.take_geometry_issues()
+        if not issues:
+            return
+        text = "; ".join(m + (f" (x{n})" if n > 1 else "") for m, n in issues)
+        self.iface.messageBar().pushMessage(
+            "Geometry", text + ". Details are in the QGIS log (Borehole Geology).",
+            level=Qgis.MessageLevel.Warning, duration=20)
 
     def _track_viewer(self, v):
         """Keep a reference while the window is open; forget it when it is closed."""
@@ -1240,7 +1401,7 @@ class BoreholeDialog(QDialog):
         opts = (self.sp_vex.value(), self.chk_corr.isChecked(), self.chk_lab.isChecked(),
                 self.sp_curv.value(), self.sp_round.value(), self.chk_merge.isChecked(),
                 self.chk_dip.isChecked(), self.chk_trans.isChecked())
-        return colors, opts, self.sp_bed.value(), False
+        return colors, opts, self.sp_bed.value(), self.chk_strat.isChecked()
 
     # ---- 3D
     def _bh_subset(self):
@@ -1248,8 +1409,7 @@ class BoreholeDialog(QDialog):
         if self.chk_sel.isChecked():
             names = set()
             for lyr in self._bh_layers():
-                if hasattr(lyr, "selectedFeatures"):
-                    names |= {str(f["name"]) for f in lyr.selectedFeatures()}
+                names |= set(self._selected_names(lyr))
             sub = [b for b in bhs if b.name in names]
             if len(sub) >= 2:
                 return sub
@@ -1260,7 +1420,7 @@ class BoreholeDialog(QDialog):
 
     def _show_3d_result(self, count, n, err, what):
         self.iface.messageBar().pushMessage(
-            "3D", f"{what}: {n} objects in {count} layers. Open View > New 3D Map View.",
+            "3D", f"{what}: {n} objects in {count} layers.",
             level=Qgis.MessageLevel.Success, duration=10)
         if err:
             QMessageBox.warning(
@@ -1275,26 +1435,28 @@ class BoreholeDialog(QDialog):
             return
         bhs = self._bh_subset()
         mode = "depth" if self.cb_gmode.currentIndex() == 1 else "elevation"
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            if self.cb_gmethod.currentIndex() == 0:
-                solids, info = model3d.smooth_model(
-                    bhs, self.sp_cell.value(), self.sp_dz.value(), mode, self.sp_k.value(),
-                    self.sp_maxd.value(),
-                    "rectangle" if self.cb_extent.currentIndex() == 1 else "hull")
-                name, layer_group = "Full model", "3D full model"
-                what = (f"Full model ({info['bodies']} smooth bodies, mesh {info['cell']:.1f} m)")
-            else:
-                prisms, info = model3d.grid_model(bhs, self.sp_cell.value(), self.sp_dz.value(),
-                                                  mode, self.sp_k.value(), self.sp_maxd.value())
-                solids = model3d.prisms_to_solids(prisms)
-                name, layer_group = "Grid blocks", "3D grid model"
-                what = f"Grid model ({info['cells']} cells of {info['cell']:.1f} m)"
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
+        failure = None
+        with _busy():
+            try:
+                if self.cb_gmethod.currentIndex() == 0:
+                    solids, info = model3d.smooth_model(
+                        bhs, self.sp_cell.value(), self.sp_dz.value(), mode, self.sp_k.value(),
+                        self.sp_maxd.value(),
+                        "rectangle" if self.cb_extent.currentIndex() == 1 else "hull")
+                    name, layer_group = "Full model", "3D full model"
+                    what = (f"Full model ({info['bodies']} smooth bodies, mesh {info['cell']:.1f} m)")
+                else:
+                    prisms, info = model3d.grid_model(bhs, self.sp_cell.value(), self.sp_dz.value(),
+                                                      mode, self.sp_k.value(), self.sp_maxd.value())
+                    solids = model3d.prisms_to_solids(prisms)
+                    name, layer_group = "Grid blocks", "3D grid model"
+                    what = f"Grid model ({info['cells']} cells of {info['cell']:.1f} m)"
+            except Exception as e:
+                failure = e
+        if failure is not None:
+            e = failure
             QMessageBox.warning(self, "3D full model", str(e))
             return
-        QApplication.restoreOverrideCursor()
         # one of the two methods replaces the other result in the viewer
         for old in ("Full model", "Grid blocks"):
             if old != name:
@@ -1313,16 +1475,9 @@ class BoreholeDialog(QDialog):
         return {lit: (c, *tiles[c]) for lit, c in codes.items() if c in tiles}
 
     def _finish_model(self, groups, colors, layer_group, solids, volume, bhs, what):
-        """Put a new model into QGIS layers and / or the plugin's own 3D viewer."""
-        mode = self.cb_out.currentIndex()
-        if mode in (0, 2):
-            reg = {}
-            count, n, err = model3d.build_layers(solids, colors, layer_group,
-                                                 edges=self.chk_edges.isChecked(),
-                                                 registry=reg, volume=volume)
-            self._register_models(reg, colors)
-            self._show_3d_result(count, n, err, what)
-        if mode in (0, 1):
+        """Put a new model into the viewer chosen in 'Open the created model in' only
+        (0 = plugin's viewer in the web browser, 1 = QGIS 3D layers) and open it."""
+        if self.cb_out.currentIndex() == 0:
             for name, sol in groups.items():
                 if sol:
                     self.scene3d[name] = sol
@@ -1330,46 +1485,111 @@ class BoreholeDialog(QDialog):
                     self.scene3d.pop(name, None)
             self.scene3d_colors.update(colors)
             self.scene3d_bhs.update({b.name: b for b in bhs})
-            if mode == 1:
-                self.iface.messageBar().pushMessage("3D", f"{what} - opening the 3D viewer.",
-                                                    level=Qgis.MessageLevel.Success, duration=6)
-            self.open_viewer()
+            self.iface.messageBar().pushMessage(
+                "3D", f"{what} - opening the plugin's 3D viewer.",
+                level=Qgis.MessageLevel.Success, duration=8)
+            self.open_web_viewer()
+            return
+        reg = {}
+        with _busy():
+            count, n, err = model3d.build_layers(solids, colors, layer_group,
+                                                 edges=self.chk_edges.isChecked(),
+                                                 registry=reg, volume=volume)
+            self._register_models(reg, colors)
+        self._show_3d_result(count, n, err, what)
+        self.open_qgis_3d_view()
 
     def open_viewer(self, _checked=False):
-        """Show all models created in this session in the plugin's own WebGL viewer."""
-        if not self.scene3d:
-            QMessageBox.information(self, "3D viewer",
-                                    "Create a fence model or a full model first.")
+        """Button 'Reopen 3D viewer': the models created in this session for the viewer chosen in
+        'Open the created model in' (0 = plugin's viewer in the web browser, 1 = QGIS 3D Map View)."""
+        web = self.cb_out.currentIndex() == 0
+        if not (self.scene3d if web else self.model_layers):
+            if self.model_layers or self.scene3d:       # a model exists, but for the other viewer
+                msg = "Previous model was created for a different viewer; please generate the model again."
+            else:
+                msg = "Create a fence model or a full model first."
+            QMessageBox.information(self, "3D viewer", msg)
             return
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        if web:
+            self.open_web_viewer()                  # the plugin's own WebGL viewer
+        else:
+            self.open_qgis_3d_view()                # the native QGIS 3D Map View
+
+    def _zoom_to_model(self):
+        """Zoom the main canvas to the 3D layers: a new 3D Map View takes this extent."""
         try:
-            cols = dict(self.scene3d_colors)
-            cols.setdefault("Borehole", core.QColor(20, 20, 20))
-            title = "Boreholes - " + " + ".join(self.scene3d)
-            lithos = {lit for sol in self.scene3d.values() for _faces, lit in sol}
-            scene = viewer3d.build_scene(list(self.scene3d.items()), cols,
-                                         list(self.scene3d_bhs.values()), title,
-                                         edges=self.chk_edges.isChecked(),
-                                         textures=self._textures(lithos))
-            path = viewer3d.write_html(scene)
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
+            from qgis.core import QgsCoordinateTransform, QgsRectangle
+            canvas = self.iface.mapCanvas()
+            dest = canvas.mapSettings().destinationCrs()
+            box = QgsRectangle()
+            box.setNull()
+            for ids in self.model_layers.values():
+                for lid in ids:
+                    lyr = QgsProject.instance().mapLayer(lid)
+                    if lyr is None or lyr.extent().isNull():
+                        continue
+                    ext = lyr.extent()
+                    if lyr.crs() != dest and lyr.crs().isValid() and dest.isValid():
+                        ext = QgsCoordinateTransform(lyr.crs(), dest,
+                                                     QgsProject.instance().transformContext()
+                                                     ).transformBoundingBox(ext)
+                    box.combineExtentWith(ext)
+            if not box.isNull() and not box.isEmpty():
+                box.scale(1.15)
+                canvas.setExtent(box)
+                canvas.refresh()
+        except Exception as e:                       # framing is a convenience only
+            core.log_warning(f"3D Map View: zoom to the model failed: {type(e).__name__}: {e}")
+
+    def open_qgis_3d_view(self):
+        """Open the native QGIS 3D Map View (Qt3D on OpenGL/Metal; no WebGL, no QtWebEngine)."""
+        from qgis.PyQt.QtGui import QAction
+        with _busy():
+            self._apply_lithology_visibility()
+            self._zoom_to_model()
+        action = None
+        # QgisInterface.actionNew3DMapCanvas() where the build has it, else the action of the
+        # main window by its object name (View > New 3D Map View)
+        getter = getattr(self.iface, "actionNew3DMapCanvas", None)
+        if callable(getter):
+            try:
+                action = getter()
+            except Exception as e:
+                core.log_warning(f"3D Map View: iface.actionNew3DMapCanvas failed: "
+                                 f"{type(e).__name__}: {e}")
+        if action is None:
+            action = self.iface.mainWindow().findChild(QAction, "mActionNew3DMapCanvas")
+        if action is None or not action.isEnabled():
+            self.iface.messageBar().pushMessage(
+                "3D", "The 3D layers are in the project, but this QGIS cannot open the 3D Map View "
+                "from the plugin (QGIS built without 3D support?). Try View > New 3D Map View.",
+                level=Qgis.MessageLevel.Warning, duration=15)
+            return
+        action.trigger()
+
+    def open_web_viewer(self):
+        """Show all models created in this session in the plugin's own WebGL viewer."""
+        failure = None
+        with _busy():
+            try:
+                cols = dict(self.scene3d_colors)
+                cols.setdefault("Borehole", core.QColor(20, 20, 20))
+                title = "Boreholes - " + " + ".join(self.scene3d)
+                lithos = {lit for sol in self.scene3d.values() for _faces, lit in sol}
+                scene = viewer3d.build_scene(list(self.scene3d.items()), cols,
+                                             list(self.scene3d_bhs.values()), title,
+                                             edges=self.chk_edges.isChecked(),
+                                             textures=self._textures(lithos))
+                path = viewer3d.write_html(scene)
+            except Exception as e:
+                failure = e
+        if failure is not None:
+            e = failure
             QMessageBox.warning(self, "3D viewer", f"{type(e).__name__}: {e}")
             return
-        QApplication.restoreOverrideCursor()
-        if self.chk_browser.isChecked() or not viewer3d_window.webengine_available():
-            if not viewer3d_window.open_in_browser(path):
-                QMessageBox.warning(self, "3D viewer", f"The web browser could not be started. "
-                                                       f"Open this file manually:\n{path}")
-            return
-        try:
-            if self._viewer3d is None:
-                self._viewer3d = viewer3d_window.Viewer3DWindow(self)
-                self._viewer3d.webgl_failed.connect(lambda: self.chk_browser.setChecked(True))
-            self._viewer3d.load(path, title)
-        except Exception as e:                       # embedded browser failed: use the system one
-            core.log_warning(f"3D viewer window failed: {type(e).__name__}: {e}")
-            viewer3d_window.open_in_browser(path)
+        if not viewer3d_window.open_in_browser(path):
+            QMessageBox.warning(self, "3D viewer", f"The web browser could not be started. "
+                                                   f"Open this file manually:\n{path}")
 
     def _refresh_dem(self):
         self.cb_dem.clear()
@@ -1385,9 +1605,16 @@ class BoreholeDialog(QDialog):
         lyr = QgsProject.instance().mapLayer(lid)
         if lyr is None:
             return None
-        tr = QgsCoordinateTransform(QgsCoordinateReferenceSystem(core.CRS_SJTSK), lyr.crs(),
-                                    QgsProject.instance())
-        prov = lyr.dataProvider()
+        prov = lyr.dataProvider() if lyr.isValid() else None
+        tr = None
+        if prov is not None and lyr.crs().isValid():
+            tr = QgsCoordinateTransform(QgsCoordinateReferenceSystem(core.CRS_SJTSK), lyr.crs(),
+                                        QgsProject.instance().transformContext())
+        if prov is None or tr is None or not tr.isValid():
+            QMessageBox.warning(self, "DEM", f"The raster layer \"{lyr.name()}\" is not usable "
+                                "(invalid layer, data provider or coordinate system) - "
+                                "the model is built without the DEM.")
+            return None
 
         def f(x, y):
             try:
@@ -1401,15 +1628,17 @@ class BoreholeDialog(QDialog):
         if not self._need_data():
             return
         bhs = model3d.drop_coincident([b for b in self._bh_subset() if b.layers])
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            edges = model3d.neighbour_edges(
-                bhs, "delaunay" if self.cb_net.currentIndex() == 1 else "grid", self.sp_maxe.value())
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
+        failure = None
+        with _busy():
+            try:
+                edges = model3d.neighbour_edges(
+                    bhs, "delaunay" if self.cb_net.currentIndex() == 1 else "grid", self.sp_maxe.value())
+            except Exception as e:
+                failure = e
+        if failure is not None:
+            e = failure
             QMessageBox.warning(self, "3D fence model", f"{type(e).__name__}: {e}")
             return
-        QApplication.restoreOverrideCursor()
         if not edges:
             QMessageBox.warning(self, "3D fence model",
                                 "No pair of neighbouring boreholes found - increase the longest panel.")
@@ -1422,23 +1651,51 @@ class BoreholeDialog(QDialog):
             return core.section_geo(proj, opts[0], opts[3], opts[4], opts[5], opts[6], opts[7],
                                     bedrock)
         dem = self._dem_func()
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            solids, volume = model3d.network_solids(
-                bhs, edges, make_geo, self.sp_pw.value(), self.sp_nslab.value(),
-                self.sp_dz.value(), dem, self.sp_colw.value(), self.chk_fill.isChecked(),
-                self.sp_fillcell.value(), self.sp_maxe.value(), 60000,
-                "blocks" if self.cb_fillmode.currentIndex() == 1 else "smooth")
-        except Exception as e:
-            QApplication.restoreOverrideCursor()
+        failure = None
+        core.take_geometry_issues()
+        with _busy():
+            try:
+                solids, volume = model3d.network_solids(
+                    bhs, edges, make_geo, self.sp_pw.value(), self.sp_nslab.value(),
+                    self.sp_dz.value(), dem, self.sp_colw.value(), self.chk_fill.isChecked(),
+                    self.sp_fillcell.value(), self.sp_maxe.value(), 60000,
+                    "blocks" if self.cb_fillmode.currentIndex() == 1 else "smooth")
+            except Exception as e:
+                failure = e
+        if failure is not None:
+            e = failure
             QMessageBox.warning(self, "3D fence model", str(e))
             return
-        QApplication.restoreOverrideCursor()
+        self._report_geometry_issues()
         cols = dict(colors)
         cols["Borehole"] = core.QColor(20, 20, 20)
         self._finish_model({"Fence panels": solids, "Fence volume": volume}, cols,
                            "3D fence network", solids, volume, bhs,
                            f"Fence network ({len(edges)} panels" + (", DEM" if dem else "") + ")")
+
+    # ---- closing / reopening the dialog: the red section line must not stay on the map
+    def _leave_map(self):
+        if self.canvas.mapTool() is self.tool:
+            self.canvas.unsetMapTool(self.tool)
+        self._drop_line_rb()
+
+    def reject(self):                      # Esc
+        self._leave_map()
+        super().reject()
+
+    def closeEvent(self, e):               # the [X] button
+        self._leave_map()
+        super().closeEvent(e)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        if self.section_pts and self.line_rb is None and self.canvas.mapTool() is not self.tool:
+            # the line stays defined: draw it again when the dialog is reopened
+            self.line_rb = QgsRubberBand(self.canvas, Qgis.GeometryType.Line)
+            self.line_rb.setColor(QColor(220, 0, 0))
+            self.line_rb.setWidth(2)
+            self.line_rb.setToGeometry(QgsGeometry.fromPolylineXY(list(self.section_pts)),
+                                       QgsCoordinateReferenceSystem(core.CRS_SJTSK))
 
     def cleanup(self):
         try:
@@ -1448,12 +1705,13 @@ class BoreholeDialog(QDialog):
         for v in list(self.viewers):
             v.close()
         self.viewers.clear()
-        if self._viewer3d is not None:
-            self._viewer3d.close()
-            self._viewer3d.deleteLater()
-            self._viewer3d = None
-        self._drop_line_rb()
-        self.canvas.unsetMapTool(self.tool)
-        sc = self.canvas.scene()
-        if sc is not None:
-            sc.removeItem(self.tool.rb)
+        viewer3d_window.cleanup_files()             # files given to a web browser a while ago
+        try:                  # the canvas may already be deleted when QGIS is closing
+            self._drop_line_rb()
+            if self.canvas is not None:
+                self.canvas.unsetMapTool(self.tool)
+                sc = self.canvas.scene()
+                if sc is not None:
+                    sc.removeItem(self.tool.rb)
+        except RuntimeError:
+            pass

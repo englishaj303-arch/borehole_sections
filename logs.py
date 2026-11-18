@@ -200,7 +200,7 @@ def build_profiles(bhs, colors, patterns, mode="depth", px_per_m=0.0, measure=ap
     cmds.append(_text("Depth [m]" if mode == "depth" else "Altitude [m a.s.l.]",
                       ruler_x - 54, TOP - 40, 9, "l", bold=True))
 
-    sw = STRAT_W if show_strat and any(L.age for b in bhs for L in _clean(b)) else 0.0
+    sw = STRAT_W if show_strat and any(L.age is not None for b in bhs for L in _clean(b)) else 0.0
     x0 = ruler_x + 70
     for bh in bhs:
         layers = _clean(bh)

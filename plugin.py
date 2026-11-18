@@ -4,6 +4,7 @@ from qgis.PyQt.QtGui import QAction, QIcon
 from qgis.core import QgsApplication
 
 from .gui import BoreholeDialog
+from . import viewer3d
 
 MENU = "&Borehole Geology"
 
@@ -15,6 +16,10 @@ class BoreholePlugin:
         self.dlg = None
 
     def initGui(self):
+        try:
+            viewer3d.remove_old_files()      # viewer files left by a QGIS closed within the hour
+        except Exception:                    # advisory cleanup only
+            pass
         path = os.path.join(os.path.dirname(__file__), "icon.png")
         icon = QIcon(path) if os.path.exists(path) else QgsApplication.getThemeIcon("/mIconLineLayer.svg")
         self.action = QAction(icon, "Borehole Geology Sections", self.iface.mainWindow())

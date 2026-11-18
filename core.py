@@ -2,8 +2,11 @@
 import csv
 import difflib
 import io
+import itertools
 import math
+import os
 import re
+import stat
 import unicodedata
 from dataclasses import dataclass, field
 
@@ -22,6 +25,26 @@ LOG_TAG = "Borehole Geology"
 
 def log_warning(msg):
     QgsMessageLog.logMessage(msg, LOG_TAG, Qgis.MessageLevel.Warning)
+
+
+_GEOM_ISSUES = {}          # message -> number of occurrences since the last take_geometry_issues()
+
+
+def geometry_issue(msg):
+    """A geometric correction failed and the uncorrected geometry was kept: write it to the QGIS
+    log at once and remember it, so that the dialog can tell the user (take_geometry_issues)."""
+    if msg not in _GEOM_ISSUES and len(_GEOM_ISSUES) >= 20:
+        return
+    if msg not in _GEOM_ISSUES:
+        log_warning(msg)
+    _GEOM_ISSUES[msg] = _GEOM_ISSUES.get(msg, 0) + 1
+
+
+def take_geometry_issues():
+    """[(message, count)] of the geometry problems reported since the last call (cleared)."""
+    out = list(_GEOM_ISSUES.items())
+    _GEOM_ISSUES.clear()
+    return out
 
 
 CRS_SJTSK = "EPSG:5514"
@@ -89,6 +112,9 @@ class Projected:
     offset: float
     d_top: float = None
     d_bot: float = None
+    s_top: float = 0.0     # signed distance of the collar from the section line (+ = left of it)
+    s_bot: float = 0.0     # the same for the bottom of the borehole
+    kx: float = 0.0        # gradient of the strata perpendicular to the section (m per m, + = rising to the left)
 
     def __post_init__(self):
         if self.d_top is None:
@@ -103,6 +129,19 @@ class Projected:
         t = md / self.bh.depth
         return self.d_top + (self.d_bot - self.d_top) * t
 
+    def s_at(self, md):
+        """Signed distance of the borehole from the section plane at along-hole depth `md`
+        (an inclined borehole crosses the plane in one point only, there s = 0)."""
+        if self.bh.depth <= 1e-9:
+            return self.s_top
+        return self.s_top + (self.s_bot - self.s_top) * md / self.bh.depth
+
+    def z_at(self, md):
+        """Elevation of the stratum point at `md` moved into the section plane: the strata
+        rise by kx per metre to the left of the line, so the point at distance s is
+        lowered by kx * s; = real elevation if kx = 0."""
+        return self.bh.z_at(md) - self.kx * self.s_at(md)
+
 
 # ----------------------------------------------------------------- CSV input
 def _norm(s):
@@ -110,39 +149,124 @@ def _norm(s):
     return s.strip().lower()
 
 
-def read_table(path, delimiter=None):
-    """Return (header, rows). Auto-detects encoding; delimiter=None -> auto."""
+MAX_TABLE_BYTES = 100 * 1024 * 1024
+# Plausible ranges of the input values; anything outside is a data error (units, a shifted
+# column ...) and would only produce absurdly large models.
+MAX_COORD = 1e8                 # projected coordinates [m]
+MAX_ELEV = 12000.0              # ground elevation [m a.s.l.]: -MAX_ELEV .. +MAX_ELEV
+MAX_DEPTH = 20000.0             # total depth and layer depths [m] (deepest borehole: 12.3 km)
+MAX_TABLE_ROWS = 1_000_000
+MAX_TABLE_COLUMNS = 1000
+MAX_TABLE_CELL = 32768
+
+
+_BLANK_HEADER_RE = re.compile(r"^\(column \d+\)$")
+
+
+def is_blank_header(name):
+    """True for the placeholder name '(column N)' that read_table gives to a blank header."""
+    return bool(_BLANK_HEADER_RE.match(name or ""))
+
+
+def read_table(path, delimiter=None, max_rows=None, max_bytes=MAX_TABLE_BYTES):
+    """Return (header, rows). Auto-detects encoding (UTF-8, UTF-16 with BOM, cp1250, latin-1);
+    delimiter=None -> auto.  max_rows=N reads only the beginning of the file (header + at most
+    N rows) - enough for a preview of the column names of a big file.  A file larger than
+    max_bytes (when read whole) or a binary file (NUL bytes) is rejected."""
+    try:
+        st = os.stat(path)
+    except OSError as e:
+        raise ValueError(f"Cannot read the file ({e.strerror or e}): {path}")
+    if not stat.S_ISREG(st.st_mode):          # FIFO, device ...: size 0, read() could block forever
+        raise ValueError("Not a regular file: " + path)
+    if max_rows is None and st.st_size > max_bytes:
+        raise ValueError(f"File is larger than {max_bytes // (1024 * 1024)} MB - "
+                         f"not a CSV table: {path}")
     with open(path, "rb") as fh:
-        raw = fh.read()
-    text = None
-    for enc in ("utf-8-sig", "cp1250", "latin-1"):
-        try:
-            text = raw.decode(enc)
-            break
-        except UnicodeDecodeError:
-            continue
-    first = text.splitlines()[0] if text else ""
+        head = fh.read(2)
+        fh.seek(0)
+        utf16 = head in (b"\xff\xfe", b"\xfe\xff")
+        if max_rows is None:
+            raw = fh.read(max_bytes + 1)        # the file may have grown since os.stat
+            if len(raw) > max_bytes:
+                raise ValueError(f"File is larger than {max_bytes // (1024 * 1024)} MB - "
+                                 f"not a CSV table: {path}")
+        else:                              # preview: at most 256 KB, whatever the file looks like
+            raw = fh.read(262144)          # (a file without line breaks would be read whole)
+            if len(raw) == 262144 and not utf16:      # do not cut a multi-byte character
+                cut = max(raw.rfind(b"\n"), raw.rfind(b"\r"))
+                if cut > 0:
+                    raw = raw[:cut]
+    if utf16:
+        raw = raw[:len(raw) // 2 * 2]
+        text = raw.decode("utf-16", errors="replace" if max_rows is not None else "strict")
+    else:
+        if b"\x00" in raw:
+            raise ValueError("Binary file (contains NUL bytes), not a CSV table: " + path)
+        text = None
+        for enc in ("utf-8-sig", "cp1250", "latin-1"):
+            try:
+                text = raw.decode(enc)
+                break
+            except UnicodeDecodeError:
+                continue
+    first = next((ln for ln in text[:65536].splitlines() if ln.strip()), "")   # first non-blank line
     if delimiter is None:
-        if ";" in first:
-            delimiter = ";"
-        elif "\t" in first:
-            delimiter = "\t"
+        for cand in (";", "\t", "|", ","):
+            if cand in first:
+                delimiter = cand
+                break
         else:
-            delimiter = ","
-    rows = [r for r in csv.reader(io.StringIO(text), delimiter=delimiter,
-                                  skipinitialspace=(delimiter == " "))
-            if any(c.strip() for c in r)]
+            delimiter = " " if len(first.split()) > 1 else ","
+    if max_rows is not None:
+        text = text[:100000]               # a preview needs only the first lines
+    raw = None                             # raw bytes and text would otherwise coexist with rows
+    rows = []
+    try:
+        for r in csv.reader(io.StringIO(text, newline=""), delimiter=delimiter,
+                            skipinitialspace=(delimiter == " ")):
+            if not any(c.strip() for c in r):
+                continue
+            if len(r) > MAX_TABLE_COLUMNS:
+                raise ValueError(f"More than {MAX_TABLE_COLUMNS} columns - not a CSV table: {path}")
+            if max(map(len, r)) > MAX_TABLE_CELL:
+                raise ValueError(f"A cell longer than {MAX_TABLE_CELL} characters (row "
+                                 f"{len(rows) + 1}) - not a CSV table: {path}")
+            rows.append(r)
+            if max_rows is not None and len(rows) > max_rows:
+                break                      # a preview needs only the header and a few rows
+            if len(rows) > MAX_TABLE_ROWS:
+                raise ValueError(f"More than {MAX_TABLE_ROWS:,} rows - too large for the plugin: "
+                                 f"{path}")
+    except csv.Error as e:
+        raise ValueError(f"Not a valid CSV table ({e}): {path}")
+    finally:
+        text = None
     if not rows:
         raise ValueError("File is empty: " + path)
+    if max_rows is not None:
+        rows = rows[:max_rows + 1]
     # a blank header would collide with other blank headers (and with "no column") later on
-    return [h.strip() or f"(column {i + 1})" for i, h in enumerate(rows[0])], rows[1:]
+    header, seen = [], {}
+    for i, h in enumerate(rows[0]):
+        h = h.strip() or f"(column {i + 1})"
+        if h in seen:                          # two equal names would overwrite each other
+            seen[h] += 1
+            h = f"{h} ({seen[h]})"
+        else:
+            seen[h] = 1
+        header.append(h)
+    return header, rows[1:]
 
 
 def to_float(s):
+    """Number from text ('1,5', '1 000.5'); None for text, NaN and +/-Inf (the latter would
+    break the sorting of layers and the JSON of the 3D viewer)."""
     try:
-        return float(str(s).strip().replace("\xa0", "").replace(" ", "").replace(",", "."))
+        v = float(str(s).strip().replace("\xa0", "").replace(" ", "").replace(",", "."))
     except ValueError:
         return None
+    return v if math.isfinite(v) else None
 
 
 # Stratigraphy, youngest -> oldest (index grows with age)
@@ -166,6 +290,23 @@ _STRAT_TERMS.update({
 })
 
 
+# Czech adjective endings after the stem of a period name (kridovy, triasovy, permsky, kvarterni)
+_STRAT_ENDING = re.compile(r"(?:(?:ov|sk|ck|n)?(?:y|a|e|i|ym|ych|ymi|eho|ou|em|ni)|a|u|y|e|ou)?")
+
+
+def _strat_word(word):
+    """Whole-word match of a period name: the word is the name itself or its Czech adjective
+    ('triasovy', 'permsky'); 'permeable' or 'industrial' do not match."""
+    if word in _STRAT_TERMS:
+        return _STRAT_TERMS[word]
+    for name in sorted(_STRAT_TERMS, key=len, reverse=True):
+        stem = name[:-1] if name.endswith("a") and len(name) > 4 else name
+        if len(stem) >= 4 and word.startswith(stem) and \
+                _STRAT_ENDING.fullmatch(word[len(stem):]):
+            return _STRAT_TERMS[name]
+    return None
+
+
 def parse_strat(text):
     """'neogén', 'Terciér', 'Cretaceous', 'křída-jura' ... -> (youngest_idx, oldest_idx) or None.
 
@@ -175,12 +316,16 @@ def parse_strat(text):
     if not t:
         return None
     found = []
-    for name in sorted(_STRAT_TERMS, key=len, reverse=True):
-        if name in t:
-            found.append(_STRAT_TERMS[name])
-            t = t.replace(name, " ")
+    left = []
+    for word in re.findall(r"[a-z?*]+", t):
+        if "?" not in word and "*" not in word:
+            hit = _strat_word(word)
+            if hit is not None:
+                found.append(hit)
+                continue
+        left.append(word)
     # what is left: words with a lost or garbled character
-    for word in re.findall(r"[a-z?*]{4,}", t):
+    for word in (w for w in left if len(w) >= 4):
         rx = re.compile("^" + "".join("." if c in "?*" else re.escape(c) for c in word) + "$")
         hits = [n for n in _STRAT_TERMS if rx.match(n)]
         if not hits:
@@ -255,6 +400,14 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
         if not name or None in (sx, sy, z):
             warnings.append(f"Boreholes file, line {n}: invalid values - skipped")
             continue
+        if depth is not None and depth > MAX_DEPTH:
+            warnings.append(f"Boreholes file, line {n} ({name}): total depth {depth:g} m is "
+                            f"over {MAX_DEPTH:g} m - skipped")
+            continue
+        if abs(z) > MAX_ELEV:
+            warnings.append(f"Boreholes file, line {n} ({name}): elevation {z:g} m is outside "
+                            f"+-{MAX_ELEV:g} m - skipped")
+            continue
         if depth is not None and depth < 0:
             warnings.append(f"Boreholes file, line {n} ({name}): negative total depth {depth:g} "
                             "- replaced by 0 (the depth of the layers is used)")
@@ -286,6 +439,12 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
 
         if swap:
             sx, sy = sy, sx
+        # geographic systems are in degrees, projected ones (S-JTSK, ETRS89 / UTM 33N) in metres
+        lim_x, lim_y = (180.0, 90.0) if src.isGeographic() else (MAX_COORD, MAX_COORD)
+        if abs(sx) > lim_x or abs(sy) > lim_y:
+            warnings.append(f"Boreholes file, line {n} ({name}): coordinates {sx:g}, {sy:g} are "
+                            "outside the valid range - skipped")
+            continue
         if crs_key == "sjtsk":
             qx, qy = sy, sx
             if negate:
@@ -294,6 +453,9 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
             try:
                 p = xform.transform(QgsPointXY(sx, sy))
                 qx, qy = p.x(), p.y()
+                if not (math.isfinite(qx) and math.isfinite(qy)
+                        and abs(qx) <= MAX_COORD and abs(qy) <= MAX_COORD):
+                    raise ValueError("outside the valid range")
             except Exception:
                 warnings.append(f"Boreholes file, line {n}: coordinate transformation failed - skipped")
                 continue
@@ -316,6 +478,10 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
         if t is None or b is None or b <= t:
             warnings.append(f"Layers file, line {n} ({name}): invalid interval - skipped")
             continue
+        if t < -MAX_DEPTH or b > MAX_DEPTH:
+            warnings.append(f"Layers file, line {n} ({name}): depth {t:g}-{b:g} m is outside "
+                            f"+-{MAX_DEPTH:g} m - skipped")
+            continue
         age = parse_strat(raw_age) if raw_age else None
         if raw_age and age is None:
             bad_strat.add(raw_age)
@@ -325,7 +491,7 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
     for bh in bhs.values():
         bh.layers.sort(key=lambda L: L.top)
         if bh.layers:
-            last = bh.layers[-1].bottom
+            last = max(L.bottom for L in bh.layers)      # layers may overlap: the deepest bottom
             if bh.depth < last:
                 if bh.depth:
                     warnings.append(f"{bh.name}: layers go deeper ({last}) than total depth ({bh.depth})")
@@ -362,11 +528,12 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
 
 # ------------------------------------------------------------------- colours
 _KEYWORDS = [
-    (("jil", "clay"), "#8b5a2b"), (("jilovec",), "#6b4423"),
+    (("jilovec",), "#6b4423"), (("pisk", "sandstone"), "#e6c27a"),     # specific words first,
+    (("jil", "clay"), "#8b5a2b"),                                       # else "jil" / "sand" win
     (("pisek", "sand"), "#f2d16b"), (("sterk", "stk", "gravel"), "#e0a458"),
     (("hlina", "silt", "loam"), "#c9a66b"), (("navaz", "fill"), "#9a9a9a"),
     (("skal", "rock", "granit", "rula", "bridlic"), "#6e7b8b"),
-    (("pisk", "sandstone"), "#e6c27a"), (("slin", "sinter"), "#a0a98f"),
+    (("slin", "sinter"), "#a0a98f"),
     (("humus", "orn", "topsoil", "soil"), "#4b3621"), (("rasel", "peat"), "#3b3b2b"),
     (("vapen", "limestone"), "#cfd8dc"),
 ]
@@ -433,16 +600,83 @@ def drop_close_boreholes(proj, min_gap):
     return kept
 
 
+MAX_WALL_SLOPE = math.tan(math.radians(85.0))
+
+
+def signed_offset(points, x, y):
+    """Signed distance (+ = left of the direction of the line) of (x, y) from a polyline."""
+    cands = []                               # (distance, sign, direction of the segment, end vertex)
+    for (ax, ay), (bx, by) in zip(points, points[1:]):
+        dx, dy = bx - ax, by - ay
+        ln2 = dx * dx + dy * dy
+        if ln2 < 1e-18:
+            continue
+        t = min(max(((x - ax) * dx + (y - ay) * dy) / ln2, 0.0), 1.0)
+        dist = math.hypot(x - (ax + t * dx), y - (ay + t * dy))
+        cross = dx * (y - ay) - dy * (x - ax)
+        ln = math.sqrt(ln2)
+        cands.append((dist, 1.0 if cross >= 0 else -1.0, (dx / ln, dy / ln), (ax, ay), (bx, by), t))
+    if not cands:
+        return 0.0
+    best = min(c[0] for c in cands)
+    ties = [c for c in cands if c[0] <= best + 1e-9 * max(1.0, best)]
+    sign = ties[0][1]
+    if len({c[1] for c in ties}) > 1:
+        # equally near to the end of one segment and the start of the next (an inner vertex of
+        # a broken line) and the two cross products disagree: take the side of the bisector
+        for c1, c2 in zip(ties, ties[1:]):
+            if c1[4] == c2[3]:
+                bx_, by_ = c1[2][0] + c2[2][0], c1[2][1] + c2[2][1]
+                if math.hypot(bx_, by_) > 1e-12:
+                    vx, vy = c1[4]
+                    sign = 1.0 if bx_ * (y - vy) - by_ * (x - vx) >= 0 else -1.0
+                break
+    return best * sign
+
+
+def apply_cross_dip(proj, mode="auto", manual_deg=0.0):
+    """Set the cross gradient kx of the strata for the projection into the section plane.
+    mode 'off': kx = 0 (orthogonal projection of the real elevations); 'manual': the strata
+    rise perpendicular to the section by `manual_deg` degrees (+ = to the left of the line);
+    'auto': slope of a plane fitted to the collar elevations (ground surface) across the line.
+    Returns kx."""
+    kx = 0.0
+    if mode == "manual":
+        kx = math.tan(math.radians(max(-80.0, min(80.0, manual_deg))))
+    elif mode == "auto" and len(proj) >= 3:
+        n = len(proj)
+        md_, ms_, mz_ = (sum(v) / n for v in zip(*[(p.d_top, p.s_top, p.bh.z) for p in proj]))
+        sdd = sds = sss = sdz = ssz = 0.0
+        for p in proj:
+            a, b, z = p.d_top - md_, p.s_top - ms_, p.bh.z - mz_
+            sdd += a * a
+            sds += a * b
+            sss += b * b
+            sdz += a * z
+            ssz += b * z
+        det = sdd * sss - sds * sds
+        if sss / n > 1.0 and det > 1e-6 * sdd * sss:      # boreholes spread across the line
+            kx = (sdd * ssz - sds * sdz) / det
+            lim = math.tan(math.radians(25.0))
+            kx = max(-lim, min(lim, kx))
+    for p in proj:
+        p.kx = kx
+    return kx
+
+
 def project_boreholes(points, boreholes, max_offset, min_gap=0.0):
     line = QgsGeometry.fromPolylineXY(points)
     if len(points) < 2 or line.length() < 1e-6:
         return []          # degenerate (zero-length) section line
     max_dep = max([b.depth for b in boreholes] or [0.0])
-    ext = max_dep + line.length() + 1000.0
+    # the virtual prolongation of the end segments: enough for boreholes that lie beside the
+    # ends of the line, but not so long that it could cut another part of a broken line
+    ext = max_dep + min(max_offset, line.length() + 1000.0) + 10.0
     ext_pts = _extend_polyline(points, ext)
     ext_line = QgsGeometry.fromPolylineXY(ext_pts)
     has_ext = len(ext_pts) >= 2 and ext_line.length() > line.length()
     out = []
+    sp = [(q.x(), q.y()) for q in (ext_pts if has_ext else _extend_polyline(points, 0))]
     for b in boreholes:
         bx, by, _ = b.point_at(b.depth)
         p_top = QgsPointXY(b.x, b.y)
@@ -462,7 +696,8 @@ def project_boreholes(points, boreholes, max_offset, min_gap=0.0):
                 d_top = line.lineLocatePoint(g_top)
                 d_bot = line.lineLocatePoint(g_bot)
             d_mid = 0.5 * (d_top + d_bot)
-            out.append(Projected(b, d_mid, off, d_top, d_bot))
+            out.append(Projected(b, d_mid, off, d_top, d_bot,
+                                 signed_offset(sp, b.x, b.y), signed_offset(sp, bx, by)))
     out.sort(key=lambda p: p.dist)
     return drop_close_boreholes(out, min_gap)
 
@@ -1091,9 +1326,11 @@ def fault_polygons(LA, LB, xa, xb, YA, YB, pos, dip_deg, direction, mA, mB, aspe
     if G is None:
         def G(x):
             return YA(0.0) + (YB(0.0) - YA(0.0)) * (x - xa) / span
-    y_ref = min(YA(top_depths[0]), YB(top_depths[1]))
     y_bot = max(YA(max([lay.bottom for lay in LA] or [0.0])), YB(max([lay.bottom for lay in LB] or [0.0])))
     x_ft = xa + min(max(pos, 0.05), 0.95) * span
+    # the fault plane starts exactly at the ground surface at the requested position: a
+    # different reference height (the higher collar) would shift it along the slope
+    y_ref = G(x_ft)
     sf = 0.0
     if direction and dip_deg < 89.5:
         sf = direction / (max(aspect, 1e-6) * math.tan(math.radians(max(dip_deg, 20.0))))
@@ -1125,32 +1362,175 @@ def fault_polygons(LA, LB, xa, xb, YA, YB, pos, dip_deg, direction, mA, mB, aspe
     return _no_overlap(out), ((xf(y_top), y_top), (xf(y_bot), y_bot))
 
 
+def _ring_area(r):
+    return sum(r[k][0] * r[(k + 1) % len(r)][1] - r[(k + 1) % len(r)][0] * r[k][1]
+               for k in range(len(r))) / 2.0
+
+
+def _cross(o, a, b):
+    return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+
+def _segments_conflict(p, q, a, b, eps):
+    """True when the open segment p-q is crossed or touched by the segment a-b anywhere but at
+    the common end points (a bridge may start and end on a vertex, nowhere else)."""
+    if a == p or a == q or b == p or b == q:
+        # the segments share an end point: only a collinear overlap is a conflict
+        if abs(_cross(p, q, a)) <= eps and abs(_cross(p, q, b)) <= eps:
+            dx, dy = q[0] - p[0], q[1] - p[1]
+            n2 = dx * dx + dy * dy
+            if n2 <= 0.0:
+                return False
+            ta = ((a[0] - p[0]) * dx + (a[1] - p[1]) * dy) / n2
+            tb = ((b[0] - p[0]) * dx + (b[1] - p[1]) * dy) / n2
+            return max(min(ta, tb), 0.0) < min(max(ta, tb), 1.0) - 1e-12
+        return False
+    d1, d2 = _cross(p, q, a), _cross(p, q, b)
+    d3, d4 = _cross(a, b, p), _cross(a, b, q)
+    if ((d1 > eps and d2 < -eps) or (d1 < -eps and d2 > eps)) and \
+            ((d3 > eps and d4 < -eps) or (d3 < -eps and d4 > eps)):
+        return True                                    # proper crossing
+
+    def on_seg(u, v, w):                               # w lies on the segment u-v
+        return (abs(_cross(u, v, w)) <= eps
+                and min(u[0], v[0]) - 1e-9 <= w[0] <= max(u[0], v[0]) + 1e-9
+                and min(u[1], v[1]) - 1e-9 <= w[1] <= max(u[1], v[1]) + 1e-9)
+    return on_seg(p, q, a) or on_seg(p, q, b) or on_seg(a, b, p) or on_seg(a, b, q)
+
+
+def _ring_edges(ring):
+    n = len(ring)
+    return [(ring[k], ring[(k + 1) % n]) for k in range(n)]
+
+
+def _bridge_holes(rings):
+    """One closed outline of a polygon with holes: every hole is joined to the outer ring by
+    a zero-width bridge between two vertices (the hole stays open when filled).
+
+    The bridge is the shortest connection that is VISIBLE: it must not cross or touch any edge
+    of the outline (including the bridges already made), of the hole itself or of the holes still
+    to be joined, and it must run inside the original polygon (its midpoint is in the polygon, not
+    in a hole and not outside).  When no such connection exists (invalid input) the nearest pair
+    is used as the last resort and the problem is reported."""
+    outer = list(rings[0])
+    if len(outer) > 1 and outer[0] == outer[-1]:
+        outer.pop()
+    sign = _ring_area(outer) >= 0
+    holes = []
+    for hole in rings[1:]:
+        hole = list(hole)
+        if len(hole) > 1 and hole[0] == hole[-1]:
+            hole.pop()
+        if len(hole) < 3:
+            continue
+        if (_ring_area(hole) >= 0) == sign:            # the hole runs the other way round
+            hole.reverse()
+        holes.append(hole)
+    orig = [list(rings[0])] + [list(h) for h in holes]    # even-odd test of the bridge midpoint
+    xs = [pt[0] for pt in outer]
+    ys = [pt[1] for pt in outer]
+    scale = max(max(xs) - min(xs), max(ys) - min(ys), 1e-9)
+    eps = 1e-12 * scale * scale                        # tolerance of the orientation tests
+
+    def inside_polygon(pt):
+        return sum(1 for r in orig if len(r) >= 3 and _inside(pt, r)) % 2 == 1
+
+    todo = list(holes)
+    while todo:
+        hole = todo.pop(0)
+        others = [e for h in todo for e in _ring_edges(h)]
+        own = _ring_edges(hole)
+        edges = _ring_edges(outer)
+        pairs = sorted(((outer[a][0] - hole[b][0]) ** 2 + (outer[a][1] - hole[b][1]) ** 2, a, b)
+                       for a in range(len(outer)) for b in range(len(hole)))
+        best = None
+        for _d, i, j in pairs:
+            p, q = outer[i], hole[j]
+            mid = ((p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0)
+            if not inside_polygon(mid):
+                continue
+            if any(_segments_conflict(p, q, u, v, eps) for u, v in edges) or \
+                    any(_segments_conflict(p, q, u, v, eps) for u, v in own) or \
+                    any(_segments_conflict(p, q, u, v, eps) for u, v in others):
+                continue
+            best = (i, j)
+            break
+        if best is None:
+            geometry_issue("2D section: a hole of a polygon could not be joined to the outline by "
+                           "a connection lying inside the polygon (invalid or degenerate "
+                           "geometry); the nearest vertices were used and the fill of that "
+                           "polygon may show an artefact")
+            _d, i, j = pairs[0]
+        else:
+            i, j = best
+        outer = (outer[:i + 1] + hole[j:] + hole[:j] + [hole[j], outer[i]] + outer[i + 1:])
+    return outer
+
+
 def _no_overlap(items):
-    """Safety net: subtract everything already drawn from each polygon."""
+    """Safety net: subtract everything already drawn from each polygon.
+
+    When a GEOS operation fails (the result is a null geometry, or an exception is raised), the
+    polygon is kept as it was - it is NOT corrected - and the failure is written to the QGIS log
+    and registered with geometry_issue(), so the dialog can warn the user that the overlaps of
+    that section were not removed."""
+    acc, out = None, []
     try:
-        acc, out = None, []
         for item in items:
             pts, rest = item[0], item[1:]
-            g = QgsGeometry.fromPolygonXY([[QgsPointXY(x, y) for x, y in pts]])
-            if not g.isGeosValid():
-                g = g.makeValid()
-            if acc is not None:
-                g = g.difference(acc)
-            if g.isNull() or g.isEmpty():
+            raw = QgsGeometry.fromPolygonXY([[QgsPointXY(x, y) for x, y in pts]])
+            g, failed = raw, None
+            try:
+                if not g.isGeosValid():
+                    g = g.makeValid()
+                    if g.isNull():
+                        failed = "makeValid()"
+                if failed is None and acc is not None:
+                    g = g.difference(acc)
+                    if g.isNull():              # an empty result is fine, a null one is an error
+                        failed = "difference()"
+            except Exception as e:
+                failed = f"{type(e).__name__}: {e}"
+            if failed is not None:
+                geometry_issue(f"2D section: GEOS operation {failed} failed - the overlaps of "
+                               f"some polygons were NOT removed (the uncorrected geometry is "
+                               f"shown)")
+                out.append((list(pts),) + rest)
+                try:                           # at least keep the polygon out of the later ones
+                    merged = raw if acc is None else acc.combine(raw)
+                    if not merged.isNull():
+                        acc = merged
+                except Exception as e:
+                    log_warning(f"2D section: combine() of an uncorrected polygon failed: "
+                                f"{type(e).__name__}: {e}")
                 continue
-            acc = g if acc is None else acc.combine(g)
+            if g.isEmpty():
+                continue
+            if acc is None:
+                acc = g
+            else:
+                merged = acc.combine(g)
+                if merged.isNull():
+                    geometry_issue("2D section: GEOS operation combine() failed - later polygons "
+                                   "may overlap the earlier ones")
+                else:
+                    acc = merged
             for part in g.asGeometryCollection():
                 if part.type() != Qgis.GeometryType.Polygon:
                     continue        # degenerate line / point left by difference()
-                poly = part.asQPolygonF()
-                pp = [(poly.at(k).x(), poly.at(k).y()) for k in range(poly.count())]
+                rings = part.asPolygon()
+                if not rings:
+                    continue
+                pp = _bridge_holes([[(q.x(), q.y()) for q in ring] for ring in rings])
                 area = abs(sum(pp[k][0] * pp[(k + 1) % len(pp)][1]
                                - pp[(k + 1) % len(pp)][0] * pp[k][1]
                                for k in range(len(pp)))) / 2.0 if len(pp) >= 3 else 0
                 if area > 1e-6:
                     out.append((pp,) + rest)
         return out
-    except Exception:
+    except Exception as e:
+        geometry_issue(f"2D section: removing the overlaps failed ({type(e).__name__}: {e}) - "
+                       f"the polygons are shown uncorrected and may overlap")
         return items
 
 
@@ -1184,6 +1564,7 @@ def age_boundary_lines(items, offset=1.5):
         if age is None or len(pts) < 3:
             continue
         bi = boxes[i]
+        hi = bi[3] - bi[1]
         cands = [j for j, o in enumerate(items)
                  if j != i and _age_disjoint(age, o[2])
                  and boxes[j][0] <= bi[2] + 2 * offset and boxes[j][2] >= bi[0] - 2 * offset
@@ -1199,11 +1580,13 @@ def age_boundary_lines(items, offset=1.5):
             if ln < 1e-9:
                 continue
             mx, my = (p[0] + q[0]) / 2.0, (p[1] + q[1]) / 2.0
-            nx, ny = -dy / ln * offset, dx / ln * offset
             for j in cands:
                 b = boxes[j]
                 if not (b[0] - offset <= mx <= b[2] + offset and b[1] - offset <= my <= b[3] + offset):
                     continue
+                # the probe must stay inside a thin layer (never jump over it into the next one)
+                off = min(offset, max(0.02, 0.25 * min(hi, b[3] - b[1])))
+                nx, ny = -dy / ln * off, dx / ln * off
                 if _inside((mx + nx, my + ny), items[j][0]) or _inside((mx - nx, my - ny), items[j][0]):
                     flags[k] = True
                     break
@@ -1298,8 +1681,8 @@ def _bh_column_geom(p, X, Y, cw):
       quad(t, b): [(x, y), ...] 4 corners of interval [t, b]
     """
     bh = p.bh
-    x0, y0 = X(p.d_top), Y(bh.z)
-    x1, y1 = X(p.d_bot), Y(bh.z_at(bh.depth))
+    x0, y0 = X(p.d_top), Y(p.z_at(0.0))
+    x1, y1 = X(p.d_bot), Y(p.z_at(bh.depth))
     dx, dy = x1 - x0, y1 - y0
     ln = math.hypot(dx, dy)
     if ln > 1e-9:
@@ -1310,11 +1693,11 @@ def _bh_column_geom(p, X, Y, cw):
     hw = cw / 2.0
 
     def left(md):
-        xc, yc = X(p.d_at(md)), Y(bh.z_at(md))
+        xc, yc = X(p.d_at(md)), Y(p.z_at(md))
         return (xc - hw * nx, yc - hw * ny)
 
     def right(md):
-        xc, yc = X(p.d_at(md)), Y(bh.z_at(md))
+        xc, yc = X(p.d_at(md)), Y(p.z_at(md))
         return (xc + hw * nx, yc + hw * ny)
 
     def quad(top, bot):
@@ -1341,10 +1724,14 @@ def _map_to_inclined(pts, span_ref, x_A, x_B, y_cross_hi=None, y_cross_lo=None):
     return mapped
 
 
-def _fence_secant_inclined(LA, LB, YA, YB, x_A, x_B):
-    """Median apparent dip (scene dy/dx) of correlated contacts between inclined walls."""
+MAX_GROUND_SLOPE = 10.0          # limit of the ground slope (scene dy/dx) between two columns
+
+
+def _fence_secant_inclined(LA, LB, YA, YB, x_A, x_B, zA=0.0, zB=0.0):
+    """Median apparent dip (scene dy/dx) of correlated contacts between inclined walls.
+    zA, zB: elevations of the collars - the same correlation as the one that is drawn."""
     sl = []
-    for i, j in align_layers(LA, LB, 0.0, 0.0):
+    for i, j in align_layers(LA, LB, zA, zB):
         ya_t, yb_t = YA(LA[i].top), YB(LB[j].top)
         dx_t = x_B(yb_t) - x_A(ya_t)
         if abs(dx_t) > 1e-6:
@@ -1378,8 +1765,10 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
 
         tyA = gA["ty"] if abs(gA["ty"]) > 1e-4 else (1e-4 if gA["ty"] >= 0 else -1e-4)
         tyB = gB["ty"] if abs(gB["ty"]) > 1e-4 else (1e-4 if gB["ty"] >= 0 else -1e-4)
-        mxA = gA["tx"] / tyA
-        mxB = gB["tx"] / tyB
+        # a (nearly) horizontal borehole has ty -> 0: the slope would grow to +-10000 while the
+        # layer height is zero; it is limited to the slope of an 85 deg inclination
+        mxA = max(-MAX_WALL_SLOPE, min(MAX_WALL_SLOPE, gA["tx"] / tyA))
+        mxB = max(-MAX_WALL_SLOPE, min(MAX_WALL_SLOPE, gB["tx"] / tyB))
 
         def x_A(y, x0=pRA0[0], y0=pRA0[1], mx=mxA):
             return x0 + mx * (y - y0)
@@ -1404,24 +1793,27 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
             else:
                 y_cross_hi = yc
 
-        def YA(d, bh=a.bh):
-            return Y(bh.z_at(d))
+        def YA(d, pp=a):
+            return Y(pp.z_at(d))
 
-        def YB(d, bh=b.bh):
-            return Y(bh.z_at(d))
+        def YB(d, pp=b):
+            return Y(pp.z_at(d))
 
         LAk, LBk = LAY[id(a.bh)], LAY[id(b.bh)]
+        zA0, zB0 = a.z_at(0.0), b.z_at(0.0)
         faulted = k in faults
         sec = qsec = None
         if not faulted:
-            sec = _fence_secant_inclined(LAk, LBk, YA, YB, x_A, x_B)
+            sec = _fence_secant_inclined(LAk, LBk, YA, YB, x_A, x_B, zA0, zB0)
         matched = sec is not None
         dx_g = pLB0[0] - pRA0[0]
-        ground = (pLB0[1] - pRA0[1]) / dx_g if abs(dx_g) > 1e-6 else 0.0
+        # ground slope; a (nearly) vertical projection must not give a huge slope
+        ground = (max(-MAX_GROUND_SLOPE, min(MAX_GROUND_SLOPE, (pLB0[1] - pRA0[1]) / dx_g))
+                  if abs(dx_g) >= 1.0 else 0.0)
         if faulted:
             qa, qb = _quat_run(LAk), _quat_run(LBk)
             if qa and qb:
-                qsec = _fence_secant_inclined(LAk[:qa], LBk[:qb], YA, YB, x_A, x_B)
+                qsec = _fence_secant_inclined(LAk[:qa], LBk[:qb], YA, YB, x_A, x_B, zA0, zB0)
                 if qsec is None:
                     qsec = ground
         if sec is None:         # nothing correlated: follow the ground surface
@@ -1445,7 +1837,7 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
             continue
         xa, xb, YA, YB, sec, faulted, qsec, matched, x_A, x_B, y_cross_hi, y_cross_lo = fc
         LA, LB = LAY[id(proj[k].bh)], LAY[id(proj[k + 1].bh)]
-        zA, zB = proj[k].bh.z, proj[k + 1].bh.z
+        zA, zB = proj[k].z_at(0.0), proj[k + 1].z_at(0.0)
 
         def map_polys(raw_polys):
             res = []
@@ -1480,6 +1872,22 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
             if line is None:            # only Quaternary cover in both boreholes: no fault line
                 continue
             (fx1, fy1), (fx2, fy2) = line
+            # the fault line, like the polygons, ends where the two inclined boreholes cross
+            lo_y = y_cross_hi if y_cross_hi is not None else -math.inf    # y must stay above
+            hi_y = y_cross_lo if y_cross_lo is not None else math.inf     # and below
+            if lo_y > -math.inf or hi_y < math.inf:
+                t0, t1 = 0.0, 1.0
+                dyl = fy2 - fy1
+                if abs(dyl) < 1e-12:
+                    if not (lo_y < fy1 < hi_y):
+                        continue
+                else:
+                    ta, tb = (lo_y - fy1) / dyl, (hi_y - fy1) / dyl
+                    t0, t1 = max(t0, min(ta, tb)), min(t1, max(ta, tb))
+                    if t1 - t0 <= 1e-9:
+                        continue
+                fx1, fy1, fx2, fy2 = (fx1 + t0 * (fx2 - fx1), fy1 + t0 * dyl,
+                                      fx1 + t1 * (fx2 - fx1), fy1 + t1 * dyl)
             u1, u2 = fx1 / xb, fx2 / xb
             lines.append((((1.0 - u1) * x_A(fy1) + u1 * x_B(fy1), fy1),
                           ((1.0 - u2) * x_A(fy2) + u2 * x_B(fy2), fy2)))
@@ -1509,8 +1917,8 @@ def _section_bounds(proj):
     """(d0, d1, zmax, zmin) accounting for collar and inclined bottom positions."""
     ds = [d for p in proj for d in (p.d_top, p.d_bot)]
     d0, d1 = min(ds), max(ds)
-    zmax = max(p.bh.z for p in proj)
-    zmin = min(p.bh.z_at(p.bh.depth) for p in proj)
+    zmax = max(p.z_at(0.0) for p in proj)
+    zmin = min(p.z_at(p.bh.depth) for p in proj)
     return d0, d1, zmax, zmin
 
 
@@ -1709,7 +2117,7 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
     # terrain (connects borehole collars)
     pen = QPen(QColor(40, 120, 40), 1.6)
     for a, b in zip(proj, proj[1:]):
-        it = scene.addLine(X(a.d_top), Y(a.bh.z), X(b.d_top), Y(b.bh.z), pen)
+        it = scene.addLine(X(a.d_top), Y(a.z_at(0.0)), X(b.d_top), Y(b.z_at(0.0)), pen)
         it.setZValue(3)
         terrain_items.append(it)
 

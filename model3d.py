@@ -71,6 +71,8 @@ def grid_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0,
     cos_dip = {id(b): max(math.cos(math.radians(b.dip)), 1e-4) for b in bhs}
     qth = {}
     qvth = {}
+    # boreholes without any stratigraphy do not say how thick the cover is
+    known = {id(b): any(L.age is not None for L in lay[id(b)]) for b in bhs}
     for b in bhs:
         n = core._quat_run(lay[id(b)])
         md_q = lay[id(b)][n - 1].bottom if n else 0.0
@@ -101,7 +103,9 @@ def grid_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0,
             wts = [(1.0 / (d * d + eps), b) for d, b in near]
             wsum = sum(w for w, _ in wts)
             g = sum(w * b.z for w, b in wts) / wsum                 # ground elevation
-            qt = sum(w * qvth[id(b)] for w, b in wts) / wsum       # vertical Quaternary thickness
+            wk = [(w, b) for w, b in wts if known[id(b)]]
+            qt = (sum(w * qvth[id(b)] for w, b in wk) / sum(w for w, _ in wk)
+                  if wk else 0.0)                                   # vertical Quaternary thickness
             zbot = min(b.z_at(b.depth) for _, b in near)
             i_top = int(math.ceil(g / dz)) - 1          # the top block contains the ground surface
             i_min = int(math.floor(zbot / dz))
@@ -140,7 +144,8 @@ def grid_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0,
                     for w, b in z_wts:
                         cd = cos_dip[id(b)]
                         if mode == "depth":
-                            dep = qth[id(b)] + (dg - qt) / cd
+                            qb = qth[id(b)] if known[id(b)] else qt / cd
+                            dep = qb + (dg - qt) / cd
                         else:
                             dep = (b.z - zc) / cd
                         L = unit_at(lay[id(b)], dep)
@@ -202,12 +207,47 @@ def solid_from_outline(front, back):
     """Closed 3D body (list of faces, each a ring of (x, y, z)) between two congruent
     outlines: the front and back face and one quadrilateral per outline edge."""
     m = len(front)
-    faces = [list(front), list(reversed(back))]
+    # all faces get normals pointing OUT of the body, whatever the direction of the outline
+    # (the 2D section has the Y axis pointing down, which turns the outline over)
+    hx, hy = front[0][0] - back[0][0], front[0][1] - back[0][1]
+    hl = math.hypot(hx, hy)
+    if hl < 1e-12:                                   # no thickness: keep the old behaviour
+        faces = [list(front), list(reversed(back))]
+        for k in range(m):
+            a, b = front[k], front[(k + 1) % m]
+            if math.dist(a, b) >= 1e-6:
+                faces.append([a, b, back[(k + 1) % m], back[k]])
+        return faces
+    nfx, nfy = hx / hl, hy / hl                      # horizontal normal of the front face
+    tx, ty = nfy, -nfx                               # horizontal direction along the panel
+
+    def newell(ring):
+        nx = ny = nz = 0.0
+        for q in range(len(ring)):
+            x1, y1, z1 = ring[q]
+            x2, y2, z2 = ring[(q + 1) % len(ring)]
+            nx += (y1 - y2) * (z1 + z2)
+            ny += (z1 - z2) * (x1 + x2)
+            nz += (x1 - x2) * (y1 + y2)
+        return nx, ny, nz
+
+    def outward(ring, vx, vy, vz):
+        n = newell(ring)
+        return ring if n[0] * vx + n[1] * vy + n[2] * vz >= 0 else list(reversed(ring))
+
+    faces = [outward(list(front), nfx, nfy, 0.0), outward(list(back), -nfx, -nfy, 0.0)]
+    s = [(p[0] * tx + p[1] * ty, p[2]) for p in front]           # outline in (s, z)
+    area = sum(s[q][0] * s[(q + 1) % m][1] - s[(q + 1) % m][0] * s[q][1] for q in range(m))
+    sg = 1.0 if area >= 0 else -1.0                  # counter-clockwise or clockwise
     for k in range(m):
         a, b = front[k], front[(k + 1) % m]
         if math.dist(a, b) < 1e-6:
             continue
-        faces.append([a, b, back[(k + 1) % m], back[k]])
+        ds = (b[0] - a[0]) * tx + (b[1] - a[1]) * ty
+        dz = b[2] - a[2]
+        # outward normal of the edge in (s, z): (dz, -ds) for a CCW outline, the opposite for CW
+        ox, oy, oz = sg * dz * tx, sg * dz * ty, -sg * ds
+        faces.append(outward([a, b, back[(k + 1) % m], back[k]], ox, oy, oz))
     return faces
 
 
@@ -388,6 +428,25 @@ def _default_maxlen(pts):
     return 2.5 * _median(nn)
 
 
+def _chain_edges(pts):
+    """Boreholes lying on one line: the points sorted along the line, each joined to the next
+    one (Delaunay has no triangle there).  Returns [] when they are not collinear."""
+    n = len(pts)
+    if n < 2:
+        return []
+    ax, ay = min(pts)                    # the end points of the line: the farthest pair of the
+    bx, by = max(pts)                    # lexicographic extremes (exact for collinear points)
+    dx, dy = bx - ax, by - ay
+    ln = math.hypot(dx, dy)
+    if ln < 1e-9:
+        return []
+    tol = max(1e-3, 1e-6 * ln)
+    if any(abs((p[0] - ax) * dy - (p[1] - ay) * dx) / ln > tol for p in pts):
+        return []                        # not on one line
+    order = sorted(range(n), key=lambda i: (pts[i][0] - ax) * dx + (pts[i][1] - ay) * dy)
+    return [(min(a, b), max(a, b)) for a, b in zip(order, order[1:])]
+
+
 def neighbour_edges(bhs, mode="grid", maxlen=0.0):
     """Pairs of neighbouring boreholes (indices) that get a panel.
     mode "grid": the nearest borehole in each of four directions (the grid is
@@ -410,7 +469,10 @@ def neighbour_edges(bhs, mode="grid", maxlen=0.0):
     if maxlen <= 0:
         maxlen = 2.5 * _median(nn)
     if mode == "delaunay":
-        return sorted(e for e in delaunay_edges(pts)
+        edges = delaunay_edges(pts) if n >= 3 else []
+        if not edges:                    # collinear boreholes (road, railway, pipeline): no triangle
+            edges = _chain_edges(pts)
+        return sorted(e for e in edges
                       if math.hypot(pts[e[0]][0] - pts[e[1]][0], pts[e[0]][1] - pts[e[1]][1]) <= maxlen)
     theta = 0.25 * math.atan2(sum(math.sin(4 * v) for v in vec), sum(math.cos(4 * v) for v in vec))
     edges = set()
@@ -435,12 +497,24 @@ def _dem_shift(A, B, L, dem, n=40):
     """Terrain-following offset along the panel A-B: the DEM profile minus the straight
     line between the collars, with zero offset at the two boreholes."""
     ds = [L * k / n for k in range(n + 1)]
-    hs = []
-    for d in ds:
-        h = dem(A.x + (B.x - A.x) * d / L, A.y + (B.y - A.y) * d / L)
-        if h is None:
-            return None
-        hs.append(h)
+    hs = [dem(A.x + (B.x - A.x) * d / L, A.y + (B.y - A.y) * d / L) for d in ds]
+    if all(h is None for h in hs):
+        return None
+    # NoData samples: linear interpolation between the neighbouring valid samples (the collars
+    # at the two ends), so the panel follows the DEM like the volume does
+    hs[0] = A.z if hs[0] is None else hs[0]
+    hs[-1] = B.z if hs[-1] is None else hs[-1]
+    k = 1
+    while k < n:
+        if hs[k] is None:
+            k2 = k
+            while hs[k2] is None:
+                k2 += 1
+            for m in range(k, k2):
+                t = (m - (k - 1)) / float(k2 - (k - 1))
+                hs[m] = hs[k - 1] + (hs[k2] - hs[k - 1]) * t
+            k = k2
+        k += 1
     e0, e1 = hs[0] - A.z, hs[-1] - B.z
     offs = [hs[k] - (A.z + (B.z - A.z) * ds[k] / L) - (e0 * (1 - ds[k] / L) + e1 * ds[k] / L)
             for k in range(n + 1)]
@@ -676,6 +750,9 @@ def _wedge(xy, tb):
     return faces
 
 
+MAX_SMOOTH_CELLS = 250_000      # triangle subdivisions of the smooth meshes (Python loops)
+
+
 def fill_smooth(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, max_solids=60000):
     """Interpolated layers between the sections WITHOUT blocks.
 
@@ -708,6 +785,9 @@ def fill_smooth(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, max_solids
     longest = max(math.hypot(pts[a][0] - pts[b][0], pts[a][1] - pts[b][1])
                   for t in tris for a, b in ((t[0], t[1]), (t[1], t[2]), (t[2], t[0])))
     n = max(1, int(math.ceil(longest / cell)))
+    if len(tris) * n * n > MAX_SMOOTH_CELLS:       # before any loop: a tiny cell would freeze QGIS
+        raise ValueError(f"The mesh would have about {len(tris) * n * n:,} cells - increase the "
+                         "mesh size (the limit is {:,}).".format(MAX_SMOOTH_CELLS))
     cache = {}                       # node position -> ({lithology: [(top, bottom), ...]}, g, zbot)
     out = []
 
@@ -769,6 +849,58 @@ def fill_smooth(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, max_solids
     return out
 
 
+def _match_runs(lists):
+    """Group the runs (top, bottom) of ONE lithology of the nodes into bodies.  Nodes with the
+    same number of runs are joined in order (k-th with k-th).  When the numbers differ (sand -
+    clay - sand in one column, a single sand in the next), the runs of the shorter columns are
+    matched in order to the runs of the longest one with the nearest middle elevation (the
+    cheapest order-preserving matching), so the single sand joins the nearer one and the other
+    pinches out instead of cutting through it.  Returns a list of groups, each a list with
+    one run or None per node."""
+    n_max = max(len(q) for q in lists)
+    ref = next(i for i, q in enumerate(lists) if len(q) == n_max)
+    groups = [[None] * len(lists) for _ in range(n_max)]
+    mid = lambda r: (r[0] + r[1]) / 2.0
+    for j, q in enumerate(lists):
+        if j == ref or len(q) == n_max:
+            for k, r in enumerate(q):
+                groups[k][j] = r
+            continue
+        m, n = len(q), n_max
+        INF = float("inf")
+        # dp[i][k]: cheapest cost of matching the first i runs of q within ref runs 0..k-1
+        dp = [[INF] * (n + 1) for _ in range(m + 1)]
+        for k in range(n + 1):
+            dp[0][k] = 0.0
+        for i in range(1, m + 1):
+            for k in range(i, n + 1):
+                dp[i][k] = min(dp[i][k - 1],
+                               dp[i - 1][k - 1] + abs(mid(q[i - 1]) - mid(lists[ref][k - 1])))
+        i, k = m, n
+        while i > 0:                              # backtrack
+            if dp[i][k] == dp[i][k - 1] and k > i:
+                k -= 1
+            else:
+                groups[k - 1][j] = q[i - 1]
+                i -= 1
+                k -= 1
+    return groups
+
+
+def _tip_level(v, z0):
+    """Elevation of the pinch-out tip of a layer missing at node v: the boundary of the
+    node's own layers nearest to z0, so the tip lies BETWEEN two layers and the wedge does not
+    cut through a layer that continues here (never above the ground, never below the bottom)."""
+    bounds = [z for runs in v[2].values() for r in runs for z in (r[0], r[1])]
+    if len(v) > 4:
+        bounds += [v[3], v[4]]
+    if bounds:
+        z0 = min(bounds, key=lambda z: abs(z - z0))
+    if len(v) > 4:
+        z0 = max(min(z0, v[3]), min(v[4], v[3]))
+    return z0
+
+
 def _join_nodes(v3, out):
     """Join three neighbouring mesh nodes (x, y, {lithology: [(top, bottom), ...]}) layer by
     layer into closed bodies with sloped top and bottom faces and append them to `out`.
@@ -782,8 +914,8 @@ def _join_nodes(v3, out):
     xy = [(v[0], v[1]) for v in v3]
     for lit in sorted(lits, key=str):
         lists = [v[2].get(lit, []) for v in v3]
-        for k in range(max(len(q) for q in lists)):
-            runs = [q[k] if k < len(q) else None for q in lists]
+        groups = _match_runs(lists)
+        for runs in groups:
             have = [r for r in runs if r]
             mid = sum((r[0] + r[1]) / 2.0 for r in have) / len(have)
             tb = []
@@ -791,9 +923,7 @@ def _join_nodes(v3, out):
                 if r:
                     tb.append(r)
                     continue
-                z0 = mid                         # pinch-out of the missing layer at this node;
-                if len(v) > 4:                   # never above the ground, never below the bottom
-                    z0 = max(min(z0, v[3]), min(v[4], v[3]))
+                z0 = _tip_level(v, mid)          # pinch-out of the missing layer at this node
                 tb.append((z0, z0))
             if all(r[0] - r[1] < 1e-6 for r in tb):
                 continue
@@ -832,6 +962,7 @@ def smooth_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0
     lay = {id(b): core.clean_layers(b.layers) for b in bhs}
     cos_dip = {id(b): max(math.cos(math.radians(b.dip)), 1e-4) for b in bhs}
     qth, qvth = {}, {}
+    known = {id(b): any(L.age is not None for L in lay[id(b)]) for b in bhs}
     for b in bhs:
         n = core._quat_run(lay[id(b)])
         qth[id(b)] = lay[id(b)][n - 1].bottom if n else 0.0
@@ -854,7 +985,9 @@ def smooth_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0
         wc = _shepard(dl, max(1, k))
         ws = sum(w for w, _ in wc)
         g = sum(w * b.z for w, b in wc) / ws                       # ground elevation
-        qt = sum(w * qvth[id(b)] for w, b in wc) / ws             # vertical Quaternary thickness
+        wk = [(w, b) for w, b in wc if known[id(b)]]
+        qt = (sum(w * qvth[id(b)] for w, b in wk) / sum(w for w, _ in wk)
+              if wk else 0.0)                                       # vertical Quaternary thickness
         zbot = sum(w * b.z_at(b.depth) for w, b in wc) / ws
 
         def vote(z):
@@ -876,7 +1009,8 @@ def smooth_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0
                     L = unit_at(lay[id(b)], (dg * qv / qt) / cd)
                     ok = L is not None and L.age == (0, 0)
                 else:
-                    dep = qth[id(b)] + (dg - qt) / cd if mode == "depth" else (b.z - z) / cd
+                    qb = qth[id(b)] if known[id(b)] else qt / cd
+                    dep = qb + (dg - qt) / cd if mode == "depth" else (b.z - z) / cd
                     L = unit_at(lay[id(b)], dep)
                     ok = L is not None and L.age != (0, 0)
                 if ok:
@@ -932,6 +1066,19 @@ def smooth_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0
         if not tris:
             raise ValueError("No triangle of neighbouring boreholes - increase the maximum "
                              "distance from a borehole.")
+        # Neighbouring triangles must divide their shared side into the same number of parts, or
+        # the nodes on it differ and gaps (T-junctions) appear: n is the same for every triangle,
+        # from the longest side of the whole mesh (as in fill_smooth).
+        longest = 0.0
+        for t in tris:
+            A, B, C = (pts[q] for q in t)
+            longest = max(longest, math.hypot(B[0] - A[0], B[1] - A[1]),
+                          math.hypot(C[0] - B[0], C[1] - B[1]), math.hypot(A[0] - C[0], A[1] - C[1]))
+        est = len(tris) * max(1, int(math.ceil(longest / cell))) ** 2   # cells, checked before the loops
+        if est > MAX_SMOOTH_CELLS:
+            raise ValueError(f"The mesh would have about {est:,} cells - increase the mesh size "
+                             f"(the limit is {MAX_SMOOTH_CELLS:,}).")
+        n_all = max(1, int(math.ceil(longest / cell)))   # ONE division for the whole mesh
         for t in tris:
             idx = list(t)
             A, B, C = (pts[q] for q in idx)
@@ -941,9 +1088,7 @@ def smooth_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0
             if det < 0:
                 idx[1], idx[2] = idx[2], idx[1]
                 A, B, C = (pts[q] for q in idx)
-            side = max(math.hypot(B[0] - A[0], B[1] - A[1]), math.hypot(C[0] - B[0], C[1] - B[1]),
-                       math.hypot(A[0] - C[0], A[1] - C[1]))
-            n = max(1, int(math.ceil(side / cell)))
+            n = n_all
 
             def node(i, j, n=n, A=A, B=B, C=C):
                 a, b, c = (n - i - j) / n, i / n, j / n

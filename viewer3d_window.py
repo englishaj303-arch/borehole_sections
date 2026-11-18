@@ -6,35 +6,17 @@ the page is opened in the default web browser.
 """
 import importlib
 import os
+import time
 
-from qgis.PyQt.QtCore import Qt, QUrl, pyqtSignal
+from qgis.PyQt.QtCore import Qt, QTimer, QUrl, pyqtSignal
 from qgis.PyQt.QtGui import QDesktopServices
 from qgis.PyQt.QtWidgets import (QDialog, QFileDialog, QHBoxLayout, QLabel, QMessageBox,
                                  QPushButton, QVBoxLayout)
 
-from qgis.core import QgsSettings
 
-from . import core
+from . import core, viewer3d
 
 _ENGINE = {}
-
-
-def _webengine_flags():
-    """Called only when the plugin's 3D viewer window is created for the first time (NOT when
-    the plugin or QGIS starts), and can be switched off in the QGIS settings (key
-    borehole_sections/software_webgl = false).
-
-    Recent Chromium versions switch WebGL off when there is no usable GPU driver (remote
-    desktops, virtual machines, old / blocklisted graphics cards) unless the software
-    rasteriser (SwiftShader) is allowed explicitly.  The flags are read when QtWebEngine starts,
-    so they work only if nothing in this QGIS session has started it yet (restart QGIS once)."""
-    if QgsSettings().value("borehole_sections/software_webgl", True, type=bool) is False:
-        return
-    flags = os.environ.get("QTWEBENGINE_CHROMIUM_FLAGS", "")
-    for f in ("--ignore-gpu-blocklist", "--enable-unsafe-swiftshader"):
-        if f not in flags:
-            flags += " " + f
-    os.environ["QTWEBENGINE_CHROMIUM_FLAGS"] = flags.strip()
 
 
 def _try_import(module_name, attr):
@@ -94,8 +76,45 @@ def pattern_tiles(codes, size=256):
     return out
 
 
+_BROWSER_FILES = {}                # path -> time when the web browser was started
+BROWSER_KEEP_MS = 60 * 60 * 1000      # F5 in the browser must keep working for an hour
+
+
 def open_in_browser(path):
-    return QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+    """Open the viewer file in the system browser (it starts asynchronously, so the file is
+    deleted only an hour later, never at once; a file left by a QGIS closed in the meantime is
+    removed by the age cleanup at the next start of the plugin or the next viewer)."""
+    ok = QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+    if ok and path not in _BROWSER_FILES:
+        _BROWSER_FILES[path] = time.time()
+
+        def _later(p=path):
+            _BROWSER_FILES.pop(p, None)
+            viewer3d.remove_file(p)
+        QTimer.singleShot(BROWSER_KEEP_MS, _later)
+    return ok
+
+
+def cleanup_files(min_age=60.0):
+    """Plugin unload: delete the files given to a web browser at least `min_age` seconds ago
+    (the browser has surely read them); younger ones are left to the timer / the age cleanup."""
+    now = time.time()
+    for p, t in list(_BROWSER_FILES.items()):
+        if now - t >= min_age:
+            _BROWSER_FILES.pop(p, None)
+            viewer3d.remove_file(p)
+
+
+def release_file(path):
+    """The window does not need its file any more: delete it, unless a web browser was started
+    with it (that file is removed by the timer of open_in_browser)."""
+    if path and path not in _BROWSER_FILES:
+        viewer3d.remove_file(path)
+
+
+class ViewerUnavailable(RuntimeError):
+    """The embedded viewer cannot be opened with the navigation control (own page with
+    _navigation_allowed); the caller shows the model in the system web browser instead."""
 
 
 class Viewer3DWindow(QDialog):
@@ -125,15 +144,93 @@ class Viewer3DWindow(QDialog):
             b.clicked.connect(fn)
             bar.addWidget(b)
         lay.addLayout(bar)
-        _webengine_flags()                 # only effective before QtWebEngine starts
         self.view = _engine()(self)
+        self._profile = None
+        self._dl_profile = None            # profile whose downloadRequested is connected
+        if not self._make_private_page():
+            # The default QWebEngine page would NOT check the navigation (_navigation_allowed),
+            # so the embedded viewer is not opened at all in that case.
+            self.view.deleteLater()
+            self.view = None
+            self.deleteLater()
+            raise ViewerUnavailable("the page with the navigation control could not be created")
         self._enable_webgl()
         lay.addWidget(self.view, 1)
         self.view.loadFinished.connect(self._loaded)
+        self._connect_downloads()
+
+    def _make_private_page(self):
+        """Own anonymous (off-the-record) profile: the viewer shares neither cookies, cache nor
+        the download handler with the other web views of QGIS, and its page checks every
+        navigation (_navigation_allowed).  Returns False when that page could not be made; the
+        view then still has the default page WITHOUT the navigation control and must not be
+        used."""
+        profile_cls = _first_import(("qgis.PyQt.QtWebEngineCore", "PyQt6.QtWebEngineCore",
+                                     "PyQt5.QtWebEngineWidgets"), "QWebEngineProfile")
+        page_cls = _first_import(("qgis.PyQt.QtWebEngineCore", "PyQt6.QtWebEngineCore",
+                                  "PyQt5.QtWebEngineWidgets"), "QWebEnginePage")
+        if profile_cls is None or page_cls is None:
+            core.log_warning("3D viewer: private web profile not available - the embedded "
+                             "viewer is not opened (navigation could not be restricted)")
+            return False
         try:
-            self.view.page().profile().downloadRequested.connect(self._download)
+            self._profile = profile_cls(self)
+            window = self
+
+            class _ViewerPage(page_cls):
+                """Page that shows only the viewer file itself (no navigation to other files,
+                links or dropped URLs)."""
+
+                def acceptNavigationRequest(self, url, nav_type, is_main_frame):
+                    if not window._navigation_allowed(url, is_main_frame):
+                        core.log_warning(f"3D viewer: navigation blocked: {url.toString()[:200]}")
+                        return False
+                    return super().acceptNavigationRequest(url, nav_type, is_main_frame)
+
+                def createWindow(self, _type):
+                    return None                    # window.open() / target=_blank never opens a window
+
+            self.view.setPage(_ViewerPage(self._profile, self.view))   # page deleted before profile
+            return True
+        except Exception as e:
+            self._profile = None
+            core.log_warning(f"3D viewer: private web profile failed: {type(e).__name__}: {e} - "
+                             f"the embedded viewer is not opened (navigation could not be "
+                             f"restricted)")
+            return False
+
+    def _navigation_allowed(self, url, is_main_frame=True):
+        """Only the loaded viewer file, about:blank and (not in the main frame) the blob: URLs
+        made by the page for the PNG download."""
+        scheme = url.scheme()
+        if scheme == "about":                # (no data: pages - they would escape the CSP)
+            return url.toString() == "about:blank"
+        if scheme == "blob":
+            return not is_main_frame
+        if scheme == "file" and self.path:
+            # realpath on both sides: /var/folders is a link to /private/var/folders on macOS
+            return (os.path.normcase(os.path.realpath(url.toLocalFile()))
+                    == os.path.normcase(os.path.realpath(self.path)))
+        return False
+
+    def _connect_downloads(self):
+        if self._dl_profile is not None:
+            return
+        try:
+            profile = self._profile or self.view.page().profile()
+            profile.downloadRequested.connect(self._download)
+            self._dl_profile = profile
         except Exception as e:                      # PNG export would then not be offered
             core.log_warning(f"3D viewer: downloads not available: {type(e).__name__}: {e}")
+
+    def _disconnect_downloads(self):
+        if self._dl_profile is None:
+            return
+        try:
+            self._dl_profile.downloadRequested.disconnect(self._download)
+        except (TypeError, RuntimeError):
+            pass
+        self._dl_profile = None
 
     def _enable_webgl(self):
         try:
@@ -141,7 +238,10 @@ class Viewer3DWindow(QDialog):
             settings_cls = _first_import(
                 ("qgis.PyQt.QtWebEngineCore", "PyQt6.QtWebEngineCore",
                  "PyQt5.QtWebEngineWidgets"), "QWebEngineSettings") or getattr(
-                mod, "QWebEngineSettings")
+                mod, "QWebEngineSettings", None)
+            if settings_cls is None:
+                core.log_warning("3D viewer: QWebEngineSettings not found, WebGL setting not applied")
+                return
             attr = getattr(settings_cls, "WebAttribute", settings_cls)
             st = self.view.settings()
             for name in ("WebGLEnabled", "Accelerated2dCanvasEnabled"):
@@ -152,7 +252,10 @@ class Viewer3DWindow(QDialog):
 
     # ---- model
     def load(self, path, title=""):
+        if self.path and self.path != path:
+            release_file(self.path)                 # the previous model file is not needed
         self.path = path
+        self._connect_downloads()
         self.lbl.setText(title)
         self.view.load(QUrl.fromLocalFile(path))
         self.show()
@@ -173,17 +276,9 @@ class Viewer3DWindow(QDialog):
         if result == "ok":
             return
         info = str(result or "")
-        core.log_warning(f"3D viewer: the embedded browser has no WebGL 2 ({info}); "
-                         f"QTWEBENGINE_CHROMIUM_FLAGS={os.environ.get('QTWEBENGINE_CHROMIUM_FLAGS', '')}")
+        core.log_warning(f"3D viewer: the embedded browser has no WebGL 2 ({info})")
         self.hide()
-        self.webgl_failed.emit()
-        QMessageBox.information(
-            self.parent() or None, "3D viewer",
-            "The embedded browser of QGIS has no WebGL 2 on this computer, so the model is "
-            "opened in your web browser instead (the next models will go there directly).\n\n"
-            "If you want the embedded window: restart QGIS once (the plugin now allows the "
-            "software renderer when QGIS starts its embedded browser) and untick "
-            "'Open the viewer in the web browser' in tab 3D model.")
+        self.webgl_failed.emit()                # the dialog shows a message-bar note
         if self.path:
             open_in_browser(self.path)
 
@@ -208,23 +303,27 @@ class Viewer3DWindow(QDialog):
     def _is_own_download(self, item):
         """The download profile is shared by the whole QGIS session: handle only downloads that
         come from the page of THIS window (the active-window test is only the fallback)."""
+        if self._profile is not None:                  # private profile: only this window's pages
+            return True
         page_of = getattr(item, "page", None)
         if callable(page_of):
             try:
                 return page_of() is self.view.page()
             except Exception:                          # page already deleted
                 return False
-        return self.isActiveWindow()
+        return False                    # cannot tell where the download comes from: ignore it
 
     def _download(self, item):
         """Screenshot (PNG) button of the viewer."""
         if not self._is_own_download(item):
             return
-        name = item.suggestedFileName() or "model3d.png"
+        name = os.path.basename(item.suggestedFileName() or "") or "model3d.png"
         dst, _ = QFileDialog.getSaveFileName(self, "Save the image", name, "PNG (*.png)")
         if not dst:
             item.cancel()
             return
+        if not dst.lower().endswith(".png"):
+            dst += ".png"
         if hasattr(item, "setDownloadDirectory"):          # Qt 6
             item.setDownloadDirectory(os.path.dirname(dst))
             item.setDownloadFileName(os.path.basename(dst))
@@ -232,6 +331,31 @@ class Viewer3DWindow(QDialog):
             item.setPath(dst)
         item.accept()
 
+    def reject(self):
+        """Esc: QDialog.reject() only hides the window; close() runs closeEvent (WebGL context
+        and temporary file are released)."""
+        self.close()
+
     def closeEvent(self, e):
         self.view.setUrl(QUrl("about:blank"))              # frees the WebGL context and the model
+        self._disconnect_downloads()
+        if self.path:
+            release_file(self.path)                        # big temporary file is not kept
+            self.path = None
         super().closeEvent(e)
+
+    def dispose(self):
+        """Final close (plugin unload): released in the order view -> page -> profile
+        (deleteLater events run in the order they were posted)."""
+        self.close()
+        self._disconnect_downloads()
+        view = self.view
+        page = view.page() if view is not None else None
+        if view is not None:
+            view.deleteLater()                      # 1. the view that shows the page
+        if self._profile is not None:               # only our own page (the view owns the default one)
+            if page is not None:
+                page.deleteLater()                  # 2. the page
+            self._profile.deleteLater()             # 3. the profile, when no page uses it
+            self._profile = None
+        self.deleteLater()
