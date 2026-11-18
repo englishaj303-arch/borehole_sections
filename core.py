@@ -214,8 +214,13 @@ def read_table(path, delimiter=None, max_rows=None, max_bytes=MAX_TABLE_BYTES):
                 continue
     first = next((ln for ln in text[:65536].splitlines() if ln.strip()), "")   # first non-blank line
     if delimiter is None:
+        def _splits(cand):                # the delimiter must split the line outside the quotes
+            try:
+                return len(next(csv.reader([first], delimiter=cand))) > 1
+            except (csv.Error, StopIteration):
+                return False
         for cand in (";", "\t", "|", ","):
-            if cand in first:
+            if cand in first and _splits(cand):
                 delimiter = cand
                 break
         else:
@@ -410,6 +415,9 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
             warnings.append(f"Boreholes file, line {n} ({name}): elevation {z:g} m is outside "
                             f"+-{MAX_ELEV:g} m - skipped")
             continue
+        if depth is None and r[m1["depth"]].strip():
+            warnings.append(f"Boreholes file, line {n} ({name}): invalid total depth "
+                            f"'{r[m1['depth']].strip()}' - the depth of the layers is used")
         if depth is not None and depth < 0:
             warnings.append(f"Boreholes file, line {n} ({name}): negative total depth {depth:g} "
                             "- replaced by 0 (the depth of the layers is used)")
@@ -438,6 +446,12 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
             elif dip < 0.0 or dip > 90.0:
                 warnings.append(f"Boreholes file, line {n} ({name}): dip/deviation {dip:g} outside 0..90 deg - clamped")
                 dip = min(max(dip, 0.0), 90.0)
+            if dip > 89.0:                    # cos(90 deg) = 0: the hole would collapse to zero height
+                warnings.append(f"Boreholes file, line {n} ({name}): dip/deviation {dip:g} deg - limited to 89 deg")
+                dip = 89.0
+            elif dip > 85.0:
+                warnings.append(f"Boreholes file, line {n} ({name}): nearly horizontal borehole "
+                                f"(dip {dip:g} deg) - the 2D section uses at most 85 deg")
 
         if swap:
             sx, sy = sy, sx
@@ -458,8 +472,9 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
                 if not (math.isfinite(qx) and math.isfinite(qy)
                         and abs(qx) <= MAX_COORD and abs(qy) <= MAX_COORD):
                     raise ValueError("outside the valid range")
-            except Exception:
-                warnings.append(f"Boreholes file, line {n}: coordinate transformation failed - skipped")
+            except Exception as e:            # QgsCsException, ValueError (range) and the like
+                warnings.append(f"Boreholes file, line {n}: coordinate transformation failed "
+                                f"({type(e).__name__}: {e}) - skipped")
                 continue
         if name in bhs:
             warnings.append(f"Duplicate borehole '{name}' - last one used")
@@ -1168,8 +1183,10 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
         elif mode == "trans":   # lateral change of lithology, jagged boundary
             ctop, cbot = T, Bt
             amp = min(0.05 * span, 10.0)
-            xl = [x for x in xs if x < xm - amp - 1e-9]
-            xr = [x for x in xs if x > xm + amp + 1e-9]
+            # the sampled grid xs has a step of span / 40; the ends of the jagged band are added so
+            # that the boundary follows the top / bottom curves right up to the zigzag
+            xl = [x for x in xs if x < xm - amp - 1e-9] + [xm - amp]
+            xr = [xm + amp] + [x for x in xs if x > xm + amp + 1e-9]
 
             def cq(x, f, T=T, Bt=Bt):
                 return T(x) + (Bt(x) - T(x)) * f
@@ -1316,7 +1333,7 @@ def _contact_curve(xa, xb, yl, yr, dips, curvature):
 
 
 def fault_polygons(LA, LB, xa, xb, YA, YB, pos, dip_deg, direction, mA, mB, aspect,
-                   G=None, top_depths=(0.0, 0.0)):
+                   G=None):
     """Two separate blocks divided by a fault.  Layers of each borehole continue
     with the dip of their own block and are cut by the fault plane.
     pos 0..1 = fault position between the columns at the surface, direction
@@ -1435,7 +1452,7 @@ def _bridge_holes(rings):
     eps = 1e-12 * scale * scale                        # tolerance of the orientation tests
 
     def inside_polygon(pt):
-        return sum(1 for r in orig if len(r) >= 3 and _inside(pt, r)) % 2 == 1
+        return sum(1 for r in orig if len(r) >= 3 and point_in_polygon(pt, r)) % 2 == 1
 
     todo = list(holes)
     while todo:
@@ -1540,7 +1557,9 @@ def _age_disjoint(a, b):
     return a is not None and b is not None and not ages_compatible(a, b)
 
 
-def _inside(pt, poly):
+def point_in_polygon(pt, poly):
+    """Even-odd test: is the point pt = (x, y) inside the polygon [(x, y), ...]? (one shared
+    implementation, also used by model3d)"""
     x, y = pt
     ins = False
     n = len(poly)
@@ -1589,7 +1608,8 @@ def age_boundary_lines(items, offset=1.5):
                 # the probe must stay inside a thin layer (never jump over it into the next one)
                 off = min(offset, max(0.02, 0.25 * min(hi, b[3] - b[1])))
                 nx, ny = -dy / ln * off, dx / ln * off
-                if _inside((mx + nx, my + ny), items[j][0]) or _inside((mx - nx, my - ny), items[j][0]):
+                if (point_in_polygon((mx + nx, my + ny), items[j][0])
+                        or point_in_polygon((mx - nx, my - ny), items[j][0])):
                     flags[k] = True
                     break
         if not any(flags):
@@ -1754,7 +1774,7 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
     """All correlation polygons of a section (supports both vertical and inclined boreholes).
     faults = {k: {"pos": 0..1, "dip": degrees, "dir": +1/-1/0}} for the fence
     between proj[k] and proj[k+1].  Layers of Quaternary age are not cut by
-    faults.  Returns ([(points, litho, age)], fault_lines)."""
+    faults.  Returns ([(points, litho, age)], fault_lines: one polyline [(x, y), ...] per fault)."""
     faults = faults or {}
     cols_geom = [_bh_column_geom(p, X, Y, cw) for p in proj]
     fences = []
@@ -1856,7 +1876,7 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
             mB = sr if sr is not None else 0.0
             if not use_dip:
                 mA = mB = 0.0
-            G, top = None, (0.0, 0.0)
+            G = None
             if qsec is not None:        # Quaternary cover continues across the fault
                 qa, qb = _quat_run(LA), _quat_run(LB)
                 dq = (LA[qa - 1].bottom, LB[qb - 1].bottom)
@@ -1865,11 +1885,10 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
                 out += map_polys(fence_polygons(LA[:qa], LB[:qb], zA, zB, xa, xb, YA, YB,
                                                 curvature, roundness, dipsq, transitions, None, True))
                 G = _contact_curve(xa, xb, YA(dq[0]), YB(dq[1]), dipsq, curvature)
-                top = dq
                 LA, LB = LA[qa:], LB[qb:]
             polys, line = fault_polygons(LA, LB, xa, xb, YA, YB, f.get("pos", 0.5),
                                          f.get("dip", 80.0), f.get("dir", 1), mA, mB, aspect,
-                                         G, top)
+                                         G)
             out += map_polys(polys)
             if line is None:            # only Quaternary cover in both boreholes: no fault line
                 continue
@@ -1890,9 +1909,16 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
                         continue
                 fx1, fy1, fx2, fy2 = (fx1 + t0 * (fx2 - fx1), fy1 + t0 * dyl,
                                       fx1 + t1 * (fx2 - fx1), fy1 + t1 * dyl)
-            u1, u2 = fx1 / xb, fx2 / xb
-            lines.append((((1.0 - u1) * x_A(fy1) + u1 * x_B(fy1), fy1),
-                          ((1.0 - u2) * x_A(fy2) + u2 * x_B(fy2), fy2)))
+            # boreholes of different inclination: the image of a straight reference line is a
+            # curve in y (x_A(y), x_B(y) differ), so it is sampled in steps along y
+            nseg = 16 if abs(fy2 - fy1) > 1e-9 else 1
+            fpts = []
+            for s in range(nseg + 1):
+                f = s / nseg
+                fx, fy = fx1 + f * (fx2 - fx1), fy1 + f * (fy2 - fy1)
+                u = fx / xb
+                fpts.append(((1.0 - u) * x_A(fy) + u * x_B(fy), fy))
+            lines.append(fpts)               # ONE polyline per fault
             continue
         sl, sr = real_sec(k - 1), real_sec(k + 1)
         dips = (sec, blend_slopes(sl, sec), blend_slopes(sec, sr)) if use_dip else None
@@ -2038,10 +2064,12 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
             it = scene.addPolygon(poly, QPen(c.darker(150), 0.6), QBrush(c))
             it.setZValue(0)
             add_hatch(lambda b, poly=poly: scene.addPolygon(poly, no_pen, b), lit, 0.5)
-        for n_f, ((x1, y1), (x2, y2)) in enumerate(flines, start=1):
-            ln = scene.addLine(x1, y1, x2, y2, QPen(QColor(170, 0, 0), 2.6))
-            ln.setZValue(4)
-            text(f"F{n_f}", x1, y1 - 18, 9, "c", True, QColor(170, 0, 0))
+        for n_f, fpts in enumerate(flines, start=1):
+            pen = QPen(QColor(170, 0, 0), 2.6)
+            for (xa_, ya_), (xb_, yb_) in zip(fpts, fpts[1:]):
+                ln = scene.addLine(xa_, ya_, xb_, yb_, pen)
+                ln.setZValue(4)
+            text(f"F{n_f}", fpts[0][0], fpts[0][1] - 18, 9, "c", True, QColor(170, 0, 0))
 
     # boreholes (vertical or inclined)
     col_geoms = {}

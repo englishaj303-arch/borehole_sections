@@ -4,6 +4,7 @@ The viewer is a self-contained HTML page (WebGL2).  It is shown in an embedded Q
 window when QGIS provides QtWebEngine, otherwise - or when the embedded browser has no WebGL -
 the page is opened in the default web browser.
 """
+import atexit
 import contextlib
 import importlib
 import os
@@ -25,7 +26,8 @@ def _try_import(module_name, attr):
     fails to initialise."""
     try:
         return getattr(importlib.import_module(module_name), attr, None)
-    except Exception:                              # not installed / failed to initialise
+    except (ImportError, AttributeError, RuntimeError) as e:    # not installed / failed to initialise
+        core.log_warning(f"3D viewer: module {module_name} is not usable: {type(e).__name__}: {e}")
         return None
 
 
@@ -98,14 +100,18 @@ def open_in_browser(path):
     return ok
 
 
-def cleanup_files(min_age=60.0):
-    """Plugin unload: delete the files given to a web browser at least `min_age` seconds ago
-    (the browser has surely read them); younger ones are left to the timer / the age cleanup."""
+def cleanup_files(min_age=15.0):
+    """Plugin unload / QGIS exit: delete the files given to a web browser at least `min_age`
+    seconds ago (the browser has read them by then; F5 after QGIS is closed needs 'Save as HTML');
+    younger ones are left to the timer / the age cleanup, so they never stay for hours."""
     now = time.time()
     for p, t in list(_BROWSER_FILES.items()):
         if now - t >= min_age:
             _BROWSER_FILES.pop(p, None)
             viewer3d.remove_file(p)
+
+
+atexit.register(cleanup_files)        # QGIS closed without unloading the plugin
 
 
 def release_file(path):
@@ -149,6 +155,7 @@ class Viewer3DWindow(QDialog):
         lay.addLayout(bar)
         self.view = _engine()(self)
         self._profile = None
+        self._page = None
         self._dl_profile = None            # profile whose downloadRequested is connected
         if not self._make_private_page():
             # The default QWebEngine page would NOT check the navigation (_navigation_allowed),
@@ -191,7 +198,8 @@ class Viewer3DWindow(QDialog):
                 def createWindow(self, _type):
                     return None                    # window.open() / target=_blank never opens a window
 
-            self.view.setPage(_ViewerPage(self._profile, self.view))   # page deleted before profile
+            self._page = _ViewerPage(self._profile, self.view)   # Python reference: the overridden
+            self.view.setPage(self._page)                        # virtual methods need a live wrapper
             return True
         except Exception as e:
             self._profile = None
@@ -245,6 +253,12 @@ class Viewer3DWindow(QDialog):
             for name in ("WebGLEnabled", "Accelerated2dCanvasEnabled"):
                 if hasattr(attr, name):
                     st.setAttribute(getattr(attr, name), True)
+            # the page is self-contained: it needs no other file, no remote content, no storage, no plugins
+            for name in ("LocalContentCanAccessFileUrls", "LocalContentCanAccessRemoteUrls",
+                         "LocalStorageEnabled", "PluginsEnabled", "JavascriptCanOpenWindows",
+                         "AllowRunningInsecureContent"):
+                if hasattr(attr, name):
+                    st.setAttribute(getattr(attr, name), False)
         except Exception as e:
             core.log_warning(f"3D viewer: WebGL setting not applied: {type(e).__name__}: {e}")
 
@@ -252,6 +266,8 @@ class Viewer3DWindow(QDialog):
     def load(self, path, title=""):
         if self.path and self.path != path:
             release_file(self.path)                 # the previous model file is not needed
+        if self.view is None:
+            raise ViewerUnavailable("the viewer window was already disposed")
         self.path = path
         self._connect_downloads()
         self.lbl.setText(title)
@@ -261,6 +277,8 @@ class Viewer3DWindow(QDialog):
         self.activateWindow()
 
     def _loaded(self, ok):
+        if self.view is None:                       # disposed meanwhile
+            return
         if self.view.url().scheme() != "file":      # about:blank set when the window is closed
             return
         if not ok:
@@ -281,9 +299,41 @@ class Viewer3DWindow(QDialog):
             open_in_browser(self.path)
 
     # ---- buttons
+    def _fetch_faults(self, done):
+        """Ask the page for the faults the user added; done(list) gets the cleaned list
+        ([] when the page cannot answer)."""
+        def _got(result):
+            done(viewer3d.sanitize_faults(result))
+        if self.view is None:
+            done([])
+            return
+        try:
+            self.view.page().runJavaScript(
+                "window.__getFaults ? JSON.stringify(window.__getFaults()) : '[]'", _got)
+        except Exception as e:                      # page or view already gone
+            core.log_warning(f"3D viewer: faults could not be read from the page: {type(e).__name__}: {e}")
+            done([])
+
     def in_browser(self):
-        if self.path:
-            open_in_browser(self.path)
+        if not self.path:
+            return
+        path = self.path
+
+        def _open(faults):
+            if not os.path.isfile(path):            # the window was closed / a new model loaded meanwhile
+                return
+            if not faults:
+                open_in_browser(path)
+                return
+            try:                                    # the browser gets a copy that includes the faults
+                with open(path, "r", encoding="utf-8") as fh:
+                    copy = viewer3d.write_html_text(viewer3d.with_faults(fh.read(), faults))
+            except (OSError, RuntimeError) as e:
+                core.log_warning(f"3D viewer: the faults were not passed to the browser: {e}")
+                open_in_browser(path)
+                return
+            open_in_browser(copy)
+        self._fetch_faults(_open)
 
     def save_html(self):
         if not self.path:
@@ -294,11 +344,20 @@ class Viewer3DWindow(QDialog):
             return
         if not dst.lower().endswith((".html", ".htm")):
             dst += ".html"
-        try:
-            with open(self.path, "rb") as src, open(dst, "wb") as out:
-                out.write(src.read())
-        except OSError as e:
-            QMessageBox.warning(self, "Save", str(e))
+        src_path = self.path
+
+        def _write(faults):                         # the faults added in the viewer are saved too
+            if not os.path.isfile(src_path):        # the window was closed / a new model loaded meanwhile
+                QMessageBox.warning(self, "Save", "The 3D viewer file no longer exists; create the model again.")
+                return
+            try:
+                with open(src_path, "r", encoding="utf-8") as src:
+                    html = viewer3d.with_faults(src.read(), faults)
+                with open(dst, "w", encoding="utf-8", newline="") as out:
+                    out.write(html)
+            except (OSError, RuntimeError) as e:
+                QMessageBox.warning(self, "Save", str(e))
+        self._fetch_faults(_write)
 
     def _download(self, item):
         """Screenshot (PNG) button of the viewer."""
@@ -309,11 +368,12 @@ class Viewer3DWindow(QDialog):
             return
         if not dst.lower().endswith(".png"):
             dst += ".png"
-        if hasattr(item, "setDownloadDirectory"):          # Qt 6
-            item.setDownloadDirectory(os.path.dirname(dst))
-            item.setDownloadFileName(os.path.basename(dst))
-        else:                                              # Qt 5
-            item.setPath(dst)
+        if not hasattr(item, "setDownloadDirectory"):
+            core.log_warning("3D viewer: QWebEngineDownloadRequest.setDownloadDirectory is missing")
+            item.cancel()
+            return
+        item.setDownloadDirectory(os.path.dirname(dst))
+        item.setDownloadFileName(os.path.basename(dst))
         item.accept()
 
     def reject(self):
@@ -322,7 +382,9 @@ class Viewer3DWindow(QDialog):
         self.close()
 
     def closeEvent(self, e):
-        self.view.setUrl(QUrl("about:blank"))              # frees the WebGL context and the model
+        if self.view is not None:
+            with contextlib.suppress(RuntimeError):         # the C++ view may be gone already
+                self.view.setUrl(QUrl("about:blank"))       # frees the WebGL context and the model
         self._disconnect_downloads()
         if self.path:
             release_file(self.path)                        # big temporary file is not kept
@@ -331,16 +393,18 @@ class Viewer3DWindow(QDialog):
 
     def dispose(self):
         """Final close (plugin unload): released in the order view -> page -> profile
-        (deleteLater events run in the order they were posted)."""
+        (deleteLater events run in the order they were posted).  Safe to call twice."""
         self.close()
         self._disconnect_downloads()
-        view = self.view
-        page = view.page() if view is not None else None
+        view, page, profile = self.view, self._page, self._profile
+        self.view = self._page = self._profile = None      # no use of deleted C++ objects later
         if view is not None:
-            view.deleteLater()                      # 1. the view that shows the page
-        if self._profile is not None:               # only our own page (the view owns the default one)
+            if page is not None:                    # 1. detach our page from the view, so the view
+                with contextlib.suppress(RuntimeError, TypeError):    # no longer holds it (Qt6 would
+                    view.setPage(None)                                # warn: profile released, page alive)
+            view.deleteLater()                      # 2. the view
+        if profile is not None:                     # only our own page (the view owns the default one)
             if page is not None:
-                page.deleteLater()                  # 2. the page
-            self._profile.deleteLater()             # 3. the profile, when no page uses it
-            self._profile = None
+                page.deleteLater()                  # 3. the page
+            profile.deleteLater()                   # 4. the profile, queued after the page
         self.deleteLater()
