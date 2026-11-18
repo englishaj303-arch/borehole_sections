@@ -16,6 +16,8 @@ Two models are offered:
 """
 import math
 
+from qgis.PyQt.QtGui import QColor
+
 from . import core
 
 CRS = core.CRS_SJTSK
@@ -64,7 +66,7 @@ def grid_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0,
     mode "elevation": layers are horizontal, "depth": layers follow the ground
     surface.  The Quaternary cover is always draped below the ground.
     Returns (prisms, info)."""
-    bhs = [b for b in boreholes if b.layers]
+    bhs = drop_coincident([b for b in boreholes if b.layers])     # two holes at one spot would count twice
     if len(bhs) < 2:
         raise ValueError("At least two boreholes with layers are needed.")
     lay = {id(b): core.clean_layers(b.layers) for b in bhs}
@@ -106,7 +108,9 @@ def grid_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0,
             wk = [(w, b) for w, b in wts if known[id(b)]]
             qt = (sum(w * qvth[id(b)] for w, b in wk) / sum(w for w, _ in wk)
                   if wk else 0.0)                                   # vertical Quaternary thickness
-            zbot = min(b.z_at(b.depth) for _, b in near)
+            # the same weighted base as smooth_model: with the minimum, a change of the set of the k
+            # nearest boreholes made the bottom jump from column to column (stepped overhangs)
+            zbot = sum(w * b.z_at(b.depth) for w, b in wts) / wsum
             i_top = int(math.ceil(g / dz)) - 1          # the top block contains the ground surface
             i_min = int(math.floor(zbot / dz))
             seq = []
@@ -133,12 +137,17 @@ def grid_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0,
                 votes = {}
                 if qt > 0 and dg <= qt:                            # Quaternary cover
                     for w, b in z_wts:
-                        q_vb = qvth[id(b)]
-                        if q_vb <= 0:
-                            continue
                         cd = cos_dip[id(b)]
-                        L = unit_at(lay[id(b)], (dg * q_vb / qt) / cd)
-                        if L is not None and L.age == (0, 0):
+                        if not known[id(b)]:        # no stratigraphy: the cover is not marked, so
+                            L = unit_at(lay[id(b)], dg / cd)   # the layers count by depth (as below)
+                            ok = L is not None
+                        else:
+                            q_vb = qvth[id(b)]
+                            if q_vb <= 0:
+                                continue
+                            L = unit_at(lay[id(b)], (dg * q_vb / qt) / cd)
+                            ok = L is not None and L.age == (0, 0)
+                        if ok:
                             votes[L.litho] = votes.get(L.litho, 0.0) + w
                 else:
                     for w, b in z_wts:
@@ -161,13 +170,17 @@ def grid_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0,
             while j < len(seq):
                 lit = seq[j][1]
                 m = j
-                while m + 1 < len(seq) and seq[m + 1][1] == lit:
+                # voxels of one lithology are merged only inside the cover or only below it,
+                # so the Quaternary base g - qt is kept even when both sides are the same rock
+                while m + 1 < len(seq) and seq[m + 1][1] == lit and seq[m + 1][2] == seq[j][2]:
                     m += 1
                 zbot_run = seq[m][0] * dz
-                if m + 1 < len(seq) and seq[m + 1][2] != seq[m][2] and qt > 0:
-                    zbot_run = g - qt                 # boundary cover / bedrock
-                if m + 1 == len(seq):
-                    zbot_run = seq[m][0] * dz
+                if m + 1 < len(seq):
+                    if seq[m + 1][2] != seq[m][2] and qt > 0:
+                        zbot_run = g - qt             # boundary cover / bedrock
+                elif seq[m][2] and qt > 0:
+                    zbot_run = max(zbot_run, g - qt)  # the column ends in the cover: its true base
+                zbot_run = min(zbot_run, ztop)        # never above the previous block's bottom
                 if lit is not None and ztop - zbot_run > 1e-6:
                     prisms.append((ring, zbot_run, ztop - zbot_run, lit))
                 ztop = zbot_run
@@ -203,19 +216,52 @@ def _densify(P, step):
     return out
 
 
-def solid_from_outline(front, back):
+def solid_from_outline(front, back, thickness=None):
     """Closed 3D body (list of faces, each a ring of (x, y, z)) between two congruent
-    outlines: the front and back face and one quadrilateral per outline edge."""
+    outlines: the front and back face and one quadrilateral per outline edge.
+    `thickness` is the horizontal vector (hx, hy) from the back to the front outline; when it
+    is not given it is taken from the first vertices (which fails for a wedge of zero width)."""
     m = len(front)
     # all faces get normals pointing OUT of the body, whatever the direction of the outline
     # (the 2D section has the Y axis pointing down, which turns the outline over)
-    hx, hy = front[0][0] - back[0][0], front[0][1] - back[0][1]
+    if thickness is None:
+        hx, hy = front[0][0] - back[0][0], front[0][1] - back[0][1]
+    else:
+        hx, hy = thickness
     hl = math.hypot(hx, hy)
+
+    # points closer than _BR_TOL are ONE point (a distance, not a rounding of the coordinates, so a
+    # value lying on a rounding boundary cannot split two equal points)
+    _BR_TOL = 1e-6
+    _cell = 4.0 * _BR_TOL
+
+    def _cells(p):
+        c = [math.floor(v / _cell) for v in p]
+        return [(c[0] + i, c[1] + j, c[2] + k) for i in (-1, 0, 1) for j in (-1, 0, 1) for k in (-1, 0, 1)]
+
+    def _same(p, q):
+        return abs(p[0] - q[0]) <= _BR_TOL and abs(p[1] - q[1]) <= _BR_TOL and abs(p[2] - q[2]) <= _BR_TOL
+
+    # a polygon with a hole is joined by a bridge: the outline runs along it there and back, so
+    # the walls on both sides of the zero-width bridge coincide inside the body (Z-fighting in the
+    # 3D view): an edge whose reverse is also in the outline gets no wall
+    starts = {}                                      # grid cell of an edge start -> [(start, end)]
+    for k in range(m):
+        a, b = front[k], front[(k + 1) % m]
+        starts.setdefault(tuple(math.floor(v / _cell) for v in a), []).append((a, b))
+
+    def _bridge(a, b):                               # is the reverse edge b -> a in the outline?
+        for c in _cells(b):
+            for s0, s1 in starts.get(c, ()):
+                if _same(s0, b) and _same(s1, a):
+                    return True
+        return False
+
     if hl < 1e-12:                                   # no thickness: keep the old behaviour
         faces = [list(front), list(reversed(back))]
         for k in range(m):
             a, b = front[k], front[(k + 1) % m]
-            if math.dist(a, b) >= 1e-6:
+            if math.dist(a, b) >= 1e-6 and not _bridge(a, b):
                 faces.append([a, b, back[(k + 1) % m], back[k]])
         return faces
     nfx, nfy = hx / hl, hy / hl                      # horizontal normal of the front face
@@ -241,7 +287,7 @@ def solid_from_outline(front, back):
     sg = 1.0 if area >= 0 else -1.0                  # counter-clockwise or clockwise
     for k in range(m):
         a, b = front[k], front[(k + 1) % m]
-        if math.dist(a, b) < 1e-6:
+        if math.dist(a, b) < 1e-6 or _bridge(a, b):
             continue
         ds = (b[0] - a[0]) * tx + (b[1] - a[1]) * ty
         dz = b[2] - a[2]
@@ -276,7 +322,7 @@ def fence_solids(geo, locate, width=4.0, step=5.0, shift=None):
             x, y = locate(d)
             front.append((x + hx, y + hy, z))
             back.append((x - hx, y - hy, z))
-        out.append((solid_from_outline(front, back), lit))
+        out.append((solid_from_outline(front, back, (2.0 * hx, 2.0 * hy)), lit))
     return out
 
 
@@ -354,7 +400,7 @@ def build_layers(solids, colors, group_name, edges=False, registry=None, volume=
                 feats.append(f)
             lyr.dataProvider().addFeatures(feats)
             lyr.updateExtents()
-            e = _style_layer(lyr, colors.get(lit, core.QColor(128, 128, 128)), edges)
+            e = _style_layer(lyr, colors.get(lit, QColor(128, 128, 128)), edges)
             state["err"] = state["err"] or e
             QgsProject.instance().addMapLayer(lyr, False)
             group.addLayer(lyr)
@@ -565,19 +611,9 @@ class _Sampler:
         if self.shift:
             z -= self.shift(d)
         for d1, d2, z1, z2, P, lit in self.polys:
-            if d1 <= d <= d2 and z1 <= z <= z2 and _inside(P, d, z):
+            if d1 <= d <= d2 and z1 <= z <= z2 and core.point_in_polygon((d, z), P):
                 return lit
         return None
-
-
-def _inside(P, x, y):
-    inside = False
-    m = len(P)
-    for k in range(m):
-        (x1, y1), (x2, y2) = P[k], P[(k + 1) % m]
-        if (y1 > y) != (y2 > y) and x < x1 + (y - y1) * (x2 - x1) / (y2 - y1):
-            inside = not inside
-    return inside
 
 
 def _clip_convex(poly, tri):
@@ -1005,7 +1041,10 @@ def smooth_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0
             quat = qt > 0 and dg <= qt
             for w, b in _shepard(zd, max(1, k)):
                 cd = cos_dip[id(b)]
-                if quat:                                            # Quaternary cover
+                if quat and not known[id(b)]:       # no stratigraphy: the cover is not marked, so
+                    L = unit_at(lay[id(b)], dg / cd)   # the layers count by depth (as below)
+                    ok = L is not None
+                elif quat:                                          # Quaternary cover
                     qv = qvth[id(b)]
                     if qv <= 0:
                         continue
@@ -1186,8 +1225,12 @@ def network_solids(bhs, edges, make_geo, width=1.0, step=5.0, dz=2.0, dem=None,
         if fill_mode == "blocks":
             volume = fill_between_sections(bhs, cached, dz, cell, maxlen, dem)
         else:
-            volume = fill_smooth(bhs, cached, dz, cell, maxlen, dem)
+            volume = fill_smooth(bhs, cached, dz, cell, maxlen, dem,
+                                 max_solids=max(1, max_solids - len(solids)))   # panels + volume together
     if colw > 0:
         used = {k for e in edges for k in e}
         solids += column_solids([bhs[k] for k in sorted(used)], colw, dz)
+    if len(solids) + len(volume) > max_solids:
+        raise ValueError("The model would contain too many objects - shorten the maximum "
+                         "panel length or select fewer boreholes.")
     return solids, volume
