@@ -54,19 +54,6 @@ select{background:var(--box);border:1px solid var(--line);border-radius:4px;padd
 .hint{opacity:.7;font-size:11px;margin:4px 0 0}
 .lit img.pt{flex:0 0 26px;width:26px;height:18px;border:1px solid var(--line);background:#fff;object-fit:cover}
 #opinfo{font-size:11.5px;margin:2px 0 4px;min-height:1.4em}
-.fl{max-height:130px;overflow:auto;border:1px solid var(--line);border-radius:4px;background:var(--box);user-select:none;min-height:22px}
-.fi{display:flex;align-items:center;gap:6px;padding:2px 5px;cursor:default}
-.fi.sel{background:var(--sel)}
-.fi.off .nm{opacity:.4;text-decoration:line-through}
-.fi .sw{flex:0 0 12px;width:12px;height:12px;border-radius:2px;border:1px solid var(--line)}
-.fi .nm{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-.fi .ds{flex:0 0 auto;font-size:11px;opacity:.75;font-variant-numeric:tabular-nums}
-.fi .ey{flex:0 0 16px;width:16px;height:16px;margin:0;cursor:pointer}
-.row input[type=number],.row input[type=text]{flex:1;min-width:0;background:var(--box);border:1px solid var(--line);border-radius:4px;padding:1px 4px}
-.row input[type=color]{flex:0 0 28px;width:28px;height:20px;padding:0;border:1px solid var(--line);background:none}
-.row select{flex:1;min-width:0}
-#fform.off{opacity:.45}
-.flab{font-weight:600}
 </style>
 </head>
 <body>
@@ -127,38 +114,6 @@ select{background:var(--box);border:1px solid var(--line);border-radius:4px;padd
       <label class="chk"><input type="checkbox" id="cflip"> Keep the other side</label>
     </fieldset>
 
-    <fieldset id="ffs"><legend>Faults</legend>
-      <div class="fl" id="flist"></div>
-      <div class="btns"><button id="fadd">Add fault</button><button id="fdup">Duplicate</button><button id="fdel">Delete</button></div>
-      <div id="fform" class="off">
-        <div class="row"><label for="fname">Name</label><input id="fname" type="text" maxlength="60"></div>
-        <div class="row"><label for="fmode">Position by</label>
-          <select id="fmode"><option value="bh">Between boreholes</option><option value="xy">Coordinates X, Y</option></select></div>
-        <div id="fbh">
-          <div class="row"><label for="fa">Borehole A</label><select id="fa"></select></div>
-          <div class="row"><label for="fb">Borehole B</label><select id="fb"></select></div>
-          <div class="row"><label for="fpos">Position A&rarr;B</label><input id="fpos" type="range" min="0" max="100" step="1"><span class="val" id="fposv"></span></div>
-          <div class="hint" id="fdist"></div>
-        </div>
-        <div id="fxy" style="display:none">
-          <div class="row"><label for="fx">X (east)</label><input id="fx" type="number" step="any"></div>
-          <div class="row"><label for="fy">Y (north)</label><input id="fy" type="number" step="any"></div>
-        </div>
-        <div class="row"><label for="fdd" title="Compass azimuth (0 = N, 90 = E) towards which the fault plane dips">Dip direction</label><input id="fdd" type="number" min="0" max="360" step="1"><span class="val">&deg;</span></div>
-        <div class="btns" id="fdq" style="margin-top:0"><button id="fdta" title="Dip towards borehole A (the fault strikes across the line A-B)">Dip towards A</button><button id="fdtb" title="Dip towards borehole B (the fault strikes across the line A-B)">Dip towards B</button></div>
-        <div class="row"><label for="fdip" title="Angle of the plane from the horizontal; 90 = vertical">Dip angle</label><input id="fdip" type="range" min="1" max="90" step="1"><span class="val" id="fdipv"></span></div>
-        <div class="hint" id="fstrike"></div>
-        <div class="row"><label for="flen" title="Length of the fault along its strike, centred on the position">Length [m]</label><input id="flen" type="number" min="1" step="any"></div>
-        <label class="chk"><input type="checkbox" id="fatop"> <span id="fatopl">Top at ground level (between the boreholes)</span></label>
-        <div class="row"><label for="ftop">Top elevation</label><input id="ftop" type="number" step="any"><span class="val">m</span></div>
-        <label class="chk"><input type="checkbox" id="fabot"> Down to the bottom of the model</label>
-        <div class="row"><label for="fdep" title="Vertical extent of the fault below its top">Depth [m]</label><input id="fdep" type="number" min="1" step="any"></div>
-        <div class="row"><label for="fcol">Colour</label><input id="fcol" type="color"><input id="fal" type="range" min="10" max="90" step="5"><span class="val" id="falv"></span></div>
-      </div>
-      <label class="chk"><input type="checkbox" id="flab" checked> Fault labels</label>
-      <div class="hint">The fault is a plane through the position at the top elevation, dipping towards the dip direction (azimuth, 0 = N, 90 = E; dip 90 = vertical). Length is measured along the strike. The plane is only drawn; the layers are not displaced.</div>
-    </fieldset>
-
     <fieldset><legend>Boreholes</legend>
       <div class="row"><label for="bhm">Traces</label>
         <select id="bhm"><option value="2">On top</option><option value="1">Normal</option><option value="0">Hidden</option></select></div>
@@ -173,8 +128,6 @@ select{background:var(--box);border:1px solid var(--line);border-radius:4px;padd
   </aside>
 </div>
 <script>
-const FAULTS_INIT = /*FAULTS_JSON*/[];
-const FAULT_KEEP = '__borehole_faults__:';
 const SCENE = /*SCENE_JSON*/null;
 (function () {
 'use strict';
@@ -194,13 +147,7 @@ if (!gl) {
 window.__webgl2_ok = true;
 canvas.addEventListener('webglcontextlost', ev => {
   ev.preventDefault();
-  fail('The graphics context was lost (GPU reset or out of memory). Trying to restore it - if nothing happens reload the page (F5) or open the viewer in a web browser.');
-});
-// After the browser restores the context all buffers, textures and shaders are empty: the page is
-// built again from its own data; the faults the user added are carried over in window.name.
-canvas.addEventListener('webglcontextrestored', () => {
-  try { window.name = FAULT_KEEP + JSON.stringify(window.__getFaults ? window.__getFaults() : []); } catch (e) { window.name = ''; }
-  location.reload();
+  fail('The graphics context was lost (GPU reset or out of memory). Reload the page (F5) or open the viewer in a web browser.');
 });
 $('title').textContent = S.title || '3D model';
 document.title = (S.title || '3D model') + ' - Borehole Geology';
@@ -274,11 +221,6 @@ uniform vec3 uColor; uniform float uAlpha; uniform int uMode; uniform vec2 uId;
 uniform int uClipAxis; uniform float uClipPos; uniform float uClipSign;
 layout(location=0) out vec4 o0;
 layout(location=1) out vec4 o1;
-// normalize(vec3(0.0)) is NaN (black pixels): a degenerate or tiny triangle has a zero cross product
-vec3 safeNormal(vec3 c) {
-  float cl = length(c);
-  return cl > 1e-12 ? c / cl : vec3(0.0, 0.0, 1.0);
-}
 void main(){
   if (uClipAxis >= 0) {
     float c = uClipAxis == 0 ? vWorld.x : (uClipAxis == 1 ? vWorld.y : vWorld.z);
@@ -294,29 +236,19 @@ void main(){
     return;
   }
   if (uMode == 2) { o0 = vec4(uColor, uAlpha); o1 = vec4(0.0); return; }
-  vec3 n = safeNormal(cross(dFdx(vPosV), dFdy(vPosV)));
+  vec3 n = normalize(cross(dFdx(vPosV), dFdy(vPosV)));
   vec3 L1 = normalize(vec3(-0.35, 0.55, 0.75));
   vec3 L2 = normalize(vec3(0.6, -0.2, 0.5));
-  // the true (unscaled) geometry: the hatching neither stretches nor switches between the plan and
-  // the wall projection when the vertical scale slider is moved
-  vec3 dWx = dFdx(vWorld), dWy = dFdy(vWorld);
-  vec3 wn = safeNormal(cross(dWx, dWy));
-  // the extra light goes to faces that are horizontal in the WORLD (not to those facing the camera)
-  float l = 0.38 + 0.50 * max(dot(n, L1), 0.0) + 0.22 * max(dot(n, L2), 0.0) + 0.12 * abs(wn.z);
+  float l = 0.38 + 0.50 * max(dot(n, L1), 0.0) + 0.22 * max(dot(n, L2), 0.0) + 0.12 * abs(n.z);
   vec3 col = uColor;
   if (uTexLayer >= 0.0) {          // pattern in world coordinates: plan view on tops, along the wall on vertical faces
+    vec3 wn = normalize(cross(dFdx(vWS), dFdy(vWS)));
     vec2 t = vec2(-wn.y, wn.x);
     float tl = length(t);
     t = tl > 1e-4 ? t / tl : vec2(1.0, 0.0);
-    if (t.x < -1e-3 || (abs(t.x) <= 1e-3 && t.y < 0.0)) t = -t;
-    bool plan = abs(wn.z) > 0.7;
-    vec2 uv = plan ? vWorld.xy : vec2(dot(vWorld.xy, t), vWorld.z);
-    // explicit derivatives of the chosen mapping: no jump of uv between the neighbouring pixels of a
-    // top / wall edge can select the coarsest mip level (dark line along the edge)
-    vec2 sc = uTexScale * vec2(uTexAsp, 1.0);
-    vec2 gx = (plan ? dWx.xy : vec2(dot(dWx.xy, t), dWx.z)) / sc;
-    vec2 gy = (plan ? dWy.xy : vec2(dot(dWy.xy, t), dWy.z)) / sc;
-    float a = textureGrad(uTex, vec3(uv / sc, uTexLayer), gx, gy).a;
+    if (t.x < 0.0 || (t.x == 0.0 && t.y < 0.0)) t = -t;
+    vec2 uv = abs(wn.z) > 0.7 ? vWS.xy : vec2(dot(vWS.xy, t), vWS.z);
+    float a = texture(uTex, vec3(uv / (uTexScale * vec2(uTexAsp, 1.0)), uTexLayer)).a;
     col = mix(col, vec3(0.04), a * 0.9);
   }
   o0 = vec4(col * min(l, 1.15), uAlpha);
@@ -457,7 +389,7 @@ function texAsp(litho) { const c = (S.litho_tex || {})[litho]; const t = (S.tex 
 meshes.forEach(m => { m.tex = texOf(m.litho); m.asp = texAsp(m.litho); });
 // ------------------------------------------------------------------ state
 const st = {
-  fLabels: true, zs: 1, edges: !!S.edges_on, grid: true, ortho: false, bg: '', clipAxis: -1, clipFlip: false, clipFrac: 0.5,
+  zs: 1, edges: !!S.edges_on, grid: true, ortho: false, bg: '', clipAxis: -1, clipFlip: false, clipFrac: 0.5,
   bhMode: 2, bhNames: true, vis: {}, gvis: {}, op: {}, sel: [], tex: false, texSize: 100
 };
 lithos.forEach(l => { st.vis[l] = true; st.op[l] = 1; });
@@ -569,44 +501,26 @@ function drawMeshes(mode) {
   const opaque = list.filter(m => st.op[m.litho] >= 0.999);
   const clear = list.filter(m => st.op[m.litho] < 0.999 && st.op[m.litho] > 0.001);
   gl.uniform1f(U.uAlpha, 1); opaque.forEach(m => one(m));
+  if (clear.length) {
+    const e = eyePos(), zs = st.zs;
+    const parts = [];
+    for (const m of clear) for (const ch of chunksOf(m)) parts.push({m, ch, d: Math.hypot(ch.c[0] - e[0], ch.c[1] - e[1], ch.c[2] * zs - e[2])});
+    parts.sort((a, b) => b.d - a.d);                // far to near
+    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
+    for (const p of parts) { gl.uniform1f(U.uAlpha, st.op[p.m.litho]); one(p.m, p.ch); }
+    gl.depthMask(true); gl.disable(gl.BLEND);
+  }
   gl.disable(gl.POLYGON_OFFSET_FILL);
-  if (st.edges) {                 // before the transparent layers, so that they are blended over the edges
+  if (st.edges) {
     gl.uniform1i(U.uMode, 2);
     gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
     for (const m of list) if (m.vaoE && st.op[m.litho] > 0.001) {
       const c = hex(colors[m.litho]); gl.uniform3f(U.uColor, c[0] * 0.45, c[1] * 0.45, c[2] * 0.45);
       gl.uniform1f(U.uAlpha, Math.max(st.op[m.litho], 0.25));
-      // edges of a transparent layer are tested against the depth but do not write it: the far edges of
-      // a see-through body would otherwise hide the transparent faces lying behind them
-      gl.depthMask(st.op[m.litho] >= 0.999);
       gl.bindVertexArray(m.vaoE); gl.drawElements(gl.LINES, m.nE, gl.UNSIGNED_INT, 0);
     }
-    gl.depthMask(true);
     gl.disable(gl.BLEND);
   }
-  const faultList = fGl.filter(g => g.f.vis);
-  if (clear.length || faultList.length) {
-    const e = eyePos(), zs = st.zs;
-    const parts = [];               // transparent layer chunks and fault planes: ONE far-to-near order
-    for (const m of clear) for (const ch of chunksOf(m)) parts.push({m, ch, d: Math.hypot(ch.c[0] - e[0], ch.c[1] - e[1], ch.c[2] * zs - e[2])});
-    // a fault plane is sorted in cells (each with its own centre), not as one piece: when it cuts the
-    // transparent layers its parts then change their order correctly while the scene is rotated
-    for (const g of faultList) {
-      g.cells.forEach((cl, i) => parts.push({g, cell: i, d: Math.hypot(cl[0] - e[0], cl[1] - e[1], cl[2] * zs - e[2])}));
-      parts.push({g, outline: true, d: Math.hypot(g.c[0] - e[0], g.c[1] - e[1], g.c[2] * zs - e[2])});
-    }
-    parts.sort((a, b) => b.d - a.d);
-    gl.enable(gl.POLYGON_OFFSET_FILL); gl.polygonOffset(1, 1);
-    gl.enable(gl.BLEND); gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA); gl.depthMask(false);
-    for (const p of parts) {
-      if (p.g) { drawFaultPlane(p.g, p.outline ? -1 : p.cell); continue; }
-      gl.uniform1i(U.uMode, 0);
-      gl.uniform1f(U.uAlpha, st.op[p.m.litho]); one(p.m, p.ch);
-    }
-    gl.depthMask(true); gl.disable(gl.BLEND); gl.disable(gl.POLYGON_OFFSET_FILL);
-    clipUniforms();
-  }
-  gl.bindVertexArray(null);
 }
 function drawLines() {
   gl.uniform1i(U.uMode, 2); gl.uniform1i(U.uClipAxis, -1); gl.uniform1f(U.uAlpha, 1);
@@ -682,7 +596,6 @@ function overlay() {
     }
     for (; n < ztick.length; n++) ztick[n].style.display = 'none';
   } else ztick.forEach(e => e.style.display = 'none');
-  placeFaultLabels();
   gizmo();
 }
 function gizmo() {
@@ -760,7 +673,7 @@ canvas.addEventListener('pointermove', e => {
   if (drag) {
     const dx = e.clientX - drag.x, dy = e.clientY - drag.y; drag.x = e.clientX; drag.y = e.clientY; drag.moved += Math.abs(dx) + Math.abs(dy);
     if (drag.pan) {
-      const f = 2 * cam.dist * Math.tan(cam.fov / 2) / H;
+      const f = (cam.ortho ? 2 : 2) * cam.dist * Math.tan(cam.fov / 2) / H;
       const ex = eyePos(), fw = nrm(sub(cam.target, ex)), r = nrm(crs(fw, [0, 0, 1])), u = crs(r, fw);
       for (let a = 0; a < 3; a++) cam.target[a] += -r[a] * dx * f + u[a] * dy * f;
     } else {
@@ -811,16 +724,12 @@ document.querySelectorAll('[data-v]').forEach(b => b.onclick = () => {
 const zsEl = $('zs');
 zsEl.value = st.zs; $('zsv').textContent = st.zs + '\u00d7';
 zsEl.oninput = () => {
-  const n = parseFloat(zsEl.value), o = st.zs, r0 = radius();
-  cam.target[2] *= n / o; st.zs = n;
-  // the bounding sphere grows with the scale: keep the model inside the view and the clipping planes
-  cam.dist *= radius() / r0;
-  $('zsv').textContent = n + '\u00d7';
-  dirty();
+  const n = parseFloat(zsEl.value), o = st.zs;
+  cam.target[2] *= n / o; st.zs = n; $('zsv').textContent = n + '\u00d7'; dirty();
 };
 $('proj').onchange = e => { cam.ortho = e.target.value === 'o'; dirty(); };
 $('bgsel').onchange = e => { st.bg = e.target.value; document.body.className = st.bg + (body.classList.contains('noside') ? ' noside' : ''); dirty(); };
-$('edges').checked = st.edges; if (!S.edges) { $('edges').disabled = true; $('edges').parentNode.title = 'Edges were not exported (they were switched off when the model was built, or the model is very large).'; }
+$('edges').checked = st.edges; if (!S.edges) { $('edges').disabled = true; $('edges').parentNode.title = 'Edges were not exported (very large model).'; }
 $('edges').onchange = e => { st.edges = e.target.checked; dirty(); };
 $('grid').onchange = e => { st.grid = e.target.checked; dirty(); };
 if (!(S.tex || []).length) { $('texrow').style.display = 'none'; $('texsrow').style.display = 'none'; }
@@ -921,259 +830,6 @@ $('shot').onclick = () => {
     document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
   }, 'image/png');
 };
-
-// ------------------------------------------------------------------ faults (planes added by the user)
-const FCOL = ['#d9302c', '#e08a00', '#8e44ad', '#0a7d7d', '#2b6cb0'];
-const faults = [];
-let fSel = null, fSeq = 0, fGl = [];
-const D2R = Math.PI / 180;
-function numIn(v, lo, hi, d) {
-  if (typeof v === 'string' && v.trim() !== '') v = Number(v);
-  return typeof v === 'number' && isFinite(v) ? Math.min(hi, Math.max(lo, v)) : d;
-}
-function bhPoint(i) { const t = traces[i]; return t ? [t.pts[0], t.pts[1], t.pts[2]] : null; }
-function normFault(r) {
-  r = r && typeof r === 'object' ? r : {};
-  const nb = Math.max(traces.length - 1, 0), id = ++fSeq;
-  return {
-    id, name: typeof r.name === 'string' && r.name.trim() ? r.name.slice(0, 60) : 'Fault ' + id,
-    vis: r.vis !== false, mode: r.mode === 'xy' || traces.length < 2 ? 'xy' : 'bh',
-    a: Math.round(numIn(r.a, 0, nb, 0)), b: Math.round(numIn(r.b, 0, nb, Math.min(1, nb))),
-    pos: numIn(r.pos, 0, 100, 50),
-    x: numIn(r.x, -1e9, 1e9, (bmin[0] + bmax[0]) / 2 + ORG[0]), y: numIn(r.y, -1e9, 1e9, (bmin[1] + bmax[1]) / 2 + ORG[1]),
-    dipdir: numIn(r.dipdir, 0, 360, 0) % 360, dip: numIn(r.dip, 1, 90, 60),
-    len: numIn(r.len, 1, 1e7, Math.max(1, Math.round(horiz * 0.6 / 5) * 5)),
-    autoTop: r.autoTop !== false, top: numIn(r.top, -1e7, 1e7, bmax[2]),
-    toBottom: r.toBottom !== false, depth: numIn(r.depth, 1, 1e7, Math.max(1, bmax[2] - bmin[2])),
-    color: typeof r.color === 'string' && /^#[0-9a-fA-F]{6}$/.test(r.color) ? r.color : FCOL[(id - 1) % FCOL.length],
-    alpha: numIn(r.alpha, 0.1, 0.9, 0.45)
-  };
-}
-function bearing(p, q) { return ((Math.atan2(q[0] - p[0], q[1] - p[1]) / D2R) % 360 + 360) % 360; }
-function faultPoint(f) {                      // [x, y] of the fault on the surface (local coordinates)
-  if (f.mode === 'bh') {
-    const A = bhPoint(f.a), B = bhPoint(f.b); if (!A || !B) return null;
-    const t = f.pos / 100; return [A[0] + (B[0] - A[0]) * t, A[1] + (B[1] - A[1]) * t, A[2] + (B[2] - A[2]) * t];
-  }
-  const x = f.x - ORG[0], y = f.y - ORG[1];
-  return [x, y, surfaceZ(x, y)];
-}
-const surfCache = new Map();
-function surfaceZ(x, y) {                     // highest model point above (x, y); the nearest vertex's Z outside the model
-  const key = x + ',' + y; if (surfCache.has(key)) return surfCache.get(key);
-  let best = -Infinity, nz = bmax[2], nd = Infinity;
-  for (const m of meshes) {
-    const P = m.pos, T = m.tri;
-    for (let k = 0; k + 2 < T.length; k += 3) {
-      const a = 3 * T[k], b = 3 * T[k + 1], c = 3 * T[k + 2];
-      const ax = P[a], ay = P[a + 1], bx = P[b], by = P[b + 1], cx = P[c], cy = P[c + 1];
-      for (const q of [a, b, c]) { const d = (P[q] - x) * (P[q] - x) + (P[q + 1] - y) * (P[q + 1] - y); if (d < nd) { nd = d; nz = P[q + 2]; } }
-      const det = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
-      if (Math.abs(det) < 1e-12) continue;                       // vertical or degenerate in plan view
-      const l1 = ((by - cy) * (x - cx) + (cx - bx) * (y - cy)) / det;
-      const l2 = ((cy - ay) * (x - cx) + (ax - cx) * (y - cy)) / det, l3 = 1 - l1 - l2;
-      if (l1 < -1e-6 || l2 < -1e-6 || l3 < -1e-6) continue;
-      const z = l1 * P[a + 2] + l2 * P[b + 2] + l3 * P[c + 2];
-      if (z > best) best = z;
-    }
-  }
-  const z = isFinite(best) ? best : nz;
-  surfCache.set(key, z); return z;
-}
-function faultGeom(f) {
-  const P = faultPoint(f); if (!P) return null;
-  const zt = f.autoTop ? P[2] : f.top;
-  const a = f.dipdir * D2R, d = f.dip * D2R;
-  const dh = [Math.sin(a), Math.cos(a)], s = [Math.cos(a), -Math.sin(a)];       // dip direction, strike (dip to the right)
-  const depth = f.toBottom ? Math.max(1, zt - bmin[2]) : f.depth;
-  const w = Math.min(depth / Math.sin(d), 20 * horiz);                          // width of the plane down the dip
-  const u = [dh[0] * Math.cos(d), dh[1] * Math.cos(d), -Math.sin(d)], h = f.len / 2;
-  const T1 = [P[0] - s[0] * h, P[1] - s[1] * h, zt], T2 = [P[0] + s[0] * h, P[1] + s[1] * h, zt];
-  const mv = (T) => [T[0] + u[0] * w, T[1] + u[1] * w, T[2] + u[2] * w];
-  const B1 = mv(T1), B2 = mv(T2);
-  return {M: [P[0], P[1], zt], T1, T2, B1, B2, u, s: [s[0], s[1], 0], w, depth, zt};
-}
-function freeFaultGl() {
-  fGl.forEach(g => { [g.F, g.L].forEach(o => { gl.deleteVertexArray(o.v); gl.deleteBuffer(o.b); }); g.lab.remove(); });
-  fGl = [];
-}
-function mkVao(arr) {
-  const b = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, b); gl.bufferData(gl.ARRAY_BUFFER, new Float32Array(arr), gl.STATIC_DRAW);
-  const v = gl.createVertexArray(); gl.bindVertexArray(v); gl.enableVertexAttribArray(0);
-  gl.vertexAttribPointer(0, 3, gl.FLOAT, false, 0, 0); gl.bindVertexArray(null); return {b, v};
-}
-function faultText(f) { return (f.name || 'Fault ' + f.id) + '  (dip ' + Math.round(f.dip) + '\u00b0 / ' + String(Math.round(f.dipdir) % 360).padStart(3, '0') + '\u00b0)'; }
-function rebuildFaultGl() {
-  freeFaultGl();
-  for (const f of faults) {
-    const g = faultGeom(f); if (!g) continue;
-    const {T1, T2, B1, B2, u, s} = g;
-    const mid = [(T1[0] + T2[0]) / 2, (T1[1] + T2[1]) / 2, g.zt], al = g.w * 0.35, hd = al * 0.18;
-    const tip = [mid[0] + u[0] * al, mid[1] + u[1] * al, mid[2] + u[2] * al];
-    const barb = k => [tip[0] - u[0] * hd + s[0] * hd * 0.5 * k, tip[1] - u[1] * hd + s[1] * hd * 0.5 * k, tip[2] - u[2] * hd];
-    const NC = 6, lerp = (A, B, t) => [A[0] + (B[0] - A[0]) * t, A[1] + (B[1] - A[1]) * t, A[2] + (B[2] - A[2]) * t];
-    const fill = [], cells = [];             // NC x NC cells along the strike and down the dip
-    for (let i = 0; i < NC; i++) for (let j = 0; j < NC; j++) {
-      const q = (a, b) => { const L = lerp(T1, T2, a / NC), R = lerp(B1, B2, a / NC); return lerp(L, R, b / NC); };
-      const p00 = q(i, j), p10 = q(i + 1, j), p11 = q(i + 1, j + 1), p01 = q(i, j + 1);
-      fill.push(...p00, ...p10, ...p11, ...p00, ...p11, ...p01);
-      cells.push([(p00[0] + p11[0]) / 2, (p00[1] + p11[1]) / 2, (p00[2] + p11[2]) / 2]);
-    }
-    const lines = [].concat(T1, T2, T2, B2, B2, B1, B1, T1, mid, tip, tip, barb(1), tip, barb(-1));
-    const lab = document.createElement('div'); lab.className = 'lab flab'; lab.textContent = faultText(f); labelsDiv.appendChild(lab);
-    fGl.push({f, g, F: mkVao(fill), L: mkVao(lines), nL: lines.length / 3, lab, cells,
-      c: [(T1[0] + T2[0] + B1[0] + B2[0]) / 4, (T1[1] + T2[1] + B1[1] + B2[1]) / 4, (T1[2] + T2[2] + B1[2] + B2[2]) / 4]});
-  }
-  dirty();
-}
-function drawFaultPlane(g, cell) {           // called inside the sorted transparent pass of drawMeshes
-  const f = g.f, c = hex(f.color);           // cell >= 0: one cell of the plane; -1: the outline and the arrow
-  gl.uniform1i(U.uMode, 2); clipUniforms();
-  if (cell >= 0) {
-    gl.uniform3f(U.uColor, c[0], c[1], c[2]); gl.uniform1f(U.uAlpha, f.id === fSel ? Math.min(0.9, f.alpha + 0.2) : f.alpha);
-    gl.bindVertexArray(g.F.v); gl.drawArrays(gl.TRIANGLES, 6 * cell, 6);
-    return;
-  }
-  gl.uniform3f(U.uColor, c[0] * 0.8, c[1] * 0.8, c[2] * 0.8); gl.uniform1f(U.uAlpha, 1);
-  gl.bindVertexArray(g.L.v); gl.drawArrays(gl.LINES, 0, g.nL);
-}
-function placeFaultLabels() {
-  fGl.forEach(g => {
-    const el = g.lab; if (!st.fLabels || !g.f.vis) { el.style.display = 'none'; return; }
-    if (st.clipAxis >= 0) {
-      const c = g.g.M[st.clipAxis], lim = bmin[st.clipAxis] + (bmax[st.clipAxis] - bmin[st.clipAxis]) * st.clipFrac;
-      if ((c - lim) * (st.clipFlip ? -1 : 1) > 0) { el.style.display = 'none'; return; }
-    }
-    const p = project(g.g.M);
-    if (!p || p[0] < -40 || p[0] > W + 40 || p[1] < -20 || p[1] > H + 20) { el.style.display = 'none'; return; }
-    el.style.display = 'block'; el.style.left = p[0] + 'px'; el.style.top = (p[1] - 4) + 'px';
-  });
-}
-
-// --- panel
-const curFault = () => faults.find(f => f.id === fSel) || null;
-const fFields = ['fname', 'fmode', 'fa', 'fb', 'fpos', 'fx', 'fy', 'fdd', 'fdta', 'fdtb', 'fdip', 'flen', 'fatop', 'ftop', 'fabot', 'fdep', 'fcol', 'fal'];
-function fillBoreholeSelects() {
-  ['fa', 'fb'].forEach(id => {
-    const sel = $(id); sel.textContent = '';
-    traces.forEach((t, i) => { const o = document.createElement('option'); o.value = String(i); o.textContent = t.name; sel.appendChild(o); });
-  });
-}
-const r1 = (v, d) => Math.round(v * Math.pow(10, d)) / Math.pow(10, d);
-function refreshDerived() {                        // texts and computed values (never touches a field being typed in)
-  const f = curFault();
-  $('fposv').textContent = f ? Math.round(f.pos) + '%' : '';
-  $('fdipv').textContent = f ? Math.round(f.dip) + '\u00b0' : '';
-  $('falv').textContent = f ? Math.round(f.alpha * 100) + '%' : '';
-  if (!f) { $('fdist').textContent = ''; $('fstrike').textContent = ''; return; }
-  const g = faultGeom(f);
-  $('fstrike').textContent = 'Strike ' + String(Math.round((f.dipdir + 270) % 360)).padStart(3, '0') + '\u00b0' +
-    (g ? '  \u2022  width down the dip ' + r1(g.w, 1) + ' m' : '');
-  if (f.mode === 'bh') {
-    const A = bhPoint(f.a), B = bhPoint(f.b);
-    if (A && B) { const L = Math.hypot(B[0] - A[0], B[1] - A[1]);
-      $('fdist').textContent = 'A\u2013B ' + r1(L, 1) + ' m  \u2022  the fault is ' + r1(L * f.pos / 100, 1) + ' m from A'; }
-  }
-  if (g) {
-    if (f.autoTop && document.activeElement !== $('ftop')) $('ftop').value = r1(g.zt, 2);
-    if (f.toBottom && document.activeElement !== $('fdep')) $('fdep').value = r1(g.depth, 1);
-  }
-}
-function toForm() {
-  const f = curFault(), form = $('fform');
-  form.classList.toggle('off', !f);
-  fFields.forEach(id => { $(id).disabled = !f; });
-  $('fdel').disabled = !f; $('fdup').disabled = !f;
-  if (!f) { $('fname').value = ''; refreshDerived(); return; }
-  $('fname').value = f.name; $('fmode').value = f.mode; $('fa').value = String(f.a); $('fb').value = String(f.b);
-  $('fpos').value = f.pos; $('fx').value = r1(f.x, 2); $('fy').value = r1(f.y, 2);
-  $('fdd').value = r1(f.dipdir, 1); $('fdip').value = f.dip; $('flen').value = r1(f.len, 1);
-  $('fatop').checked = f.autoTop; $('ftop').value = r1(f.top, 2); $('fabot').checked = f.toBottom; $('fdep').value = r1(f.depth, 1);
-  $('fcol').value = f.color; $('fal').value = Math.round(f.alpha * 100);
-  const bh = f.mode === 'bh';
-  $('fbh').style.display = bh ? '' : 'none'; $('fxy').style.display = bh ? 'none' : '';
-  $('fdq').style.display = bh ? '' : 'none';
-  $('fatopl').textContent = bh ? 'Top at ground level (between the boreholes)' : 'Top at the top of the model';
-  $('ftop').disabled = f.autoTop; $('fdep').disabled = f.toBottom;
-  refreshDerived();
-}
-function refreshList() {
-  const box = $('flist'); box.textContent = '';
-  faults.forEach(f => {
-    const row = document.createElement('div'); row.className = 'fi' + (f.id === fSel ? ' sel' : '') + (f.vis ? '' : ' off');
-    const ey = document.createElement('input'); ey.type = 'checkbox'; ey.className = 'ey'; ey.checked = f.vis; ey.title = 'Show / hide this fault';
-    ey.onclick = e => e.stopPropagation();
-    ey.onchange = () => { f.vis = ey.checked; refreshList(); dirty(); };
-    const sw = document.createElement('span'); sw.className = 'sw'; sw.style.background = f.color;
-    const nm = document.createElement('span'); nm.className = 'nm'; nm.textContent = f.name || 'Fault ' + f.id; nm.title = nm.textContent;
-    const ds = document.createElement('span'); ds.className = 'ds'; ds.textContent = Math.round(f.dip) + '\u00b0/' + String(Math.round(f.dipdir) % 360).padStart(3, '0') + '\u00b0';
-    row.append(ey, sw, nm, ds);
-    row.onclick = () => selectFault(f.id);
-    box.appendChild(row);
-  });
-  if (!faults.length) { const h = document.createElement('div'); h.className = 'hint'; h.style.padding = '2px 6px'; h.textContent = 'No faults yet - press \u201cAdd fault\u201d.'; box.appendChild(h); }
-}
-function selectFault(id) { fSel = id; refreshList(); toForm(); dirty(); }
-function changed() { rebuildFaultGl(); refreshList(); refreshDerived(); }
-function addFault(src) {
-  const f = normFault(src || {});
-  if (!src && f.mode === 'bh') f.dipdir = Math.round(bearing(bhPoint(f.a), bhPoint(f.b)));       // dips towards B
-  faults.push(f); fSel = f.id; rebuildFaultGl(); refreshList(); toForm();
-}
-$('fadd').onclick = () => addFault();
-$('fdup').onclick = () => { const f = curFault(); if (f) { const c = Object.assign({}, f); c.name = f.name + ' (copy)'; c.pos = Math.min(100, f.pos + 5); addFault(c); } };
-$('fdel').onclick = () => {
-  const i = faults.findIndex(f => f.id === fSel); if (i < 0) return;
-  faults.splice(i, 1); fSel = faults.length ? faults[Math.min(i, faults.length - 1)].id : null;
-  rebuildFaultGl(); refreshList(); toForm();
-};
-function onForm(fn) { return e => { const f = curFault(); if (!f) return; fn(f, e); changed(); }; }
-const numOr = (id, lo, hi, cur) => numIn($(id).value, lo, hi, cur);
-$('fname').oninput = onForm(f => { f.name = $('fname').value.slice(0, 60); });      // may be empty while the user retypes it
-$('fname').onchange = onForm(f => { if (!f.name.trim()) { f.name = 'Fault ' + f.id; $('fname').value = f.name; } });
-$('fmode').onchange = onForm(f => {
-  const m = $('fmode').value === 'xy' || traces.length < 2 ? 'xy' : 'bh';
-  if (m === 'xy' && f.mode === 'bh') { const P = faultPoint(f); if (P) { f.x = P[0] + ORG[0]; f.y = P[1] + ORG[1]; } }
-  f.mode = m; toForm();
-});
-$('fa').onchange = onForm(f => { f.a = parseInt($('fa').value) || 0; });
-$('fb').onchange = onForm(f => { f.b = parseInt($('fb').value) || 0; });
-$('fpos').oninput = onForm(f => { f.pos = numOr('fpos', 0, 100, f.pos); });
-$('fx').oninput = onForm(f => { f.x = numOr('fx', -1e9, 1e9, f.x); });
-$('fy').oninput = onForm(f => { f.y = numOr('fy', -1e9, 1e9, f.y); });
-$('fdd').oninput = onForm(f => { f.dipdir = numOr('fdd', 0, 360, f.dipdir) % 360; });
-$('fdta').onclick = onForm(f => { const A = bhPoint(f.a), B = bhPoint(f.b); if (A && B && (A[0] !== B[0] || A[1] !== B[1])) { f.dipdir = Math.round(bearing(B, A)); $('fdd').value = f.dipdir; } });
-$('fdtb').onclick = onForm(f => { const A = bhPoint(f.a), B = bhPoint(f.b); if (A && B && (A[0] !== B[0] || A[1] !== B[1])) { f.dipdir = Math.round(bearing(A, B)); $('fdd').value = f.dipdir; } });
-$('fdip').oninput = onForm(f => { f.dip = numOr('fdip', 1, 90, f.dip); });
-$('flen').oninput = onForm(f => { f.len = numOr('flen', 1, 1e7, f.len); });
-$('fatop').onchange = onForm(f => {
-  const g = faultGeom(f); const on = $('fatop').checked;
-  if (!on && g) f.top = r1(g.zt, 2);                                   // keep the current elevation as the manual value
-  f.autoTop = on; $('ftop').disabled = on; $('ftop').value = r1(f.top, 2);
-});
-$('ftop').oninput = onForm(f => { f.top = numOr('ftop', -1e7, 1e7, f.top); });
-$('fabot').onchange = onForm(f => {
-  const g = faultGeom(f); const on = $('fabot').checked;
-  if (!on && g) f.depth = Math.max(1, r1(g.depth, 1));
-  f.toBottom = on; $('fdep').disabled = on; $('fdep').value = r1(f.depth, 1);
-});
-$('fdep').oninput = onForm(f => { f.depth = numOr('fdep', 1, 1e7, f.depth); });
-$('fcol').oninput = onForm(f => { f.color = $('fcol').value; });
-$('fal').oninput = onForm(f => { f.alpha = numOr('fal', 10, 90, f.alpha * 100) / 100; });
-$('flab').onchange = e => { st.fLabels = e.target.checked; dirty(); };
-window.__getFaults = () => faults.map(f => ({name: f.name, vis: f.vis, mode: f.mode, a: f.a, b: f.b, pos: f.pos, x: f.x, y: f.y,
-  dipdir: f.dipdir, dip: f.dip, len: f.len, autoTop: f.autoTop, top: f.top, toBottom: f.toBottom, depth: f.depth, color: f.color, alpha: f.alpha}));
-window.__faults = {faults, faultGeom, normFault, addFault};
-fillBoreholeSelects();
-$('fmode').options[0].disabled = traces.length < 2;      // between boreholes needs two of them
-let faultsStart = Array.isArray(FAULTS_INIT) ? FAULTS_INIT : [];
-if (typeof window.name === 'string' && window.name.indexOf(FAULT_KEEP) === 0) {        // page rebuilt after a lost WebGL context
-  try { const k = JSON.parse(window.name.slice(FAULT_KEEP.length)); if (Array.isArray(k)) faultsStart = k; } catch (e) { /* keep the faults of the file */ }
-  window.name = '';
-}
-faultsStart.slice(0, 200).forEach(r => faults.push(normFault(r)));
-fSel = faults.length ? faults[0].id : null;
-rebuildFaultGl(); refreshList(); toForm();
 
 // ------------------------------------------------------------------ main loop
 function resize() {
