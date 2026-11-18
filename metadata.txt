@@ -72,7 +72,7 @@ changelog=0.24.1 - fixed: lambda assignment in model3d replaced by a def (flake8
 	0.2.1 - fixed bug with importing data on Data tab in S-JTSK coordinates system without minus
 	0.2 - improved importing tab Data
 	0.1 - initial release
-experimental=True
+experimental=False
 deprecated=False
 tags=geology,borehole,cross section,3D,S-JTSK
 
