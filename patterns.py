@@ -154,6 +154,13 @@ def pattern_brush(code, scale=0.45):
 _icons = {}
 
 
+def clear_cache():
+    """Drop all cached QPixmap / QIcon objects (plugin unload, QGIS shutdown): module-level
+    Qt objects must not outlive the QGuiApplication."""
+    _cache.clear()
+    _icons.clear()
+
+
 def icon(code, size=(64, 48)):
     """Small icon of a pattern on white for menus (None for an unknown code); cached."""
     if (code, size) not in _icons:

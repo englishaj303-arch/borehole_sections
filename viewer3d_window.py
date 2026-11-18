@@ -4,6 +4,7 @@ The viewer is a self-contained HTML page (WebGL2).  It is shown in an embedded Q
 window when QGIS provides QtWebEngine, otherwise - or when the embedded browser has no WebGL -
 the page is opened in the default web browser.
 """
+import contextlib
 import importlib
 import os
 import time
@@ -41,8 +42,7 @@ def _engine():
     """QWebEngineView class or None when QtWebEngine is not installed."""
     if "view" not in _ENGINE:
         _ENGINE["view"] = _first_import(
-            ("qgis.PyQt.QtWebEngineWidgets", "PyQt6.QtWebEngineWidgets",
-             "PyQt5.QtWebEngineWidgets"), "QWebEngineView")
+            ("qgis.PyQt.QtWebEngineWidgets",), "QWebEngineView")
     return _ENGINE["view"]
 
 
@@ -70,8 +70,11 @@ def pattern_tiles(codes, size=256):
         ba = QByteArray()
         buf = QBuffer(ba)
         buf.open(QIODevice.OpenModeFlag.WriteOnly)
-        img.save(buf, "PNG")
+        saved = img.save(buf, "PNG")
         buf.close()
+        if not saved:
+            core.log_warning(f"3D viewer: pattern tile {code} could not be encoded")
+            continue
         out[code] = (bytes(ba.data()), asp)
     return out
 
@@ -152,7 +155,7 @@ class Viewer3DWindow(QDialog):
             # so the embedded viewer is not opened at all in that case.
             self.view.deleteLater()
             self.view = None
-            self.deleteLater()
+            self.setParent(None)           # let go of the parent; the unreferenced dialog is freed
             raise ViewerUnavailable("the page with the navigation control could not be created")
         self._enable_webgl()
         lay.addWidget(self.view, 1)
@@ -165,10 +168,8 @@ class Viewer3DWindow(QDialog):
         navigation (_navigation_allowed).  Returns False when that page could not be made; the
         view then still has the default page WITHOUT the navigation control and must not be
         used."""
-        profile_cls = _first_import(("qgis.PyQt.QtWebEngineCore", "PyQt6.QtWebEngineCore",
-                                     "PyQt5.QtWebEngineWidgets"), "QWebEngineProfile")
-        page_cls = _first_import(("qgis.PyQt.QtWebEngineCore", "PyQt6.QtWebEngineCore",
-                                  "PyQt5.QtWebEngineWidgets"), "QWebEnginePage")
+        profile_cls = _first_import(("qgis.PyQt.QtWebEngineCore",), "QWebEngineProfile")
+        page_cls = _first_import(("qgis.PyQt.QtWebEngineCore",), "QWebEnginePage")
         if profile_cls is None or page_cls is None:
             core.log_warning("3D viewer: private web profile not available - the embedded "
                              "viewer is not opened (navigation could not be restricted)")
@@ -217,7 +218,7 @@ class Viewer3DWindow(QDialog):
         if self._dl_profile is not None:
             return
         try:
-            profile = self._profile or self.view.page().profile()
+            profile = self._profile                  # always the private profile (see __init__)
             profile.downloadRequested.connect(self._download)
             self._dl_profile = profile
         except Exception as e:                      # PNG export would then not be offered
@@ -226,18 +227,15 @@ class Viewer3DWindow(QDialog):
     def _disconnect_downloads(self):
         if self._dl_profile is None:
             return
-        try:
+        with contextlib.suppress(TypeError, RuntimeError):     # already disconnected / profile deleted
             self._dl_profile.downloadRequested.disconnect(self._download)
-        except (TypeError, RuntimeError):
-            pass
         self._dl_profile = None
 
     def _enable_webgl(self):
         try:
             mod = importlib.import_module(type(self.view).__module__)
             settings_cls = _first_import(
-                ("qgis.PyQt.QtWebEngineCore", "PyQt6.QtWebEngineCore",
-                 "PyQt5.QtWebEngineWidgets"), "QWebEngineSettings") or getattr(
+                ("qgis.PyQt.QtWebEngineCore",), "QWebEngineSettings") or getattr(
                 mod, "QWebEngineSettings", None)
             if settings_cls is None:
                 core.log_warning("3D viewer: QWebEngineSettings not found, WebGL setting not applied")
@@ -294,29 +292,16 @@ class Viewer3DWindow(QDialog):
                                              "HTML (*.html)")
         if not dst:
             return
+        if not dst.lower().endswith((".html", ".htm")):
+            dst += ".html"
         try:
             with open(self.path, "rb") as src, open(dst, "wb") as out:
                 out.write(src.read())
         except OSError as e:
             QMessageBox.warning(self, "Save", str(e))
 
-    def _is_own_download(self, item):
-        """The download profile is shared by the whole QGIS session: handle only downloads that
-        come from the page of THIS window (the active-window test is only the fallback)."""
-        if self._profile is not None:                  # private profile: only this window's pages
-            return True
-        page_of = getattr(item, "page", None)
-        if callable(page_of):
-            try:
-                return page_of() is self.view.page()
-            except Exception:                          # page already deleted
-                return False
-        return False                    # cannot tell where the download comes from: ignore it
-
     def _download(self, item):
         """Screenshot (PNG) button of the viewer."""
-        if not self._is_own_download(item):
-            return
         name = os.path.basename(item.suggestedFileName() or "") or "model3d.png"
         dst, _ = QFileDialog.getSaveFileName(self, "Save the image", name, "PNG (*.png)")
         if not dst:

@@ -3,6 +3,7 @@ import csv
 import difflib
 import io
 import itertools
+import logging
 import math
 import os
 import re
@@ -209,6 +210,7 @@ def read_table(path, delimiter=None, max_rows=None, max_bytes=MAX_TABLE_BYTES):
                 text = raw.decode(enc)
                 break
             except UnicodeDecodeError:
+                logging.getLogger(__name__).debug("CSV is not %s, trying the next encoding", enc)
                 continue
     first = next((ln for ln in text[:65536].splitlines() if ln.strip()), "")   # first non-blank line
     if delimiter is None:

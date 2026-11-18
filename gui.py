@@ -450,12 +450,10 @@ LY_FIELDS = [("name", "Borehole name", ["name", "borehole", "vrt", "nazev", "id"
 
 def _fit_to_screen(widget, width, height):
     """Resize a window to the wanted size, but never larger than 90 % of the screen."""
-    try:
+    with contextlib.suppress(AttributeError, RuntimeError):      # no screen (yet): keep the size
         scr = widget.screen() or QGuiApplication.primaryScreen()
         area = scr.availableGeometry()
         width, height = min(width, int(area.width() * 0.9)), min(height, int(area.height() * 0.85))
-    except (AttributeError, RuntimeError):
-        pass
     widget.resize(width, height)
 
 
@@ -1698,20 +1696,16 @@ class BoreholeDialog(QDialog):
                                        QgsCoordinateReferenceSystem(core.CRS_SJTSK))
 
     def cleanup(self):
-        try:
+        with contextlib.suppress(TypeError, RuntimeError):      # already disconnected / deleted
             self.tool.aborted.disconnect(self.show)
-        except (TypeError, RuntimeError):
-            pass
         for v in list(self.viewers):
             v.close()
         self.viewers.clear()
         viewer3d_window.cleanup_files()             # files given to a web browser a while ago
-        try:                  # the canvas may already be deleted when QGIS is closing
+        with contextlib.suppress(RuntimeError):       # the canvas may already be deleted when QGIS is closing
             self._drop_line_rb()
             if self.canvas is not None:
                 self.canvas.unsetMapTool(self.tool)
                 sc = self.canvas.scene()
                 if sc is not None:
                     sc.removeItem(self.tool.rb)
-        except RuntimeError:
-            pass

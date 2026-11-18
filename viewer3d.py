@@ -7,7 +7,9 @@ This module is pure Python (no QGIS / Qt imports): it converts the closed solids
 server is needed.
 """
 import base64
+import contextlib
 import json
+import logging
 import math
 import os
 import re
@@ -20,6 +22,7 @@ from collections import Counter
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(HERE, "viewer3d.html")
 PLACEHOLDER = "/*SCENE_JSON*/null"
+_log = logging.getLogger(__name__)
 MAX_EDGE_FACES = 400000          # above this number of faces the edge lines are not exported
 
 
@@ -256,11 +259,37 @@ class _Mesh:
         if len(ring) >= 3:
             self.faces.append(tuple(ring))
 
+    def _quad_vs_triangles(self, count):
+        """Indices of faces forming a wall between two blocks of the same lithology where one
+        block has the wall as ONE quadrilateral and the neighbouring (pinching-out) block as
+        TWO triangles (either diagonal): such a wall is inside the solid and is dropped too."""
+        tri_at = {}
+        for i, f in enumerate(self.faces):
+            if len(f) == 3:
+                key = tuple(sorted(f))
+                if count[key] == 1:
+                    tri_at[key] = i
+        drop = set()
+        if not tri_at:
+            return drop
+        for i, f in enumerate(self.faces):
+            if len(f) != 4 or len(set(f)) != 4 or count[tuple(sorted(f))] != 1:
+                continue
+            a, b, c, d = f
+            for t1, t2 in (((a, b, c), (a, c, d)), ((a, b, d), (b, c, d))):   # the two diagonals
+                i1, i2 = tri_at.get(tuple(sorted(t1))), tri_at.get(tuple(sorted(t2)))
+                if i1 is not None and i2 is not None and i1 not in drop and i2 not in drop:
+                    drop.update((i, i1, i2))
+                    break
+        return drop
+
     def finish(self, edges):
         """Drop faces that appear twice (the wall between two blocks of the same lithology),
         triangulate, return (positions, triangles, edges) as arrays."""
         count = Counter(tuple(sorted(f)) for f in self.faces if len(f) in (3, 4))
-        kept = [f for f in self.faces if len(f) not in (3, 4) or count[tuple(sorted(f))] == 1]
+        drop = self._quad_vs_triangles(count)
+        kept = [f for i, f in enumerate(self.faces)
+                if i not in drop and (len(f) not in (3, 4) or count[tuple(sorted(f))] == 1)]
         tri = array("I")
         for f in kept:
             for t in triangulate_face(f, self.verts):
@@ -421,15 +450,38 @@ def render_html(scene):
 _PREFIX = "borehole_3d_"
 
 
+def _same_dir(a, b):
+    """True when two directories are the same one (real paths: /var -> /private/var on macOS)."""
+    return os.path.normcase(os.path.realpath(a)) == os.path.normcase(os.path.realpath(b))
+
+
 def remove_file(path):
-    """Delete a viewer file made by write_html (never any other file)."""
+    """Delete a viewer file made by write_html (never any other file): the name must start
+    with the plugin prefix, the file must lie directly in the temp directory (compared by
+    real paths) and be a regular file, not a link."""
     try:
         if (os.path.basename(path).startswith(_PREFIX)
-                and os.path.dirname(os.path.abspath(path)) == os.path.abspath(tempfile.gettempdir())
-                and not os.path.islink(path)):
+                and _same_dir(os.path.dirname(os.path.abspath(path)), tempfile.gettempdir())
+                and stat.S_ISREG(os.lstat(path).st_mode)):
             os.remove(path)
-    except OSError:
-        pass
+    except OSError as e:
+        _log.debug("viewer file %s was not removed: %s", path, e)
+
+
+def _temp_dir_is_private():
+    """Age cleanup may touch foreign-looking files only in a temp directory of this user.
+    POSIX: file owners are checked per file.  Windows has no getuid(), so the temp directory
+    must lie inside the user profile (a shared TEMP such as C:\\Temp is not cleaned)."""
+    if hasattr(os, "getuid"):
+        return True
+    profile = os.environ.get("USERPROFILE")
+    if not profile:
+        return False
+    tmp, prof = (os.path.normcase(os.path.realpath(p)) for p in (tempfile.gettempdir(), profile))
+    try:
+        return os.path.commonpath([tmp, prof]) == prof
+    except ValueError:                                # different drives
+        return False
 
 
 def remove_old_files(*a, **k):
@@ -441,11 +493,14 @@ def _remove_old_files(max_age=2 * 3600):
     """Remove viewer files of this plugin older than two hours (the browser timer is one hour) from the temp directory (only
     regular files owned by the current user; links and foreign files are never touched)."""
     d = tempfile.gettempdir()
+    if not _temp_dir_is_private():
+        return
     now = time.time()
     uid = os.getuid() if hasattr(os, "getuid") else None
     try:
         names = os.listdir(d)
-    except OSError:
+    except OSError as e:
+        _log.debug("temp directory cannot be listed: %s", e)
         return
     for f in names:
         if not (f.startswith(_PREFIX) and f.endswith(".html")):
@@ -457,8 +512,8 @@ def _remove_old_files(max_age=2 * 3600):
                 continue
             if now - st.st_mtime > max_age:
                 os.remove(p)
-        except OSError:
-            pass
+        except OSError as e:
+            _log.debug("old viewer file %s was not removed: %s", p, e)
 
 
 def write_html(scene):
@@ -467,7 +522,14 @@ def write_html(scene):
     other local user can pre-create it, replace it by a link or read the exported data."""
     _remove_old_files()
     html = render_html(scene)
-    with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".html",
-                                     prefix=_PREFIX, delete=False) as fh:
-        fh.write(html)
-        return fh.name
+    fh = tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", suffix=".html",
+                                     prefix=_PREFIX, delete=False)
+    name = fh.name
+    try:
+        with fh:
+            fh.write(html)
+    except BaseException:                             # e.g. disk full: do not leave a stub behind
+        with contextlib.suppress(OSError):
+            os.remove(name)
+        raise
+    return name
