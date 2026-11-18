@@ -860,7 +860,10 @@ def _match_runs(lists):
     n_max = max(len(q) for q in lists)
     ref = next(i for i, q in enumerate(lists) if len(q) == n_max)
     groups = [[None] * len(lists) for _ in range(n_max)]
-    mid = lambda r: (r[0] + r[1]) / 2.0
+
+    def mid(r):
+        return (r[0] + r[1]) / 2.0
+
     for j, q in enumerate(lists):
         if j == ref or len(q) == n_max:
             for k, r in enumerate(q):
