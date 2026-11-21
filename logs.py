@@ -127,8 +127,8 @@ def _extent(bhs, mode):
     """(value of the top, value of the bottom) covering all boreholes."""
     if mode == "alt":
         return (max(b.z for b in bhs),
-                min(b.z_at(max([L.bottom for L in b.layers] or [b.depth])) for b in bhs))
-    return 0.0, max(max([L.bottom for L in b.layers] or [b.depth]) for b in bhs)
+                min(b.z_at(max([L.bottom for L in b.layers] + [b.depth])) for b in bhs))
+    return 0.0, max(max([L.bottom for L in b.layers] + [b.depth]) for b in bhs)
 
 
 # ------------------------------------------------------------- 1) profiles
@@ -154,9 +154,8 @@ def _layout_labels(items, line_h):
     return boxes
 
 
-# colours of the geological periods (ICS), same order as core.STRAT_NAMES
-STRAT_COLORS = ["#F9F97F", "#FFE619", "#FD9A52", "#7FC64E", "#34B2C9", "#812B92", "#F04028",
-                "#67A599", "#CB8C37", "#B3E1B6", "#009270", "#7FA056", "#F74370"]
+# colours of the geological periods (ICS): the table STRATIGRAPHY in core.py
+STRAT_COLORS = core.STRAT_COLORS
 STRAT_W = 66.0
 
 
@@ -215,7 +214,7 @@ def build_profiles(bhs, colors, patterns, mode="depth", px_per_m=0.0, measure=ap
         # three header lines with 20 px between them (name 15 pt, the others 8 pt)
         cmds.append(_text(bh.name, x0 + COL_W / 2, TOP - 62, 15, "c", bold=True))
         if bh.dip > 0:
-            cmds.append(_text(f"az {bh.azimuth:g}°, dip {bh.dip:g}°",
+            cmds.append(_text(f"az {bh.azimuth:g}°, incl {bh.dip:g}°",
                               x0 + COL_W / 2, TOP - 40, 8, "c"))
         cmds.append(_text("Lithology", x0 + COL_W / 2, TOP - 20, 8, "c"))
         # ground marker
@@ -243,6 +242,11 @@ def build_profiles(bhs, colors, patterns, mode="depth", px_per_m=0.0, measure=ap
             cy = (b0 + b1) / 2 - len(lines) * line_h / 2
             for i, s in enumerate(lines):
                 cmds.append(_text(s, (lx0 + lx1) / 2, cy + i * line_h - 1, 10, "c"))
+        if layers and bh.depth > max(L.bottom for L in layers) + 1e-6:      # part without a description
+            last = max(L.bottom for L in layers)
+            a = last if mode == "depth" else bh.z_at(last)
+            b = bh.depth if mode == "depth" else bh.z_at(bh.depth)
+            cmds.append(_rect(x0, y_of(a), COL_W, y_of(b) - y_of(a), "#ffffff", "#000000", 0.6))
         # stratigraphy column
         if sw:
             cmds.append(_text("Stratigraphy", sx + sw / 2, TOP - 20, 8, "c"))
@@ -289,7 +293,7 @@ def build_records(bhs, colors, grains, patterns=None, px_per_m=0.0, measure=appr
     # width of the widest ruler label: the ruler of the next borehole must not run into the
     # previous column (altitudes such as -1250.5 m), and the first one needs room on the left
     lo_v, hi_v = (v_top, v_bot) if mode == "depth" else (v_bot, v_top)
-    lab_w = max(measure(f"{v:g}", 9.0) for v in (lo_v, hi_v, (lo_v + hi_v) / 2.0))
+    lab_w = max(measure(_fmt(v, _nice_steps(k)[0]), 9.0) for v in (lo_v, hi_v, (lo_v + hi_v) / 2.0))
     ruler_room = lab_w + 30.0                     # tick + gap + label
     x0 = max(100.0, ruler_room + 12.0)
     pitch = gw + max(100.0, ruler_room + 40.0)
@@ -302,10 +306,10 @@ def build_records(bhs, colors, grains, patterns=None, px_per_m=0.0, measure=appr
                lambda v: f"{v:g}")
         if n == 0:
             cmds.append(_text("Depth [m]" if mode == "depth" else "Altitude [m a.s.l.]",
-                              x0 - 60, REC_TOP - HEAD_H - 40, 9, "l", bold=True))
+                              x0 - 60, REC_TOP - HEAD_H - 12, 9, "l", bold=True))   # not under the name
         cmds.append(_text(bh.name, x0 + gw / 2, REC_TOP - HEAD_H - 46, 14, "c", bold=True))
         if bh.dip > 0:                  # inclined hole: the depths are measured along the hole
-            cmds.append(_text(f"az {bh.azimuth:g}°, dip {bh.dip:g}°",
+            cmds.append(_text(f"az {bh.azimuth:g}°, incl {bh.dip:g}°",
                               x0 + gw / 2, REC_TOP - HEAD_H - 24, 8, "c"))
         # header: four grain-size cells with vertical captions
         for i, g in enumerate(GRAINS):
@@ -327,6 +331,11 @@ def build_records(bhs, colors, grains, patterns=None, px_per_m=0.0, measure=appr
                 cmds.append(_rect(x0, y1, w, y2 - y1, None, "#000000", 0.0, patterns[L.litho]))
             if (L.litho, L.desc or L.litho) not in used:
                 used.append((L.litho, L.desc or L.litho))
+        if layers and bh.depth > max(L.bottom for L in layers) + 1e-6:      # part without a description
+            last = max(L.bottom for L in layers)
+            a = last if mode == "depth" else bh.z_at(last)
+            b = bh.depth if mode == "depth" else bh.z_at(bh.depth)
+            cmds.append(_rect(x0, y_of(a), gw, y_of(b) - y_of(a), "#ffffff", "#000000", 0.9))
         if letters:
             cmds.append(_text(string.ascii_lowercase[n % 26], x0 + gw / 2, bottom_px + 12, 14,
                               "c", bold=True))

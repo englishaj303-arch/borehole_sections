@@ -26,7 +26,7 @@ def _try_import(module_name, attr):
     fails to initialise."""
     try:
         return getattr(importlib.import_module(module_name), attr, None)
-    except (ImportError, AttributeError, RuntimeError) as e:    # not installed / failed to initialise
+    except (ImportError, AttributeError, RuntimeError, OSError, SystemError) as e:   # not installed / failed to initialise / missing shared library
         core.log_warning(f"3D viewer: module {module_name} is not usable: {type(e).__name__}: {e}")
         return None
 
@@ -82,6 +82,7 @@ def pattern_tiles(codes, size=256):
 
 
 _BROWSER_FILES = {}                # path -> time when the web browser was started
+_BROWSER_TIMERS = {}               # path -> QTimer that deletes the file (stopped on unload)
 BROWSER_KEEP_MS = 60 * 60 * 1000      # F5 in the browser must keep working for an hour
 
 
@@ -95,8 +96,15 @@ def open_in_browser(path):
 
         def _later(p=path):
             _BROWSER_FILES.pop(p, None)
+            t = _BROWSER_TIMERS.pop(p, None)
+            if t is not None:
+                t.deleteLater()
             viewer3d.remove_file(p)
-        QTimer.singleShot(BROWSER_KEEP_MS, _later)
+        timer = QTimer()                  # kept here (not a bare singleShot), so unload can stop it
+        timer.setSingleShot(True)
+        timer.timeout.connect(_later)
+        _BROWSER_TIMERS[path] = timer
+        timer.start(BROWSER_KEEP_MS)
     return ok
 
 
@@ -108,15 +116,47 @@ def cleanup_files(min_age=15.0):
     for p, t in list(_BROWSER_FILES.items()):
         if now - t >= min_age:
             _BROWSER_FILES.pop(p, None)
+            _stop_timer(p)
             viewer3d.remove_file(p)
 
 
-atexit.register(cleanup_files)        # QGIS closed without unloading the plugin
+def _stop_timer(path):
+    timer = _BROWSER_TIMERS.pop(path, None)
+    if timer is not None:
+        with contextlib.suppress(RuntimeError):          # the C++ object may be gone already
+            timer.stop()
+            timer.deleteLater()
+
+
+_ATEXIT = [False]
+
+
+def _register_atexit():
+    """cleanup_files at the end of QGIS (once; stop_timers takes it back when the plugin is
+    unloaded, so a reloaded module does not leave a second registration behind)."""
+    if not _ATEXIT[0]:
+        atexit.register(cleanup_files)
+        _ATEXIT[0] = True
+
+
+def stop_timers():
+    """Plugin unload: stop every pending deletion timer (nothing of the plugin stays in the Qt
+    event loop); the files they would delete are removed by cleanup_files or, when they are
+    younger than its limit, by the age cleanup at the next start."""
+    for p in list(_BROWSER_TIMERS):
+        _stop_timer(p)
+    if _ATEXIT[0]:
+        atexit.unregister(cleanup_files)
+        _ATEXIT[0] = False
+
+
+_register_atexit()                   # QGIS closed without unloading the plugin
 
 
 def release_file(path):
     """The window does not need its file any more: delete it, unless a web browser was started
     with it (that file is removed by the timer of open_in_browser)."""
+    _register_atexit()                   # the plugin is in use again after an unload
     if path and path not in _BROWSER_FILES:
         viewer3d.remove_file(path)
 
@@ -182,7 +222,7 @@ class Viewer3DWindow(QDialog):
                              "viewer is not opened (navigation could not be restricted)")
             return False
         try:
-            self._profile = profile_cls(self)
+            self._profile = profile_cls()               # no C++ parent: dispose() controls its life
             window = self
 
             class _ViewerPage(page_cls):
@@ -209,13 +249,12 @@ class Viewer3DWindow(QDialog):
             return False
 
     def _navigation_allowed(self, url, is_main_frame=True):
-        """Only the loaded viewer file, about:blank and (not in the main frame) the blob: URLs
-        made by the page for the PNG download."""
+        """Only the loaded viewer file and about:blank.  The PNG download needs no navigation
+        (it goes through downloadRequested), so blob: URLs are refused everywhere - in
+        Chromium a blob: URL shares the origin of its parent file:// page."""
         scheme = url.scheme()
         if scheme == "about":                # (no data: pages - they would escape the CSP)
             return url.toString() == "about:blank"
-        if scheme == "blob":
-            return not is_main_frame
         if scheme == "file" and self.path:
             # realpath on both sides: /var/folders is a link to /private/var/folders on macOS
             return (os.path.normcase(os.path.realpath(url.toLocalFile()))
@@ -264,10 +303,32 @@ class Viewer3DWindow(QDialog):
 
     # ---- model
     def load(self, path, title=""):
-        if self.path and self.path != path:
-            release_file(self.path)                 # the previous model file is not needed
         if self.view is None:
             raise ViewerUnavailable("the viewer window was already disposed")
+        old = self.path
+        if old and old != path and self.view.url().scheme() == "file":
+            # the faults the user added in the open window go into the new model, like when the
+            # model is opened in a web browser or saved
+            self._fetch_faults(lambda faults: self._load_with_faults(path, title, old, faults))
+            return
+        self._load_now(path, title, old)
+
+    def _load_with_faults(self, path, title, old, faults):
+        if self.view is None:                       # disposed while the page was asked
+            return
+        if faults and os.path.isfile(path) and not os.path.islink(path):
+            try:
+                with open(path, "r", encoding="utf-8") as src:
+                    html = viewer3d.with_faults(src.read(), faults)
+                with open(path, "w", encoding="utf-8", newline="") as out:
+                    out.write(html)
+            except (OSError, RuntimeError) as e:
+                core.log_warning(f"3D viewer: the faults were not carried over: {e}")
+        self._load_now(path, title, old)
+
+    def _load_now(self, path, title, old):
+        if old and old != path:
+            release_file(old)                       # the previous model file is not needed
         self.path = path
         self._connect_downloads()
         self.lbl.setText(title)
@@ -282,7 +343,12 @@ class Viewer3DWindow(QDialog):
         if self.view.url().scheme() != "file":      # about:blank set when the window is closed
             return
         if not ok:
-            QMessageBox.warning(self, "3D viewer", "The viewer page could not be loaded.")
+            # loadFinished(False) of an older, already replaced file must not raise the dialog
+            current = self.view.url().toLocalFile()
+            if (self.path and current
+                    and os.path.realpath(current) == os.path.realpath(self.path)
+                    and os.path.isfile(self.path)):
+                QMessageBox.warning(self, "3D viewer", "The viewer page could not be loaded.")
             return
         self.view.page().runJavaScript(
             "window.__webgl2_ok === true ? 'ok' : 'fail: ' + (window.__webgl_info || '')",
@@ -335,8 +401,20 @@ class Viewer3DWindow(QDialog):
             open_in_browser(copy)
         self._fetch_faults(_open)
 
+    def _may_overwrite(self, path):
+        """True when `path` does not exist or the user agrees to replace it (the file dialog asks
+        only about the name as typed, so a file that exists under the name with the added suffix
+        would be replaced silently)."""
+        if not os.path.exists(path):
+            return True
+        yes = QMessageBox.StandardButton.Yes
+        return QMessageBox.question(self, "Save", f"{os.path.basename(path)} already exists. Replace it?",
+                                    yes | QMessageBox.StandardButton.No,
+                                    QMessageBox.StandardButton.No) == yes
+
     def save_html(self):
-        if not self.path:
+        src_path = self.path                        # before the dialog: closing the window clears self.path
+        if not src_path:
             return
         dst, _ = QFileDialog.getSaveFileName(self, "Save the 3D viewer", "borehole_model_3d.html",
                                              "HTML (*.html)")
@@ -344,10 +422,11 @@ class Viewer3DWindow(QDialog):
             return
         if not dst.lower().endswith((".html", ".htm")):
             dst += ".html"
-        src_path = self.path
+            if not self._may_overwrite(dst):        # the dialog checked the name without the suffix
+                return
 
         def _write(faults):                         # the faults added in the viewer are saved too
-            if not os.path.isfile(src_path):        # the window was closed / a new model loaded meanwhile
+            if not src_path or not os.path.isfile(src_path):        # the window was closed / a new model loaded meanwhile
                 QMessageBox.warning(self, "Save", "The 3D viewer file no longer exists; create the model again.")
                 return
             try:
@@ -368,6 +447,9 @@ class Viewer3DWindow(QDialog):
             return
         if not dst.lower().endswith(".png"):
             dst += ".png"
+            if not self._may_overwrite(dst):        # the dialog checked the name without the suffix
+                item.cancel()
+                return
         if not hasattr(item, "setDownloadDirectory"):
             core.log_warning("3D viewer: QWebEngineDownloadRequest.setDownloadDirectory is missing")
             item.cancel()
@@ -399,9 +481,11 @@ class Viewer3DWindow(QDialog):
         view, page, profile = self.view, self._page, self._profile
         self.view = self._page = self._profile = None      # no use of deleted C++ objects later
         if view is not None:
-            if page is not None:                    # 1. detach our page from the view, so the view
-                with contextlib.suppress(RuntimeError, TypeError):    # no longer holds it (Qt6 would
-                    view.setPage(None)                                # warn: profile released, page alive)
+            if page is not None:                    # 1. detach our page from the view: PyQt6 does not
+                page_cls = _first_import(("qgis.PyQt.QtWebEngineCore",), "QWebEnginePage")
+                with contextlib.suppress(RuntimeError, TypeError):    # accept setPage(None), so the view
+                    if page_cls is not None:                          # gets a fresh page of the default
+                        view.setPage(page_cls(view))                  # profile and lets go of ours
             view.deleteLater()                      # 2. the view
         if profile is not None:                     # only our own page (the view owns the default one)
             if page is not None:

@@ -7,6 +7,7 @@ CC0; 718 comes from the FGDC PDF) - see LICENSE.  This module gives the names, a
 pattern for a lithology and the Qt brush made from a tile.
 """
 import os
+import unicodedata
 
 PATTERN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patterns")
 
@@ -92,10 +93,16 @@ _KEYWORDS = [
 ]
 
 
+def norm_text(s):
+    """Text without diacritics, lower case (core._norm uses it too: patterns.py imports nothing
+    of the plugin, so there is no circular import)."""
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode()
+    return s.strip().lower()
+
+
 def default_pattern(litho):
     """Pattern code guessed from the name of a lithology; '' when nothing fits (plain colour)."""
-    from . import core        # local import: core imports this module at load time (circular)
-    n = core._norm(litho)
+    n = norm_text(litho)
     best = None
     for code, keys in _KEYWORDS:
         for k in keys:

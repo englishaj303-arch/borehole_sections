@@ -173,7 +173,7 @@ select{background:var(--box);border:1px solid var(--line);border-radius:4px;padd
   </aside>
 </div>
 <script>
-const FAULTS_INIT = /*FAULTS_JSON*/[];
+const FAULTS_INIT = /*FAULTS_JSON_START*/[]/*FAULTS_JSON_END*/;
 const FAULT_KEEP = '__borehole_faults__:';
 const SCENE = /*SCENE_JSON*/null;
 (function () {
@@ -187,7 +187,8 @@ if (!S || !S.meshes || !S.meshes.length) { window.__webgl2_ok = true; fail('No m
 const gl = canvas.getContext('webgl2', {antialias: true, preserveDrawingBuffer: true, alpha: false});
 if (!gl) {
   window.__webgl2_ok = false;
-  try { const t = document.createElement('canvas'); window.__webgl_info = 'WebGL 1: ' + (t.getContext('webgl') ? 'available' : 'not available'); } catch (e) { window.__webgl_info = 'WebGL 1: unknown'; }
+  try { const t = document.createElement('canvas'); const g1 = t.getContext('webgl'); window.__webgl_info = 'WebGL 1: ' + (g1 ? 'available' : 'not available');
+    if (g1) { const lc = g1.getExtension('WEBGL_lose_context'); if (lc) lc.loseContext(); } } catch (e) { window.__webgl_info = 'WebGL 1: unknown'; }
   fail('WebGL 2 is not available in this window. Open the viewer in a web browser (Chrome, Edge, Firefox, Safari) instead.');
   return;
 }
@@ -227,7 +228,10 @@ const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 const crs = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 const nrm = a => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
 function lookAt(e, c, u) {
-  const z = nrm(sub(e, c)), x = nrm(crs(u, z)), y = crs(z, x), m = new Float32Array(16);
+  const z = nrm(sub(e, c));
+  let ux = crs(u, z);
+  if (Math.hypot(ux[0], ux[1], ux[2]) < 1e-6) ux = crs([0, 1, 0], z);   // looking straight along 'up' (Top view)
+  const x = nrm(ux), y = crs(z, x), m = new Float32Array(16);
   m[0] = x[0]; m[1] = y[0]; m[2] = z[0]; m[4] = x[1]; m[5] = y[1]; m[6] = z[1];
   m[8] = x[2]; m[9] = y[2]; m[10] = z[2];
   m[12] = -dot(x, e); m[13] = -dot(y, e); m[14] = -dot(z, e); m[15] = 1; return m;
@@ -642,7 +646,7 @@ function render() {
 // ------------------------------------------------------------------ overlay (labels, gizmo)
 const labelsDiv = $('labels');
 const bhLabels = traces.map(t => { const d = document.createElement('div'); d.className = 'lab'; d.textContent = t.name; labelsDiv.appendChild(d); return d; });
-const ztick = []; for (let i = 0; i < 14; i++) { const d = document.createElement('div'); d.className = 'lab zt'; labelsDiv.appendChild(d); ztick.push(d); }
+const ztick = []; for (let i = 0; i < 24; i++) { const d = document.createElement('div'); d.className = 'lab zt'; labelsDiv.appendChild(d); ztick.push(d); }
 function project(p) {
   const x = p[0], y = p[1], z = p[2] * st.zs;
   const vx = V[0] * x + V[4] * y + V[8] * z + V[12], vy = V[1] * x + V[5] * y + V[9] * z + V[13],
@@ -761,7 +765,8 @@ canvas.addEventListener('pointermove', e => {
     const dx = e.clientX - drag.x, dy = e.clientY - drag.y; drag.x = e.clientX; drag.y = e.clientY; drag.moved += Math.abs(dx) + Math.abs(dy);
     if (drag.pan) {
       const f = 2 * cam.dist * Math.tan(cam.fov / 2) / H;
-      const ex = eyePos(), fw = nrm(sub(cam.target, ex)), r = nrm(crs(fw, [0, 0, 1])), u = crs(r, fw);
+      if (!V) updateMatrices();
+      const r = [V[0], V[4], V[8]], u = [V[1], V[5], V[9]];     // camera axes from the view matrix (never degenerate)
       for (let a = 0; a < 3; a++) cam.target[a] += -r[a] * dx * f + u[a] * dy * f;
     } else {
       cam.az -= dx * 0.006;
@@ -1121,7 +1126,7 @@ function addFault(src) {
   faults.push(f); fSel = f.id; rebuildFaultGl(); refreshList(); toForm();
 }
 $('fadd').onclick = () => addFault();
-$('fdup').onclick = () => { const f = curFault(); if (f) { const c = Object.assign({}, f); c.name = f.name + ' (copy)'; c.pos = Math.min(100, f.pos + 5); addFault(c); } };
+$('fdup').onclick = () => { const f = curFault(); if (f) { const c = Object.assign({}, f); c.name = f.name + ' (copy)'; c.pos = Math.min(100, f.pos + 5); if (f.mode === 'xy') { const st = Math.max(1, Math.round(0.03 * Math.max(bmax[0] - bmin[0], bmax[1] - bmin[1]))); c.x = f.x + st; c.y = f.y + st; } addFault(c); } };
 $('fdel').onclick = () => {
   const i = faults.findIndex(f => f.id === fSel); if (i < 0) return;
   faults.splice(i, 1); fSel = faults.length ? faults[Math.min(i, faults.length - 1)].id : null;
@@ -1139,8 +1144,8 @@ $('fmode').onchange = onForm(f => {
 $('fa').onchange = onForm(f => { f.a = parseInt($('fa').value) || 0; });
 $('fb').onchange = onForm(f => { f.b = parseInt($('fb').value) || 0; });
 $('fpos').oninput = onForm(f => { f.pos = numOr('fpos', 0, 100, f.pos); });
-$('fx').oninput = onForm(f => { f.x = numOr('fx', -1e9, 1e9, f.x); });
-$('fy').oninput = onForm(f => { f.y = numOr('fy', -1e9, 1e9, f.y); });
+$('fx').onchange = onForm(f => { f.x = numOr('fx', -1e9, 1e9, f.x); });
+$('fy').onchange = onForm(f => { f.y = numOr('fy', -1e9, 1e9, f.y); });
 $('fdd').oninput = onForm(f => { f.dipdir = numOr('fdd', 0, 360, f.dipdir) % 360; });
 $('fdta').onclick = onForm(f => { const A = bhPoint(f.a), B = bhPoint(f.b); if (A && B && (A[0] !== B[0] || A[1] !== B[1])) { f.dipdir = Math.round(bearing(B, A)); $('fdd').value = f.dipdir; } });
 $('fdtb').onclick = onForm(f => { const A = bhPoint(f.a), B = bhPoint(f.b); if (A && B && (A[0] !== B[0] || A[1] !== B[1])) { f.dipdir = Math.round(bearing(A, B)); $('fdd').value = f.dipdir; } });

@@ -10,7 +10,7 @@ Requires QGIS 4.0 or newer (Qt6). Open **Plugins \> Borehole Geology \> Borehole
     - *Boreholes*: name, X, Y, ground altitude, total depth; optional azimuth (0-360 deg clockwise from North) and dip/deviation (0-90 deg from vertical) for inclined boreholes.
     - *Layers*: borehole name, depth from, depth to, lithology; optional stratigraphy. Any further columns can be used later as descriptions in the borehole logs.
 - Columns, delimiter and encoding are detected automatically and can be changed.
-- Coordinates in S-JTSK (EPSG:5514, also written without the minus sign), WGS84 or ETRS89.
+- Coordinates in the coordinate system of the CSV file, used as it is (no conversion to S-JTSK): S-JTSK (EPSG:5514, also written without the minus sign), WGS84, ETRS89, NAD83 and its variants (HARN, NSRS2007, 2011, CSRS), UTM (WGS84 zones 1-60 N/S, NAD83 zones 1-23N, NAD83(CSRS) 7-22N, NAD83(2011) 10-19N, NAD83(HARN) 4-19N, ETRS89 zones 28-38N) or Web Mercator. The QGIS project takes the CRS of the file. Degrees and Web Mercator do not give distances in metres, so for them the plugin works in the UTM zone of the boreholes.
 - The boreholes can be added to the map as a point layer; boreholes selected in it can be used for the logs and the 3D models.
 
 ### 2. Lithology (colour, grain size)
@@ -48,7 +48,7 @@ A viewer built into the plugin (WebGL 2, own code, no libraries to install). Fen
 - *Opacity of layers*: a slider sets the opacity of the selected layers (all layers when none is selected); every layer shows its own opacity. Tick boxes also show or hide the fence panels, the interpolated volume, the full model and the grid blocks.
 - *Lithology textures (hatching)*: draws the FGDC hatching patterns on the surfaces (the patterns chosen for the lithologies in tab 2; lithologies without a pattern stay plain). The patterns follow the model in world coordinates - in plan on horizontal faces, along the wall on vertical faces - and *Texture size* scales them. The layer list shows a small thumbnail of the pattern.
 - *Faults*: insert fault planes into the model. Each fault has a **position** (between two chosen boreholes as a % of the distance A→B, or X / Y coordinates), a **dip direction** (azimuth, 0 = N, 90 = E; buttons *Dip towards A / B* make the fault strike across the line A–B), a **dip angle** (1–90°, 90 = vertical), a **length** along the strike (centred on the position), a **top elevation** (default: ground level between the boreholes) and a **depth** (default: down to the bottom of the model). Faults are semi-transparent planes with an outline and a dip arrow, a name label, colour and opacity, and can be added, duplicated, hidden or deleted; the fields can be edited at any time. The planes are only drawn - the layers are not displaced. *Save as HTML...* and *Open in web browser* keep the faults; they are not stored in the QGIS project.
-- Borehole traces (also inclined) with names; hovering shows the lithology, S-JTSK coordinates and elevation under the cursor.
+- Borehole traces (also inclined) with names; hovering shows the lithology, coordinates and elevation under the cursor.
 - *Save PNG* and *Save as HTML...* (one file with the whole model that opens in any browser and can be sent to colleagues).
 
 Requirements: nothing has to be installed. The viewer opens in the default web browser (Chrome, Edge, Firefox or Safari with WebGL 2). Models with up to about 100 000 blocks stay smooth on an ordinary graphics card.

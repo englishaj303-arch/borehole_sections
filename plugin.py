@@ -4,7 +4,7 @@ from qgis.PyQt.QtGui import QAction, QIcon
 from qgis.core import Qgis, QgsApplication, QgsMessageLog
 
 from .gui import BoreholeDialog
-from . import patterns, viewer3d
+from . import patterns, viewer3d, viewer3d_window
 
 MENU = "&Borehole Geology"
 
@@ -41,6 +41,8 @@ class BoreholePlugin:
             self.dlg.cleanup()
             self.dlg.deleteLater()
             self.dlg = None
+        viewer3d_window.stop_timers()                 # no QTimer of a browser file stays in the event loop
+        viewer3d_window.cleanup_files(min_age=0)      # the plugin is gone: all its temporary files go
         patterns.clear_cache()              # no QPixmap / QIcon may outlive QGuiApplication
 
     def run(self):

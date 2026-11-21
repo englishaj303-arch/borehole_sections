@@ -1,4 +1,5 @@
 """Data handling, section drawing and 3D layer creation (no GUI widgets)."""
+import contextlib
 import csv
 import difflib
 import io
@@ -8,7 +9,6 @@ import math
 import os
 import re
 import stat
-import unicodedata
 from dataclasses import dataclass, field
 
 from qgis.PyQt.QtCore import Qt, QPointF
@@ -26,6 +26,10 @@ LOG_TAG = "Borehole Geology"
 
 def log_warning(msg):
     QgsMessageLog.logMessage(msg, LOG_TAG, Qgis.MessageLevel.Warning)
+
+
+def log_debug(msg):
+    QgsMessageLog.logMessage(msg, LOG_TAG, Qgis.MessageLevel.Info)
 
 
 _GEOM_ISSUES = {}          # message -> number of occurrences since the last take_geometry_issues()
@@ -49,21 +53,193 @@ def take_geometry_issues():
 
 
 CRS_SJTSK = "EPSG:5514"
+CRS_WEB_MERCATOR = "EPSG:3857"
+WEB_MERCATOR_LIMIT = 20037508.35
+WEB_MERCATOR_RADIUS = 6378137.0
+
+_LONLAT = ("Longitude [deg]", "Latitude [deg]",
+           ["lon", "lng", "longitude", "x"], ["lat", "latitude", "y"])
+_EASTNORTH = ("Easting (E) [m]", "Northing (N) [m]",
+              ["easting", "east", "e", "x"], ["northing", "north", "n", "y"])
 
 # key -> (authid, label, x label, y label, x keywords, y keywords)
+# authid None = UTM family: the EPSG code follows from the zone (see UTM_FAMILIES, crs_authid)
 INPUT_CRS = {
     "sjtsk": ("EPSG:5514", "S-JTSK (EPSG:5514)",
-              "X (northing, latitude)", "Y (easting, longitude)", ["x"], ["y"]),
-    "wgs84": ("EPSG:4326", "WGS84 geographic - lon/lat in degrees (EPSG:4326)",
-              "Longitude [deg]", "Latitude [deg]",
-              ["lon", "lng", "longitude", "x"], ["lat", "latitude", "y"]),
-    "etrs89": ("EPSG:4258", "ETRS89 geographic - lon/lat in degrees (EPSG:4258)",
-               "Longitude [deg]", "Latitude [deg]",
-               ["lon", "lng", "longitude", "x"], ["lat", "latitude", "y"]),
-    "etrs89_utm33": ("EPSG:25833", "ETRS89 / UTM zone 33N (EPSG:25833)",
-                     "Easting (E) [m]", "Northing (N) [m]",
-                     ["easting", "east", "e", "x"], ["northing", "north", "n", "y"]),
+              "X (southing / Krovak X [m])", "Y (westing / Krovak Y [m])", ["x"], ["y"]),
+    "wgs84": ("EPSG:4326", "WGS84 geographic - lon/lat in degrees (EPSG:4326)", *_LONLAT),
+    "etrs89": ("EPSG:4258", "ETRS89 geographic - lon/lat in degrees (EPSG:4258)", *_LONLAT),
+    "nad83": ("EPSG:4269", "NAD83 geographic - lon/lat in degrees (EPSG:4269)", *_LONLAT),
+    "nad83_harn": ("EPSG:4152", "NAD83(HARN) geographic - lon/lat in degrees (EPSG:4152)",
+                   *_LONLAT),
+    "nad83_nsrs2007": ("EPSG:4759", "NAD83(NSRS2007) geographic - lon/lat in degrees (EPSG:4759)",
+                       *_LONLAT),
+    "nad83_2011": ("EPSG:6318", "NAD83(2011) geographic - lon/lat in degrees (EPSG:6318)",
+                   *_LONLAT),
+    "nad83_csrs": ("EPSG:4617", "NAD83(CSRS) geographic - lon/lat in degrees (EPSG:4617)",
+                   *_LONLAT),
+    "utm_wgs84": (None, "WGS84 / UTM zone (Universal Transverse Mercator, EPSG:326xx N, 327xx S)", *_EASTNORTH),
+    "utm_nad83": (None, "NAD83 / UTM zone 1N-23N (Universal Transverse Mercator, EPSG:269xx)", *_EASTNORTH),
+    "utm_etrs89": (None, "ETRS89 / UTM zone 28N-38N (Universal Transverse Mercator, EPSG:258xx)", *_EASTNORTH),
+    "utm_nad83_csrs": (None, "NAD83(CSRS) / UTM zone 7N-22N (Universal Transverse Mercator)",
+                       *_EASTNORTH),
+    "utm_nad83_2011": (None, "NAD83(2011) / UTM zone 10N-19N (Universal Transverse Mercator)",
+                       *_EASTNORTH),
+    "utm_nad83_harn": (None, "NAD83(HARN) / UTM zone 4N-5N, 10N-19N (Universal Transverse Mercator)",
+                       *_EASTNORTH),
+    "webmerc": (CRS_WEB_MERCATOR, "Web Mercator / Pseudo-Mercator (EPSG:3857)", *_EASTNORTH),
 }
+
+# UTM families: key -> (EPSG base of the northern zones, base of the southern zones or None,
+#                       first zone, last zone, default zone)
+UTM_FAMILIES = {
+    "utm_wgs84": (32600, 32700, 1, 60, 33),     # WGS84 / UTM zone 1N..60N (EPSG:326xx), 1S..60S (327xx)
+    "utm_nad83": (26900, None, 1, 23, 14),      # NAD83 / UTM zone 1N..23N (EPSG:269xx)
+    "utm_etrs89": (25800, None, 28, 38, 33),    # ETRS89 / UTM zone 28N..38N (EPSG:258xx)
+}
+
+# geographic systems of the NAD83 family: their metric working system is NAD83 / UTM
+_NAD83_GEOGRAPHIC = ("EPSG:4269", "EPSG:4152", "EPSG:4759", "EPSG:6318", "EPSG:4617")
+
+
+# UTM of the NAD83 realizations: key -> (name in the EPSG registry, first zone, last zone,
+# default zone, {zone: EPSG code}).  The codes are only the first guess: every one is checked
+# against the name QGIS has for it, and when it does not match (or is missing) the EPSG codes are
+# searched for the name "<name> / UTM zone <n>N", so a wrong code can never be used silently.
+_HARN_UTM = {4: 3750, 5: 3751, **{z: 3740 + z - 10 for z in range(10, 20)}}    # no 6N-9N in EPSG
+
+_UTM_NAMED = {
+    "utm_nad83_csrs": ("NAD83(CSRS)", 7, 22, 17,
+                       {7: 3154, 8: 3155, 9: 3156, 10: 3157, 11: 2955, 12: 2956, 13: 2957,
+                        14: 3158, 15: 3159, 16: 3160, 17: 2958, 18: 2959, 19: 2960, 20: 2961,
+                        21: 2962, 22: 3761}),
+    "utm_nad83_2011": ("NAD83(2011)", 10, 19, 17,
+                       {z: 6339 + z - 10 for z in range(10, 20)}),
+    "utm_nad83_harn": ("NAD83(HARN)", 4, 19, 17, _HARN_UTM),
+}
+_UTM_FOUND = {}                      # (key, zone) -> authid, found once per session
+
+
+def is_utm(crs_key):
+    return crs_key in UTM_FAMILIES or crs_key in _UTM_NAMED
+
+
+def utm_zone_info(crs_key):
+    """(first zone, last zone, default zone, southern hemisphere possible) of a UTM entry."""
+    if crs_key in _UTM_NAMED:
+        _, z0, z1, default, _ = _UTM_NAMED[crs_key]
+        return z0, z1, default, False
+    _, south_base, z0, z1, default = UTM_FAMILIES[crs_key]
+    return z0, z1, default, south_base is not None
+
+
+def utm_valid_zones(crs_key):
+    """Sorted list of the UTM zones that exist for a UTM entry (the datums NAD83(HARN) has gaps)."""
+    if crs_key in _UTM_NAMED and _UTM_NAMED[crs_key][4]:
+        return sorted(_UTM_NAMED[crs_key][4])
+    z0, z1, _, _ = utm_zone_info(crs_key)
+    return list(range(z0, z1 + 1))
+
+
+def _utm_name_matches(description, name, zone):  # noqa: D401
+    """True for '<name> / UTM zone <zone>N', also when a newer PROJ/GDAL adds a realization or
+    an epoch to the datum name (e.g. 'NAD83(CSRS)v7 / UTM zone 17N')."""
+    pattern = (re.escape(name) + r"(?:\s*v\d+(?:\.\d+)?|\s*\([^)]*\))*\s*/\s*UTM\s+zone\s+"
+               + str(int(zone)) + r"N\b")
+    # re.match: an authority or a locale added after the name ("... 17N [EPSG:2958]") is allowed
+    return re.match(pattern, description.strip(), re.IGNORECASE) is not None
+
+
+def _find_named_utm(crs_key, zone):
+    """EPSG code of '<datum> / UTM zone <zone>N' (names are checked, see _UTM_NAMED)."""
+    if (crs_key, zone) in _UTM_FOUND:
+        return _UTM_FOUND[(crs_key, zone)]
+    name, _, _, _, known = _UTM_NAMED[crs_key]
+    want = f"{name} / UTM zone {zone}N"
+    first = known.get(zone)
+    # the search is limited to the blocks of the EPSG registry where these systems are
+    blocks = itertools.chain(range(2955, 2963), range(3154, 3161), range(3740, 3762),
+                             range(6330, 6350))
+    codes = ([first] if first else []) + [c for c in blocks if c != first]
+    for code in codes:
+        crs = QgsCoordinateReferenceSystem(f"EPSG:{code}")
+        if crs.isValid() and _utm_name_matches(crs.description(), name, zone):
+            _UTM_FOUND[(crs_key, zone)] = f"EPSG:{code}"
+            return _UTM_FOUND[(crs_key, zone)]
+    raise ValueError(f"'{want}' was not found in the coordinate systems of this QGIS "
+                     "installation - choose another zone or coordinate system.")
+
+
+def crs_authid(crs_key, zone=None, south=False):
+    """EPSG code of an input system; the UTM entries need the zone (and the hemisphere)."""
+    if not is_utm(crs_key):
+        return INPUT_CRS[crs_key][0]
+    z0, z1, default, south_ok = utm_zone_info(crs_key)
+    zone = default if zone is None else int(zone)
+    if not z0 <= zone <= z1:
+        raise ValueError(f"UTM zone {zone} is outside {z0}..{z1} for this datum.")
+    if south and not south_ok:
+        raise ValueError("The southern hemisphere is not available for this datum.")
+    if crs_key in _UTM_NAMED:
+        if _UTM_NAMED[crs_key][4] and zone not in _UTM_NAMED[crs_key][4]:
+            raise ValueError(f"{_UTM_NAMED[crs_key][0]} / UTM zone {zone}N does not exist "
+                             f"(zones: {', '.join(str(z) for z in sorted(_UTM_NAMED[crs_key][4]))}).")
+        return _find_named_utm(crs_key, zone)
+    north, south_base = UTM_FAMILIES[crs_key][:2]
+    return f"EPSG:{(south_base if south else north) + zone}"
+
+
+_GEOGRAPHIC_TO_UTM_KEY = {"EPSG:4617": "utm_nad83_csrs", "EPSG:6318": "utm_nad83_2011",
+                           "EPSG:4152": "utm_nad83_harn"}
+
+
+def utm_authid_and_note(lon, lat, src_authid):
+    """(metric UTM system, note) for a point in degrees.  The UTM of the same datum realization
+    is used where there is one; otherwise the note says which other datum is the fallback
+    (it is empty when the realization is kept)."""
+    zone = min(max(int(math.floor((lon + 180.0) / 6.0)) + 1, 1), 60)
+    key = _GEOGRAPHIC_TO_UTM_KEY.get(src_authid)
+    if key and lat >= 0:                   # NAD83(CSRS), NAD83(2011), NAD83(HARN): no datum shift
+        with contextlib.suppress(ValueError):      # zone outside the range of that realization
+            return crs_authid(key, zone), ""
+    if src_authid in _NAD83_GEOGRAPHIC and lat >= 0 and 1 <= zone <= 23:
+        auth, other = f"EPSG:{26900 + zone}", "NAD83 / UTM"
+    elif src_authid == "EPSG:4258" and lat >= 0 and 28 <= zone <= 38:
+        return f"EPSG:{25800 + zone}", ""
+    else:
+        auth, other = f"EPSG:{(32600 if lat >= 0 else 32700) + zone}", "WGS84 / UTM"
+    note = ""
+    if key or src_authid == "EPSG:4759":      # a realization of its own (plain NAD83 = NAD83 / UTM)
+        note = (f"no UTM zone {zone}{'N' if lat >= 0 else 'S'} of the same NAD83 realization as the "
+                f"file ({src_authid}) - the working system is {other} ({auth}); the datums differ "
+                "by up to about 1-2 m")
+    return auth, note
+
+
+def utm_authid_for(lon, lat, src_authid):
+    """Metric UTM system (the same datum realization where there is one) for a point in degrees."""
+    return utm_authid_and_note(lon, lat, src_authid)[0]
+
+
+# The coordinate system of the loaded boreholes: the one chosen for the CSV file ("source"), and
+# the metric one the plugin works in ("work": map layers, sections, 3D).  They are the same for
+# every projected system; a geographic system (degrees) and Web Mercator (distances are
+# stretched by 1 / cos(latitude)) cannot be used for distances in metres, so the plugin works in
+# the UTM zone of the data and the QGIS project keeps the system of the CSV file.
+_DATA_CRS = {"source": CRS_SJTSK, "work": CRS_SJTSK}
+
+
+def source_crs_authid():
+    return _DATA_CRS["source"]
+
+
+def work_crs_authid():
+    return _DATA_CRS["work"]
+
+
+def work_crs():
+    return QgsCoordinateReferenceSystem(_DATA_CRS["work"])
+
 
 DELIMITERS = [("Auto-detect", None), ("Semicolon ;", ";"), ("Comma ,", ","),
               ("Tab", "\t"), ("Space", " "), ("Pipe |", "|")]
@@ -82,8 +258,8 @@ class Layer:
 @dataclass
 class Borehole:
     name: str
-    x: float          # QGIS easting  (EPSG:5514)
-    y: float          # QGIS northing (EPSG:5514)
+    x: float          # easting in the working CRS (work_crs_authid())
+    y: float          # northing in the working CRS (work_crs_authid())
     z: float          # collar altitude
     depth: float
     layers: list = field(default_factory=list)
@@ -116,6 +292,7 @@ class Projected:
     s_top: float = 0.0     # signed distance of the collar from the section line (+ = left of it)
     s_bot: float = 0.0     # the same for the bottom of the borehole
     kx: float = 0.0        # gradient of the strata perpendicular to the section (m per m, + = rising to the left)
+    path: object = None    # inclined hole + broken line: md -> (distance along the line, signed offset)
 
     def __post_init__(self):
         if self.d_top is None:
@@ -127,6 +304,8 @@ class Projected:
         """Distance along section polyline at measured along-hole depth `md`."""
         if self.bh.depth <= 1e-9:
             return self.d_top
+        if self.path is not None:          # the trace of the hole bends with the line: no interpolation
+            return self.path(md)[0]
         t = md / self.bh.depth
         return self.d_top + (self.d_bot - self.d_top) * t
 
@@ -135,6 +314,8 @@ class Projected:
         (an inclined borehole crosses the plane in one point only, there s = 0)."""
         if self.bh.depth <= 1e-9:
             return self.s_top
+        if self.path is not None:
+            return self.path(md)[1]
         return self.s_top + (self.s_bot - self.s_top) * md / self.bh.depth
 
     def z_at(self, md):
@@ -146,19 +327,25 @@ class Projected:
 
 # ----------------------------------------------------------------- CSV input
 def _norm(s):
-    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode()
-    return s.strip().lower()
+    """Text without diacritics, lower case (shared with patterns.py, which core imports)."""
+    return _patterns.norm_text(s)
 
 
 MAX_TABLE_BYTES = 100 * 1024 * 1024
 # Plausible ranges of the input values; anything outside is a data error (units, a shifted
 # column ...) and would only produce absurdly large models.
 MAX_COORD = 1e8                 # projected coordinates [m]
+# physically sensible ranges of some projected systems [m]: (min, max) of easting and northing
+UTM_EASTING = (0.0, 1000000.0)      # the zones overlap: eastings beyond 100-900 km are legal
+UTM_NORTHING = (0.0, 10000000.0)
+UTM_LAT_MIN, UTM_LAT_MAX = -80.0, 84.0     # latitudes covered by UTM (poles: UPS, not supported)
+SJTSK_LIMIT = 3e6               # |X| and |Y| of S-JTSK (the Czech Republic: ~0.4-1.3 million)
 MAX_ELEV = 12000.0              # ground elevation [m a.s.l.]: -MAX_ELEV .. +MAX_ELEV
 MAX_DEPTH = 20000.0             # total depth and layer depths [m] (deepest borehole: 12.3 km)
 MAX_TABLE_ROWS = 1_000_000
 MAX_TABLE_COLUMNS = 1000
 MAX_TABLE_CELL = 32768
+MAX_NAME_LEN = 256                # borehole names and lithology names are cut to this (labels, textures)
 
 
 _BLANK_HEADER_RE = re.compile(r"^\(column \d+\)$")
@@ -175,15 +362,16 @@ def read_table(path, delimiter=None, max_rows=None, max_bytes=MAX_TABLE_BYTES):
     N rows) - enough for a preview of the column names of a big file.  A file larger than
     max_bytes (when read whole) or a binary file (NUL bytes) is rejected."""
     try:
-        st = os.stat(path)
+        fh = open(path, "rb")                 # open first, then check the descriptor (no TOCTOU)
     except OSError as e:
         raise ValueError(f"Cannot read the file ({e.strerror or e}): {path}")
-    if not stat.S_ISREG(st.st_mode):          # FIFO, device ...: size 0, read() could block forever
-        raise ValueError("Not a regular file: " + path)
-    if max_rows is None and st.st_size > max_bytes:
-        raise ValueError(f"File is larger than {max_bytes // (1024 * 1024)} MB - "
-                         f"not a CSV table: {path}")
-    with open(path, "rb") as fh:
+    with fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):      # FIFO, device ...: size 0, read() could block forever
+            raise ValueError("Not a regular file: " + path)
+        if max_rows is None and st.st_size > max_bytes:
+            raise ValueError(f"File is larger than {max_bytes // (1024 * 1024)} MB - "
+                             f"not a CSV table: {path}")
         head = fh.read(2)
         fh.seek(0)
         utf16 = head in (b"\xff\xfe", b"\xfe\xff")
@@ -276,14 +464,28 @@ def to_float(s):
     return v if math.isfinite(v) else None
 
 
-# Stratigraphy, youngest -> oldest (index grows with age)
-STRAT_NAMES = ["kvarter", "neogen", "paleogen", "krida", "jura", "trias", "perm",
-               "karbon", "devon", "silur", "ordovik", "kambrium", "proterozoikum"]
-STRAT_LABELS = ["kvartér", "neogén", "paleogén", "křída", "jura", "trias", "perm",
-                "karbon", "devon", "silur", "ordovik", "kambrium", "proterozoikum"]
-STRAT_ENGLISH = ["Quaternary", "Neogene", "Palaeogene", "Cretaceous", "Jurassic", "Triassic",
-                 "Permian", "Carboniferous", "Devonian", "Silurian", "Ordovician", "Cambrian",
-                 "Proterozoic"]
+# Stratigraphy, youngest -> oldest (index grows with age): ONE table, so that the names, the
+# labels and the colours (ICS) of a period can never get out of step
+STRATIGRAPHY = [
+    # (key, Czech label, English name, colour)
+    ("kvarter", "kvartér", "Quaternary", "#F9F97F"),
+    ("neogen", "neogén", "Neogene", "#FFE619"),
+    ("paleogen", "paleogén", "Palaeogene", "#FD9A52"),
+    ("krida", "křída", "Cretaceous", "#7FC64E"),
+    ("jura", "jura", "Jurassic", "#34B2C9"),
+    ("trias", "trias", "Triassic", "#812B92"),
+    ("perm", "perm", "Permian", "#F04028"),
+    ("karbon", "karbon", "Carboniferous", "#67A599"),
+    ("devon", "devon", "Devonian", "#CB8C37"),
+    ("silur", "silur", "Silurian", "#B3E1B6"),
+    ("ordovik", "ordovik", "Ordovician", "#009270"),
+    ("kambrium", "kambrium", "Cambrian", "#7FA056"),
+    ("proterozoikum", "proterozoikum", "Proterozoic", "#F74370"),
+]
+STRAT_NAMES = [r[0] for r in STRATIGRAPHY]
+STRAT_LABELS = [r[1] for r in STRATIGRAPHY]
+STRAT_ENGLISH = [r[2] for r in STRATIGRAPHY]
+STRAT_COLORS = [r[3] for r in STRATIGRAPHY]
 _STRAT_TERMS = {n: (i, i) for i, n in enumerate(STRAT_NAMES)}
 _STRAT_TERMS.update({
     "tercier": (1, 2), "mesozoikum": (3, 5), "paleozoikum": (6, 11), "permokarbon": (6, 7),
@@ -325,6 +527,7 @@ def parse_strat(text):
     found = []
     left = []
     for word in re.findall(r"[a-z?*]+", t):
+        word = word.rstrip("?*") if word.strip("?*") else word   # 'kreda?', 'trias??': uncertain, not damaged
         if "?" not in word and "*" not in word:
             hit = _strat_word(word)
             if hit is not None:
@@ -372,21 +575,121 @@ def guess_column(header, keywords, default=0):
     return default
 
 
-def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=False):
+def _convert_to_work_crs(bhs, raw_line, src, src_id, warnings):
+    """Boreholes given in degrees (or Web Mercator) -> metres of the UTM zone of their centre.
+
+    bhs: name -> Borehole with the coordinates of the file; the boreholes that cannot be
+    converted are removed.  Returns the EPSG code of the working system."""
+    ctx = QgsProject.instance().transformContext()
+    geographic = src.isGeographic()
+
+    def lonlat(b):
+        """Longitude / latitude [deg] of a borehole without a transformation: the file is in
+        degrees (of its own datum - the difference to WGS84 does not matter for the zone) or in
+        Web Mercator (spherical formulas of EPSG:3857)."""
+        if geographic:
+            return b.x, b.y
+        return (math.degrees(b.x / WEB_MERCATOR_RADIUS),
+                math.degrees(2.0 * math.atan(math.exp(b.y / WEB_MERCATOR_RADIUS)) - math.pi / 2.0))
+    # centre of the boreholes in degrees: the longitude is a circular mean (boreholes at 179.9
+    # and -179.9 deg lie at the antimeridian, not at 0 deg); at most ~2000 boreholes are used
+    items = list(bhs.values())
+    step = max(1, len(items) // 2000)
+    try:
+        s_sin = s_cos = s_lat = 0.0
+        n_ok = 0
+        for b in items[::step]:
+            try:
+                w_lon, w_lat = lonlat(b)
+            except (OverflowError, ValueError) as e:     # the borehole is skipped for the centre
+                log_debug(f"Centre of the boreholes: {b.name} skipped ({type(e).__name__}: {e})")
+                continue
+            if not (math.isfinite(w_lon) and math.isfinite(w_lat)):
+                continue
+            if not (UTM_LAT_MIN <= w_lat <= UTM_LAT_MAX):    # polar outliers are skipped below:
+                continue                                      # they must not move the centre
+            rl = math.radians(w_lon)
+            s_sin += math.sin(rl)
+            s_cos += math.cos(rl)
+            s_lat += w_lat
+            n_ok += 1
+        if n_ok == 0:
+            raise ValueError("centre of the boreholes is not finite")
+        lon = math.degrees(math.atan2(s_sin, s_cos))
+        lat = s_lat / n_ok
+        if not (math.isfinite(lon) and math.isfinite(lat)):
+            raise ValueError("centre of the boreholes is not finite")
+    except Exception as e:                 # QgsCsException, ValueError
+        raise ValueError(f"Cannot find the UTM zone of the boreholes ({type(e).__name__}: {e}); "
+                         "check the coordinate system and the swap option.") from e
+    work_id, note = utm_authid_and_note(lon, lat, src_id)
+    if note:
+        warnings.append("Coordinate system: " + note)
+    xform = QgsCoordinateTransform(src, QgsCoordinateReferenceSystem(work_id), ctx)
+    zone_c = min(max(int(math.floor((lon + 180.0) / 6.0)) + 1, 1), 60)
+    cm = (zone_c - 1) * 6.0 - 180.0 + 3.0                  # central meridian of the chosen zone
+    n_far, far_max, n_other_hemi = 0, 0.0, 0
+    for name in list(bhs):
+        bh = bhs[name]
+        try:
+            b_lat = lonlat(bh)[1]
+            if not (UTM_LAT_MIN <= b_lat <= UTM_LAT_MAX):      # beyond the UTM grid (polar caps)
+                raise ValueError(f"latitude {b_lat:.2f} deg is outside the UTM range "
+                                 f"{UTM_LAT_MIN:g}..{UTM_LAT_MAX:g} deg")
+            p = xform.transform(QgsPointXY(bh.x, bh.y))
+            if not (math.isfinite(p.x()) and math.isfinite(p.y())
+                    and abs(p.x()) <= MAX_COORD and abs(p.y()) <= MAX_COORD):
+                raise ValueError("outside the valid range")
+            if not (UTM_EASTING[0] <= p.x() <= UTM_EASTING[1] and abs(p.y()) <= UTM_NORTHING[1]):
+                raise ValueError(f"UTM coordinates {p.x():.0f}, {p.y():.0f} are outside the range of the "
+                                 "zone (the boreholes are too far from its central meridian)")
+            b_lon = lonlat(bh)[0]
+            d_lon = abs(((b_lon - cm + 180.0) % 360.0) - 180.0)
+            if d_lon > 9.0:
+                n_far += 1
+                far_max = max(far_max, d_lon)
+            if (b_lat >= 0) != (lat >= 0):
+                n_other_hemi += 1
+        except Exception as e:             # QgsCsException, ValueError (range) and the like
+            warnings.append(f"Boreholes file, line {raw_line.get(name, '?')} ({name}): coordinate "
+                            f"transformation failed ({type(e).__name__}: {e}) - skipped")
+            del bhs[name]
+            continue
+        bh.x, bh.y = p.x(), p.y()
+    if n_far:
+        warnings.append(f"Coordinate system: {n_far} borehole(s) lie more than 9 deg of longitude "
+                        f"(up to {far_max:.1f} deg) from the central meridian of the working UTM zone "
+                        f"{work_id} - distances there are distorted; the data should lie in one or two "
+                        "neighbouring zones")
+    if n_other_hemi:
+        warnings.append(f"Coordinate system: {n_other_hemi} borehole(s) lie in the other hemisphere than "
+                        f"the centre of the data - their northings are negative / shifted by 10 000 000 m "
+                        f"in {work_id}")
+    return work_id
+
+
+def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=False,
+                    utm_zone=None, utm_south=False):
     """m1: dict name,x,y,z,depth[,azimuth,dip] -> column index (-1 = none).
     m2: dict name,top,bottom,litho[,strat] -> column index (-1 = none).
 
-    Input CRS is given by crs_key (see INPUT_CRS); all boreholes are converted
-    to S-JTSK (EPSG:5514) which is used for map, section and 3D.
+    The coordinate system of the CSV file is given by crs_key (see INPUT_CRS; for the UTM
+    families also utm_zone and utm_south).  A projected system is used as it is - the boreholes
+    keep the coordinates of the file.  A geographic system (degrees) and Web Mercator cannot be
+    used for distances in metres, so those boreholes are converted to the UTM zone of the data
+    (see work_crs_authid()); source_crs_authid() is the system of the file.
     S-JTSK: column 'x' = X (northing), 'y' = Y (easting), both negative in
     EPSG:5514; QGIS point = (-Y, -X). `negate` adds the minus sign.
     Other CRS: column 'x' = lon/easting, 'y' = lat/northing.
     `swap` exchanges the meaning of the two coordinate columns.
     """
-    src = QgsCoordinateReferenceSystem(INPUT_CRS[crs_key][0])
-    dst = QgsCoordinateReferenceSystem(CRS_SJTSK)
-    xform = None if crs_key == "sjtsk" else QgsCoordinateTransform(
-        src, dst, QgsProject.instance().transformContext())
+    src_id = crs_authid(crs_key, utm_zone, utm_south)
+    src = QgsCoordinateReferenceSystem(src_id)
+    if not src.isValid():
+        raise ValueError(f"The coordinate system {src_id} is not known to this QGIS installation.")
+    # degrees and Web Mercator (scale 1/cos(lat)) are not metric: work in a local UTM zone
+    needs_work_crs = src.isGeographic() or src_id == CRS_WEB_MERCATOR
+    raw_line = {}                      # borehole name -> line of the file (for the warnings)
     for key in ("name", "x", "y", "z", "depth"):
         if m1.get(key, -1) < 0:
             raise ValueError(f"Boreholes file: no column selected for '{key}'.")
@@ -394,11 +697,16 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
         if m2.get(key, -1) < 0:
             raise ValueError(f"Layers file: no column selected for '{key}'.")
     warnings, bhs, bad_strat = [], {}, set()
+    n_signed = n_positive = 0          # S-JTSK rows that already have a minus / have none and are not negated
+    n_cut = 0                          # names cut to MAX_NAME_LEN
     az_idx = m1.get("azimuth", -1)
     dip_idx = m1.get("dip", -1)
     for n, r in enumerate(r1, start=2):
         try:
             name = r[m1["name"]].strip()
+            if len(name) > MAX_NAME_LEN:
+                name = name[:MAX_NAME_LEN]
+                n_cut += 1
             sx, sy = to_float(r[m1["x"]]), to_float(r[m1["y"]])
             z, depth = to_float(r[m1["z"]]), to_float(r[m1["depth"]])
         except IndexError:
@@ -418,6 +726,9 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
         if depth is None and r[m1["depth"]].strip():
             warnings.append(f"Boreholes file, line {n} ({name}): invalid total depth "
                             f"'{r[m1['depth']].strip()}' - the depth of the layers is used")
+        if depth == 0:
+            warnings.append(f"Boreholes file, line {n} ({name}): total depth 0 - the depth of the "
+                            "layers is used")
         if depth is not None and depth < 0:
             warnings.append(f"Boreholes file, line {n} ({name}): negative total depth {depth:g} "
                             "- replaced by 0 (the depth of the layers is used)")
@@ -456,7 +767,23 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
         if swap:
             sx, sy = sy, sx
         # geographic systems are in degrees, projected ones (S-JTSK, ETRS89 / UTM 33N) in metres
-        lim_x, lim_y = (180.0, 90.0) if src.isGeographic() else (MAX_COORD, MAX_COORD)
+        if src.isGeographic():
+            lim_x, lim_y = 180.0, 90.0
+        elif src_id == CRS_WEB_MERCATOR:
+            lim_x = lim_y = WEB_MERCATOR_LIMIT          # the whole world: +-20037508.34 m
+        elif crs_key == "sjtsk":
+            lim_x = lim_y = SJTSK_LIMIT
+        else:
+            lim_x, lim_y = MAX_COORD, MAX_COORD
+        if is_utm(crs_key):                # easting / northing in metres (a unit or decimal error)
+            ex, ny = sx, sy                # the columns are already swapped when asked
+            ok = (UTM_EASTING[0] <= ex <= UTM_EASTING[1] and UTM_NORTHING[0] <= ny <= UTM_NORTHING[1])
+            if not ok:
+                warnings.append(f"Boreholes file, line {n} ({name}): UTM coordinates {sx:g}, {sy:g} "
+                                f"are outside the range of easting {UTM_EASTING[0]:g}-{UTM_EASTING[1]:g} m "
+                                f"and northing {UTM_NORTHING[0]:g}-{UTM_NORTHING[1]:g} m "
+                                "(units? shifted decimal point? swapped columns?) - skipped")
+                continue
         if abs(sx) > lim_x or abs(sy) > lim_y:
             warnings.append(f"Boreholes file, line {n} ({name}): coordinates {sx:g}, {sy:g} are "
                             "outside the valid range - skipped")
@@ -464,27 +791,26 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
         if crs_key == "sjtsk":
             qx, qy = sy, sx
             if negate:
+                if qx < 0 or qy < 0:
+                    n_signed += 1
                 qx, qy = -abs(qx), -abs(qy)
+            elif qx > 0 or qy > 0:
+                n_positive += 1
         else:
-            try:
-                p = xform.transform(QgsPointXY(sx, sy))
-                qx, qy = p.x(), p.y()
-                if not (math.isfinite(qx) and math.isfinite(qy)
-                        and abs(qx) <= MAX_COORD and abs(qy) <= MAX_COORD):
-                    raise ValueError("outside the valid range")
-            except Exception as e:            # QgsCsException, ValueError (range) and the like
-                warnings.append(f"Boreholes file, line {n}: coordinate transformation failed "
-                                f"({type(e).__name__}: {e}) - skipped")
-                continue
+            qx, qy = sx, sy                   # kept as in the file (converted below if not metric)
         if name in bhs:
             warnings.append(f"Duplicate borehole '{name}' - last one used")
         bhs[name] = Borehole(name, qx, qy, z, depth or 0.0, azimuth=az, dip=dip)
+        raw_line[name] = n
 
     for n, r in enumerate(r2, start=2):
         try:
-            name = r[m2["name"]].strip()
+            name = r[m2["name"]].strip()[:MAX_NAME_LEN]
             t, b = to_float(r[m2["top"]]), to_float(r[m2["bottom"]])
             lit = r[m2["litho"]].strip() or "(unknown)"
+            if len(lit) > MAX_NAME_LEN:
+                lit = lit[:MAX_NAME_LEN]
+                n_cut += 1
             raw_age = r[m2["strat"]].strip() if 0 <= m2.get("strat", -1) < len(r) else ""
         except IndexError:
             warnings.append(f"Layers file, line {n}: too few columns - skipped")
@@ -495,7 +821,7 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
         if t is None or b is None or b <= t:
             warnings.append(f"Layers file, line {n} ({name}): invalid interval - skipped")
             continue
-        if t < -MAX_DEPTH or b > MAX_DEPTH:
+        if t < -1e-6 or b > MAX_DEPTH:          # depths run downwards from the collar: no negative top
             warnings.append(f"Layers file, line {n} ({name}): depth {t:g}-{b:g} m is outside "
                             f"+-{MAX_DEPTH:g} m - skipped")
             continue
@@ -513,33 +839,59 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
                 if bh.depth:
                     warnings.append(f"{bh.name}: layers go deeper ({last}) than total depth ({bh.depth})")
                 bh.depth = last
+            running_bottom = bh.layers[0].bottom       # deepest bottom of the layers above
             for a, b in zip(bh.layers, bh.layers[1:]):
                 if a.age and b.age and b.age[1] < a.age[0]:
                     warnings.append(f"{bh.name}: younger stratigraphy ({age_label(b.age)}) below "
                                     f"older ({age_label(a.age)}) at {b.top} m - fault or data error?")
-                if b.top < a.bottom - 1e-6:
+                if b.top < running_bottom - 1e-6:
                     warnings.append(f"{bh.name}: overlapping layers at {b.top} m")
-                elif b.top > a.bottom + 1e-6:
-                    warnings.append(f"{bh.name}: gap between {a.bottom} and {b.top} m")
+                elif b.top > running_bottom + 1e-6:
+                    warnings.append(f"{bh.name}: gap between {running_bottom} and {b.top} m")
+                running_bottom = max(running_bottom, b.bottom)
         else:
             warnings.append(f"{bh.name}: no layers")
     for raw in sorted(bad_strat):
         warnings.append(f"Unknown stratigraphy '{raw}' - layer treated as unknown age")
-    # sanity check: should lie within the Czech Republic (lon 11.5-19.5, lat 48.4-51.2)
-    try:
-        to_wgs = QgsCoordinateTransform(dst, QgsCoordinateReferenceSystem("EPSG:4326"),
-                                        QgsProject.instance().transformContext())
-        out = 0
-        for bh in bhs.values():
-            p = to_wgs.transform(QgsPointXY(bh.x, bh.y))
-            if not (11.5 <= p.x() <= 19.5 and 48.4 <= p.y() <= 51.2):
-                out += 1
-        if out:
-            warnings.insert(0, f"{out} borehole(s) lie outside the Czech Republic - check the "
-                               "coordinate system, the minus-sign option and the swap option")
-    except Exception as e:
-        # the location check is only advisory; keep the data but record why it was skipped
-        log_warning(f"Coordinate plausibility check skipped: {type(e).__name__}: {e}")
+    if n_cut:
+        warnings.append(f"{n_cut} borehole or lithology name(s) longer than {MAX_NAME_LEN} "
+                        "characters were cut")
+    if n_signed:
+        warnings.append(f"S-JTSK: {n_signed} borehole(s) already have a minus sign although the option "
+                        "'without minus sign' is on - the sign was made negative anyway (mixed signs "
+                        "in the file?)")
+    if n_positive:
+        warnings.append(f"S-JTSK: {n_positive} borehole(s) have positive coordinates, but EPSG:5514 "
+                        "needs negative ones - tick 'Coordinates are given without minus sign' "
+                        "(they lie far outside the Czech Republic and Slovakia now)")
+    work_id = src_id
+    if needs_work_crs and bhs:
+        work_id = _convert_to_work_crs(bhs, raw_line, src, src_id, warnings)
+    if bhs:                    # no valid borehole: the system of the previous data stays
+        wcrs = QgsCoordinateReferenceSystem(work_id)
+        if not wcrs.isValid() or wcrs.isGeographic():
+            raise ValueError(f"The working coordinate system {work_id or '(none)'} is not a metric "
+                             "projected system - the distances in metres cannot be computed.")
+        _DATA_CRS["source"] = src_id
+        _DATA_CRS["work"] = work_id
+    if crs_key == "sjtsk":
+        # S-JTSK is used in the Czech Republic and Slovakia: a point elsewhere means a wrong
+        # system, a missing minus sign or swapped columns (lon 11.5-22.7, lat 47.7-51.2)
+        try:
+            to_wgs = QgsCoordinateTransform(src, QgsCoordinateReferenceSystem("EPSG:4326"),
+                                            QgsProject.instance().transformContext())
+            out = 0
+            for bh in bhs.values():
+                p = to_wgs.transform(QgsPointXY(bh.x, bh.y))
+                if not (11.5 <= p.x() <= 22.7 and 47.7 <= p.y() <= 51.2):
+                    out += 1
+            if out:
+                warnings.insert(0, f"{out} borehole(s) lie outside the Czech Republic and Slovakia - "
+                                   "check the coordinate system, the minus-sign option and the swap "
+                                   "option")
+        except Exception as e:
+            # the location check is only advisory; keep the data but record why it was skipped
+            log_warning(f"Coordinate plausibility check skipped: {type(e).__name__}: {e}")
     return list(bhs.values()), warnings
 
 
@@ -644,9 +996,12 @@ def signed_offset(points, x, y):
         for c1, c2 in zip(ties, ties[1:]):
             if c1[4] == c2[3]:
                 bx_, by_ = c1[2][0] + c2[2][0], c1[2][1] + c2[2][1]
+                vx, vy = c1[4]
                 if math.hypot(bx_, by_) > 1e-12:
-                    vx, vy = c1[4]
                     sign = 1.0 if bx_ * (y - vy) - by_ * (x - vx) >= 0 else -1.0
+                else:                       # the line turns back by 180 deg: normal of the first segment
+                    nx_, ny_ = -c1[2][1], c1[2][0]
+                    sign = 1.0 if nx_ * (x - vx) + ny_ * (y - vy) >= 0 else -1.0
                 break
     return best * sign
 
@@ -713,8 +1068,15 @@ def project_boreholes(points, boreholes, max_offset, min_gap=0.0):
                 d_top = line.lineLocatePoint(g_top)
                 d_bot = line.lineLocatePoint(g_bot)
             d_mid = 0.5 * (d_top + d_bot)
+            path = None
+            if len(points) >= 3 and math.hypot(bx - b.x, by - b.y) > 1e-6:
+                def path(md, b=b):          # point of the hole at md projected on the broken line
+                    x, y, _ = b.point_at(md)
+                    g = QgsGeometry.fromPointXY(QgsPointXY(x, y))
+                    d = (ext_line.lineLocatePoint(g) - ext) if has_ext else line.lineLocatePoint(g)
+                    return d, signed_offset(sp, x, y)
             out.append(Projected(b, d_mid, off, d_top, d_bot,
-                                 signed_offset(sp, b.x, b.y), signed_offset(sp, bx, by)))
+                                 signed_offset(sp, b.x, b.y), signed_offset(sp, bx, by), path=path))
     out.sort(key=lambda p: p.dist)
     return drop_close_boreholes(out, min_gap)
 
@@ -1059,7 +1421,11 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
         def omega(i, x):
             xt = tips[i]
             if side == "A":
+                if xt - xa <= 1e-12:                 # zero-length wedge: no division by zero
+                    return 0.0
                 return hs[i] * wf((xt - x) / (xt - xa)) if x <= xt else 0.0
+            if xb - xt <= 1e-12:
+                return 0.0
             return hs[i] * wf((x - xt) / (xb - xt)) if x >= xt else 0.0
 
         def frac(j, x):
@@ -2179,9 +2545,10 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
 # ------------------------------------------------------------------- layers
 def make_borehole_point_layer(boreholes):
     lyr = QgsVectorLayer(
-        f"PointZ?crs={CRS_SJTSK}&field=name:string&field=z:double&field=depth:double"
+        "PointZ?field=name:string&field=z:double&field=depth:double"
         "&field=azimuth:double&field=dip:double",
         "Boreholes", "memory")
+    lyr.setCrs(work_crs())              # the CRS object, not an authid text in the URI
     feats = []
     for b in boreholes:
         f = QgsFeature(lyr.fields())

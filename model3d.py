@@ -20,8 +20,6 @@ from qgis.PyQt.QtGui import QColor
 
 from . import core
 
-CRS = core.CRS_SJTSK
-
 
 # ------------------------------------------------------------------ helpers
 def box_solid(ring, zb, h):
@@ -40,15 +38,21 @@ def prisms_to_solids(prisms):
     return [(box_solid(ring, zb, h), lit) for ring, zb, h, lit in prisms]
 
 
+def _unique_indices(bhs, tol=1.0):
+    """Indices (ascending) of the boreholes left after dropping those closer than `tol` m
+    (collar position) to another one with more layers."""
+    kept = []
+    for i in sorted(range(len(bhs)), key=lambda q: -len(bhs[q].layers)):
+        b = bhs[i]
+        if all(math.hypot(b.x - bhs[k].x, b.y - bhs[k].y) >= tol for k in kept):
+            kept.append(i)
+    return sorted(kept)
+
+
 def drop_coincident(bhs, tol=1.0):
     """Boreholes closer than `tol` m (collar position) to an earlier one are left out - a panel
     between them has no length (the one with more layers is kept)."""
-    kept = []
-    for b in sorted(bhs, key=lambda q: -len(q.layers)):
-        if all(math.hypot(b.x - k.x, b.y - k.y) >= tol for k in kept):
-            kept.append(b)
-    keep_ids = {id(b) for b in kept}
-    return [b for b in bhs if id(b) in keep_ids]
+    return [bhs[i] for i in _unique_indices(bhs, tol)]
 
 
 def unit_at(layers, depth):
@@ -59,6 +63,18 @@ def unit_at(layers, depth):
 
 
 # --------------------------------------------------------------- grid model
+def _plan_dist(b, x, y):
+    """Horizontal distance of the point (x, y) from the trace of the borehole (collar for a
+    vertical hole, the segment collar - bottom for an inclined one)."""
+    if b.dip <= 0.0 or b.depth <= 0.0:
+        return math.hypot(b.x - x, b.y - y)
+    ex, ey, _ = b.point_at(b.depth)
+    dx, dy = ex - b.x, ey - b.y
+    ll = dx * dx + dy * dy
+    t = 0.0 if ll <= 0.0 else max(0.0, min(1.0, ((x - b.x) * dx + (y - b.y) * dy) / ll))
+    return math.hypot(b.x + t * dx - x, b.y + t * dy - y)
+
+
 def grid_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0,
                margin=0.1, max_prisms=80000):
     """Block model on a square grid.
@@ -99,9 +115,11 @@ def grid_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0,
             cx, cy = x0 + (ix + 0.5) * cell, y0 + (iy + 0.5) * cell
             dist = sorted(((math.hypot(b.x - cx, b.y - cy), b) for b in bhs),
                           key=lambda t: t[0])
-            if maxdist > 0 and dist[0][0] > maxdist:
-                continue
+            if maxdist > 0 and min(_plan_dist(b, cx, cy) for b in bhs) > maxdist:
+                continue                    # (an inclined hole counts with its whole trace, not the collar)
             near = [(d, b) for d, b in dist[:max(1, k)] if maxdist <= 0 or d <= maxdist]
+            if not near:                    # only the deeper part of an inclined hole is near
+                near = [dist[0]]
             wts = [(1.0 / (d * d + eps), b) for d, b in near]
             wsum = sum(w for w, _ in wts)
             g = sum(w * b.z for w, b in wts) / wsum                 # ground elevation
@@ -210,9 +228,14 @@ def _densify(P, step):
     for q in range(m):
         (d1, z1), (d2, z2) = P[q], P[(q + 1) % m]
         n = max(1, int(math.ceil(abs(d2 - d1) / step)))
-        for k in range(n):
-            t = k / n
-            out.append((d1 + (d2 - d1) * t, z1 + (z2 - z1) * t))
+        out.append((d1, z1))
+        # the inner points are computed from the lexicographically smaller end, so an edge and
+        # its reverse (the two sides of a bridge to a hole) give bitwise identical points
+        forward = (d1, z1) <= (d2, z2)
+        (da, za), (db, zb) = ((d1, z1), (d2, z2)) if forward else ((d2, z2), (d1, z1))
+        for k in range(1, n):
+            j = k if forward else n - k
+            out.append((da + (db - da) * j / n, za + (zb - za) * j / n))
     return out
 
 
@@ -257,14 +280,7 @@ def solid_from_outline(front, back, thickness=None):
                     return True
         return False
 
-    if hl < 1e-12:                                   # no thickness: keep the old behaviour
-        faces = [list(front), list(reversed(back))]
-        for k in range(m):
-            a, b = front[k], front[(k + 1) % m]
-            if math.dist(a, b) >= 1e-6 and not _bridge(a, b):
-                faces.append([a, b, back[(k + 1) % m], back[k]])
-        return faces
-    nfx, nfy = hx / hl, hy / hl                      # horizontal normal of the front face
+    nfx, nfy = (hx / hl, hy / hl) if hl >= 1e-12 else (0.0, 0.0)   # horizontal normal of the front face
     tx, ty = nfy, -nfx                               # horizontal direction along the panel
 
     def newell(ring):
@@ -281,6 +297,22 @@ def solid_from_outline(front, back, thickness=None):
         n = newell(ring)
         return ring if n[0] * vx + n[1] * vy + n[2] * vz >= 0 else list(reversed(ring))
 
+    if hl < 1e-12:                                   # no thickness: a flat body (front = back)
+        # the front keeps its winding, the back is turned over, and every wall is oriented away
+        # from the outline: outward direction of an edge a -> b is (b - a) x n of the front
+        nf = newell(front)
+        faces = [list(front), list(reversed(back))]
+        for k in range(m):
+            a, b = front[k], front[(k + 1) % m]
+            if math.dist(a, b) < 1e-6 or _bridge(a, b):
+                continue
+            wall = [a, b, back[(k + 1) % m], back[k]]
+            e = (b[0] - a[0], b[1] - a[1], b[2] - a[2])
+            ox = e[1] * nf[2] - e[2] * nf[1]
+            oy = e[2] * nf[0] - e[0] * nf[2]
+            oz = e[0] * nf[1] - e[1] * nf[0]
+            faces.append(outward(wall, ox, oy, oz) if (ox or oy or oz) else wall)
+        return faces
     faces = [outward(list(front), nfx, nfy, 0.0), outward(list(back), -nfx, -nfy, 0.0)]
     s = [(p[0] * tx + p[1] * ty, p[2]) for p in front]           # outline in (s, z)
     area = sum(s[q][0] * s[(q + 1) % m][1] - s[(q + 1) % m][0] * s[q][1] for q in range(m))
@@ -385,8 +417,9 @@ def build_layers(solids, colors, group_name, edges=False, registry=None, volume=
             by_lit.setdefault(lit, []).append(faces)
         for lit, bodies in sorted(by_lit.items(), key=lambda kv: str(kv[0])):
             lyr = QgsVectorLayer(
-                f"MultiPolygonZ?crs={CRS}&field=litho:string&field=zbot:double&field=ztop:double",
+                "MultiPolygonZ?field=litho:string&field=zbot:double&field=ztop:double",
                 f"{lit}{suffix}", "memory")
+            lyr.setCrs(core.work_crs())     # the CRS object, not an authid text in the URI
             feats = []
             for faces in bodies:
                 mp = QgsMultiPolygon()
@@ -437,9 +470,9 @@ def delaunay_triangles(pts):
         return []
     minx, maxx = min(p[0] for p in pts), max(p[0] for p in pts)
     miny, maxy = min(p[1] for p in pts), max(p[1] for p in pts)
-    dm = max(maxx - minx, maxy - miny, 1.0) * 30.0
+    dm = max(maxx - minx, maxy - miny, 1.0) * 1000.0     # long thin sets of boreholes (roads, tunnels)
     mx, my = (minx + maxx) / 2.0, (miny + maxy) / 2.0
-    # work in a local origin: S-JTSK coordinates are ~1e6 m, their squares ~1e12 would eat the
+    # work in a local origin: projected coordinates are often ~1e6 m, their squares ~1e12 would eat the
     # significant digits of float64 in the in-circle test
     P = [(p[0] - mx, p[1] - my) for p in pts] + [(-dm, -dm), (0.0, dm), (dm, -dm)]
 
@@ -452,7 +485,10 @@ def delaunay_triangles(pts):
               + (cx * cx + cy * cy) * (ay - by)) / d
         uy = ((ax * ax + ay * ay) * (cx - bx) + (bx * bx + by * by) * (ax - cx)
               + (cx * cx + cy * cy) * (bx - ax)) / d
-        return (p[0] - ux) ** 2 + (p[1] - uy) ** 2 < (ax - ux) ** 2 + (ay - uy) ** 2 - 1e-9
+        r2 = (ax - ux) ** 2 + (ay - uy) ** 2
+        # relative tolerance: a fixed one in m^2 is too coarse for tiny models and below the
+        # float64 rounding for large ones
+        return (p[0] - ux) ** 2 + (p[1] - uy) ** 2 < r2 * (1.0 - 1e-12)
 
     tris = [(n, n + 1, n + 2)]
     for i in range(n):
@@ -494,6 +530,16 @@ def _chain_edges(pts):
 
 
 def neighbour_edges(bhs, mode="grid", maxlen=0.0):
+    """Pairs of neighbouring boreholes (indices of `bhs`) that get a panel; boreholes less than
+    1 m from another one (repeated or inclined holes from one spot) are not joined.
+    See _neighbour_edges for the modes."""
+    keep = _unique_indices(bhs)
+    if len(keep) == len(bhs):
+        return _neighbour_edges(bhs, mode, maxlen)
+    return sorted((keep[a], keep[b]) for a, b in _neighbour_edges([bhs[i] for i in keep], mode, maxlen))
+
+
+def _neighbour_edges(bhs, mode="grid", maxlen=0.0):
     """Pairs of neighbouring boreholes (indices) that get a panel.
     mode "grid": the nearest borehole in each of four directions (the grid is
     rotated to the dominant direction of the boreholes), "delaunay": triangulation.
@@ -541,9 +587,13 @@ def neighbour_edges(bhs, mode="grid", maxlen=0.0):
 
 def _dem_shift(A, B, L, dem, n=40):
     """Terrain-following offset along the panel A-B: the DEM profile minus the straight
-    line between the collars, with zero offset at the two boreholes."""
+    line between the collars, with zero offset at the two boreholes.
+    A panel of no length (L <= 0, NaN) has no profile: None (no terrain shift)."""
+    if not L > 0.0:
+        return None
     ds = [L * k / n for k in range(n + 1)]
     hs = [dem(A.x + (B.x - A.x) * d / L, A.y + (B.y - A.y) * d / L) for d in ds]
+    hs = [h if (h is not None and math.isfinite(h)) else None for h in hs]     # NaN / Inf = NoData
     if all(h is None for h in hs):
         return None
     # NoData samples: linear interpolation between the neighbouring valid samples (the collars
@@ -607,6 +657,23 @@ class _Sampler:
                 ds, zs = [p[0] for p in P], [p[1] for p in P]
                 self.polys.append((min(ds), max(ds), min(zs), max(zs), P, lit))
 
+    def levels(self, d):
+        """Elevations (terrain-shifted like lit_at) in the middle of every stretch of the vertical
+        line at distance d that lies inside a polygon: samples inside thin layers."""
+        out = []
+        sh = self.shift(d) if self.shift else 0.0
+        for d1, d2, _z1, _z2, P, _lit in self.polys:
+            if not d1 <= d <= d2:
+                continue
+            zs = []
+            for q in range(len(P)):
+                (x1, y1), (x2, y2) = P[q], P[(q + 1) % len(P)]
+                if (x1 <= d < x2) or (x2 <= d < x1):
+                    zs.append(y1 + (y2 - y1) * (d - x1) / (x2 - x1))
+            zs.sort()
+            out.extend(0.5 * (a + b) + sh for a, b in zip(zs[0::2], zs[1::2]))
+        return out
+
     def lit_at(self, d, z):
         if self.shift:
             z -= self.shift(d)
@@ -639,6 +706,17 @@ def _clip_convex(poly, tri):
 
 
 def fill_between_sections(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, max_columns=30000):
+    """Volume between the panels (boreholes less than 1 m apart count once, the indices given to
+    edge_of are those of `bhs`).  See _fill_between_sections."""
+    keep = _unique_indices(bhs)
+    if len(keep) == len(bhs):
+        return _fill_between_sections(bhs, edge_of, dz, cell, maxlen, dem, max_columns)
+    return _fill_between_sections([bhs[i] for i in keep],
+                                  lambda i, j: edge_of(keep[i], keep[j]),
+                                  dz, cell, maxlen, dem, max_columns)
+
+
+def _fill_between_sections(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, max_columns=30000):
     """Volume between the panels: every Delaunay triangle of neighbouring boreholes is cut
     into small columns; the lithology of a column at depth z is interpolated from the three
     sections around the triangle (the line from each corner through the column hits the
@@ -694,29 +772,37 @@ def fill_between_sections(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, 
                 if ncol > max_columns:
                     raise ValueError("The filled model would contain too many columns - "
                                      "increase the fill cell size.")
-                cx = sum(p[0] for p in ring) / len(ring)
-                cy = sum(p[1] for p in ring) / len(ring)
+                # centroid of the polygon (area-weighted): the mean of the vertices is pulled to the
+                # side where the clipping by the triangle put more vertices
+                # (computed from the first vertex: coordinates of ~1e6 m would lose the digits)
+                ox, oy = ring[0]
+                a2 = cx = cy = 0.0
+                for q in range(len(ring)):
+                    x1, y1 = ring[q][0] - ox, ring[q][1] - oy
+                    x2, y2 = ring[(q + 1) % len(ring)][0] - ox, ring[(q + 1) % len(ring)][1] - oy
+                    c = x1 * y2 - x2 * y1
+                    a2 += c
+                    cx += (x1 + x2) * c
+                    cy += (y1 + y2) * c
+                if abs(a2) > 1e-12 * cell * cell:
+                    cx = ox + cx / (3.0 * a2)
+                    cy = oy + cy / (3.0 * a2)
+                else:
+                    cx = sum(p[0] for p in ring) / len(ring)
+                    cy = sum(p[1] for p in ring) / len(ring)
                 wa = ((B[0] - cx) * (C[1] - cy) - (B[1] - cy) * (C[0] - cx)) / det
                 wb = ((C[0] - cx) * (A[1] - cy) - (C[1] - cy) * (A[0] - cx)) / det
                 w3 = [max(wa, 0.0), max(wb, 0.0), max(1.0 - wa - wb, 0.0)]
                 g = None
                 if dem is not None:
                     g = dem(cx, cy)
+                gz = sum(w * b.z for w, b in zip(w3, bh3))
                 if g is None:
-                    g = sum(w * b.z for w, b in zip(w3, bh3))
-                zbot = sum(w * b.z_at(b.depth) for w, b in zip(w3, bh3))
-                refs = []                       # (sampler, distance d, weight) for the 3 sections
-                for v in range(3):
-                    u, w = (v + 1) % 3, (v + 2) % 3
-                    den = w3[u] + w3[w]
-                    tt = w3[w] / den if den > 1e-9 else 0.5
-                    i1, i2 = idx[u], idx[w]
-                    sampler, length = edge_of(min(i1, i2), max(i1, i2))
-                    if i1 > i2:
-                        tt = 1.0 - tt
-                    if sampler is None:
-                        continue
-                    refs.append((sampler, tt * length, 1.0 / (w3[v] ** 2 + 0.02)))
+                    g = gz
+                # the panels are shifted with the terrain (fence_solids), bottom included: the bottom
+                # of the column follows by the same offset, or there are gaps / cut-offs under hills
+                zbot = sum(w * b.z_at(b.depth) for w, b in zip(w3, bh3)) + (g - gz)
+                refs = _section_refs(w3, idx, edge_of)   # (sampler, distance d, weight) of 3 sections
 
                 if not refs:
                     continue
@@ -729,7 +815,8 @@ def fill_between_sections(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, 
                             votes[lit] = votes.get(lit, 0.0) + wt
                     return max(votes, key=votes.get) if votes else None
 
-                for top, bot, lit in _column_runs(vote, g, zbot, dz):
+                extra = [z for sampler, d, _wt in refs for z in sampler.levels(d)]
+                for top, bot, lit in _column_runs(vote, g, zbot, dz, extra):
                     out.append((box_solid(ring, bot, top - bot), lit))
     return out
 
@@ -790,6 +877,16 @@ MAX_SMOOTH_CELLS = 250_000      # triangle subdivisions of the smooth meshes (Py
 
 
 def fill_smooth(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, max_solids=60000):
+    """Interpolated layers between the sections WITHOUT blocks (boreholes less than 1 m apart count
+    once, the indices given to edge_of are those of `bhs`).  See _fill_smooth."""
+    keep = _unique_indices(bhs)
+    if len(keep) == len(bhs):
+        return _fill_smooth(bhs, edge_of, dz, cell, maxlen, dem, max_solids)
+    return _fill_smooth([bhs[i] for i in keep], lambda i, j: edge_of(keep[i], keep[j]),
+                        dz, cell, maxlen, dem, max_solids)
+
+
+def _fill_smooth(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, max_solids=60000):
     """Interpolated layers between the sections WITHOUT blocks.
 
     Every Delaunay triangle of neighbouring boreholes is divided into a fine triangular mesh.
@@ -824,17 +921,19 @@ def fill_smooth(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, max_solids
     if len(tris) * n * n > MAX_SMOOTH_CELLS:       # before any loop: a tiny cell would freeze QGIS
         raise ValueError(f"The mesh would have about {len(tris) * n * n:,} cells - increase the "
                          "mesh size (the limit is {:,}).".format(MAX_SMOOTH_CELLS))
-    cache = {}                       # node position -> ({lithology: [(top, bottom), ...]}, g, zbot)
+    cache = {}              # node position -> (x, y, {lithology: [(top, bottom), ...]}, g, zbot)
     out = []
 
     def column(w3, x, y, bh3, idx):
-        key = (round(x, 3), round(y, 3))
+        key = (round(x, 6), round(y, 6))
         if key in cache:
             return cache[key]
+        gz = sum(w * b.z for w, b in zip(w3, bh3))
         g = dem(x, y) if dem is not None else None
         if g is None:
-            g = sum(w * b.z for w, b in zip(w3, bh3))
-        zbot = sum(w * b.z_at(b.depth) for w, b in zip(w3, bh3))
+            g = gz
+        # the panels follow the terrain including their bottom edge: so does the volume
+        zbot = sum(w * b.z_at(b.depth) for w, b in zip(w3, bh3)) + (g - gz)
         refs = _section_refs(w3, idx, edge_of)
         by = {}
         if refs:
@@ -845,9 +944,10 @@ def fill_smooth(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, max_solids
                     if lit is not None:
                         votes[lit] = votes.get(lit, 0.0) + wt
                 return max(votes, key=votes.get) if votes else None
-            for top, bot, lit in _column_runs(vote, g, zbot, dz):
+            extra = [z for sampler, d, _wt in refs for z in sampler.levels(d)]
+            for top, bot, lit in _column_runs(vote, g, zbot, dz, extra):
                 by.setdefault(lit, []).append((top, bot))
-        cache[key] = (by, g, zbot)
+        cache[key] = (x, y, by, g, zbot)     # the x, y of the first triangle that reached the node
         return cache[key]
 
     def join(v3):
@@ -873,8 +973,9 @@ def fill_smooth(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, max_solids
                 a, b, c = (n - i - j) / n, i / n, j / n
                 x = a * A[0] + b * B[0] + c * C[0]
                 y = a * A[1] + b * B[1] + c * C[1]
-                by, g, zbot = column((a, b, c), x, y, bh3, idx)
-                nodes[(i, j)] = (x, y, by, g, zbot)
+                # a node shared by two triangles has ONE position (the cached one), not two that
+                # differ by rounding of the barycentric sums
+                nodes[(i, j)] = column((a, b, c), x, y, bh3, idx)
             return nodes[(i, j)]
 
         for i in range(n):
@@ -1013,14 +1114,21 @@ def smooth_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0
     if cell <= 0:
         cell = max(ext / 25.0, 1.0)
     cand_n = max(2 * k, 8)
+    # how far an inclined hole can lie from its collar (horizontally)
+    reach = {id(b): b.depth * math.sin(math.radians(b.dip)) for b in bhs}
     cache = {}
 
     def column(x, y):
-        key = (round(x, 3), round(y, 3))
+        key = (round(x, 6), round(y, 6))
         if key in cache:
             return cache[key]
         dl = sorted(((math.hypot(b.x - x, b.y - y), b) for b in bhs), key=lambda t: t[0])
         cands = [b for _, b in dl[:cand_n]]
+        # a long inclined hole whose collar is farther than the candidates but whose trace can
+        # pass under the point (as in grid_model, which looks at every hole) is a candidate too
+        if len(dl) > cand_n:
+            dmax = dl[cand_n - 1][0]
+            cands += [b for d, b in dl[cand_n:] if reach[id(b)] > 0 and d - reach[id(b)] <= dmax]
         wc = _shepard(dl, max(1, k))
         ws = sum(w for w, _ in wc)
         g = sum(w * b.z for w, b in wc) / ws                       # ground elevation
@@ -1059,8 +1167,21 @@ def smooth_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0
                     votes[L.litho] = votes.get(L.litho, 0.0) + w
             return max(votes, key=votes.get) if votes else None
 
+        # samples in the middle of every layer of the nearest boreholes (in the elevation of each
+        # rule of vote), so a layer thinner than dz is not stepped over
+        extra = []
+        for _, b in dl[:max(1, k)]:
+            cd = cos_dip[id(b)]
+            qb = qth[id(b)] if known[id(b)] else qt / cd
+            for L in lay[id(b)]:
+                dm = 0.5 * (L.top + L.bottom)
+                extra.append(b.z - dm * cd)                                # elevation mode
+                if qt > 0 and qvth[id(b)] > 0:
+                    extra.append(g - dm * cd * qt / qvth[id(b)])           # Quaternary cover
+                if mode == "depth":
+                    extra.append(g - (qt + (dm - qb) * cd))                # layers follow the ground
         by = {}
-        for top, bot, lit in _column_runs(vote, g, zbot, dz):
+        for top, bot, lit in _column_runs(vote, g, zbot, dz, extra):
             by.setdefault(lit, []).append((top, bot))
         cache[key] = (x, y, by, g, zbot)
         return cache[key]
@@ -1144,13 +1265,24 @@ def smooth_model(boreholes, cell=0.0, dz=2.0, mode="elevation", k=4, maxdist=0.0
                  "extent": extent}
 
 
-def _column_runs(vote, ztop, zbot, dz):
-    """Runs (top, bottom, lithology) of one column; boundaries are refined by bisection."""
+def _column_runs(vote, ztop, zbot, dz, extra=()):
+    """Runs (top, bottom, lithology) of one column; boundaries are refined by bisection.
+    The column is sampled every ~dz and at the elevations in `extra` (e.g. the middle of every
+    layer of the neighbouring boreholes or sections): a layer thinner than dz that lies between
+    two equidistant samples would otherwise be skipped and swallowed by its neighbour."""
     if ztop - zbot < 1e-6:
         return []
     n = max(1, int(math.ceil((ztop - zbot) / dz)))
     step = (ztop - zbot) / n
     zc = [ztop - (k + 0.5) * step for k in range(n)]
+    if extra:
+        seen = {round(z, 6) for z in zc}
+        for z in extra:
+            if zbot + 1e-6 < z < ztop - 1e-6 and round(z, 6) not in seen:
+                seen.add(round(z, 6))
+                zc.append(z)
+        zc.sort(reverse=True)
+        n = len(zc)
     lits = [vote(z) for z in zc]
     runs = []
     top = ztop
@@ -1223,7 +1355,8 @@ def network_solids(bhs, edges, make_geo, width=1.0, step=5.0, dz=2.0, dem=None,
                 samplers[(i, j)] = sampler_of(i, j)
             return samplers[(i, j)]
         if fill_mode == "blocks":
-            volume = fill_between_sections(bhs, cached, dz, cell, maxlen, dem)
+            volume = fill_between_sections(bhs, cached, dz, cell, maxlen, dem,
+                                           max_columns=max(1, min(30000, max_solids - len(solids))))
         else:
             volume = fill_smooth(bhs, cached, dz, cell, maxlen, dem,
                                  max_solids=max(1, max_solids - len(solids)))   # panels + volume together

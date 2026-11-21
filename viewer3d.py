@@ -22,17 +22,28 @@ from collections import Counter
 HERE = os.path.dirname(os.path.abspath(__file__))
 TEMPLATE = os.path.join(HERE, "viewer3d.html")
 PLACEHOLDER = "/*SCENE_JSON*/null"
-FAULTS_PLACEHOLDER = "/*FAULTS_JSON*/[]"      # in viewer3d.html BEFORE the scene, so its first match is genuine
+FAULTS_START = "/*FAULTS_JSON_START*/"       # in viewer3d.html BEFORE the scene, so its first match is genuine
+FAULTS_END = "/*FAULTS_JSON_END*/"           # the faults JSON lies between the two markers
 _log = logging.getLogger(__name__)
 MAX_EDGE_FACES = 400000          # above this number of faces the edge lines are not exported
 
 
 # ------------------------------------------------------------ triangulation
-def _ear_clip(P, eps=1e-9):
+def _ear_clip(P, eps=None):
     """Ear clipping of a simple polygon given as a counter-clockwise list of (u, v).
     Returns triangles as index triples into P.  Collinear vertices are dropped, degenerate
-    input never loops forever."""
+    input never loops forever.  The tolerances follow the size of the polygon (like in
+    core._bridge_holes), so thin millimetre wedges are not dropped as collinear: eps is the
+    tolerance of the cross products (areas), leps that of the coordinates (lengths)."""
     n = len(P)
+    scale = max((max(abs(p[0]), abs(p[1])) for p in P), default=0.0)
+    if P:
+        scale = max(scale, max(p[0] for p in P) - min(p[0] for p in P),
+                    max(p[1] for p in P) - min(p[1] for p in P))
+    scale = max(scale, 1e-9)
+    if eps is None:
+        eps = 1e-12 * scale * scale
+    leps = 1e-11 * scale
     prev = [(i - 1) % n for i in range(n)]
     nxt = [(i + 1) % n for i in range(n)]
 
@@ -69,15 +80,15 @@ def _ear_clip(P, eps=1e-9):
         ear = cr > 0
         if ear and reflex:
             A, B, C = P[a], P[i], P[c]
-            lox, hix = min(A[0], B[0], C[0]) - eps, max(A[0], B[0], C[0]) + eps
-            loy, hiy = min(A[1], B[1], C[1]) - eps, max(A[1], B[1], C[1]) + eps
+            lox, hix = min(A[0], B[0], C[0]) - leps, max(A[0], B[0], C[0]) + leps
+            loy, hiy = min(A[1], B[1], C[1]) - leps, max(A[1], B[1], C[1]) + leps
             for j in reflex:
                 if j == a or j == c or j == i:
                     continue
                 p = P[j]
                 if p[0] < lox or p[0] > hix or p[1] < loy or p[1] > hiy:
                     continue
-                if any(abs(p[0] - q[0]) <= eps and abs(p[1] - q[1]) <= eps for q in (A, B, C)):
+                if any(abs(p[0] - q[0]) <= leps and abs(p[1] - q[1]) <= leps for q in (A, B, C)):
                     continue                    # a duplicate of the ear's own vertex (hole bridge)
                 d1 = (B[0] - A[0]) * (p[1] - A[1]) - (B[1] - A[1]) * (p[0] - A[0])
                 d2 = (C[0] - B[0]) * (p[1] - B[1]) - (C[1] - B[1]) * (p[0] - B[0])
@@ -277,7 +288,7 @@ class _Mesh:
     def add_face(self, ring3d, ox, oy):
         ring = []
         for x, y, z in ring3d:
-            if not math.isfinite(x + y + z):
+            if not (math.isfinite(x) and math.isfinite(y) and math.isfinite(z)):
                 return                           # NaN / Inf: the face cannot be placed, drop it
             i = self.vertex(x - ox, y - oy, z)
             if not ring or ring[-1] != i:
@@ -375,7 +386,7 @@ def _hex(c):
         try:
             h = c.name()                         # QColor
         except AttributeError:
-            r, g, b = c
+            r, g, b = c[:3]                      # (r, g, b) or (r, g, b, a)
             h = "#%02x%02x%02x" % (int(r), int(g), int(b))
     if not _HEX_RE.match(h):
         raise ValueError(f"Invalid colour: {h!r}")
@@ -539,13 +550,16 @@ def _json_for_html(obj):
 
 
 def with_faults(html, faults):
-    """The viewer HTML with the given faults (see sanitize_faults) as its initial faults."""
+    """The viewer HTML with the given faults (see sanitize_faults) as its initial faults.
+    The faults are written between the paired markers /*FAULTS_JSON_START*/ and
+    /*FAULTS_JSON_END*/, which stay in the text, so the function can be applied again to its
+    own result (the faults are replaced, not added) and does not depend on line breaks."""
     faults = sanitize_faults(faults)
-    if not faults:
-        return html
-    if FAULTS_PLACEHOLDER not in html:
+    i = html.find(FAULTS_START)           # the first one: the template has it BEFORE the scene
+    end = html.find(FAULTS_END, i + len(FAULTS_START)) if i >= 0 else -1
+    if i < 0 or end < 0:
         raise RuntimeError("viewer3d.html is damaged (fault placeholder missing).")
-    return html.replace(FAULTS_PLACEHOLDER, _json_for_html(faults), 1)
+    return html[:i] + FAULTS_START + _json_for_html(faults) + html[end:]
 
 
 def render_html(scene):
@@ -585,9 +599,11 @@ class ViewerDirError(OSError):
 
 
 def _viewer_dir():
-    """Directory of the viewer files: the temp directory, but when that is not private to this
-    user (Windows TEMP redirected outside the user profile, so its ACL may allow other users to
-    read it) a folder inside the user profile, which only the user (and administrators) can read.
+    """Directory of the viewer files: the temp directory when it is private to this user (the
+    per-user temp folder of macOS, Windows TEMP inside the profile), otherwise (the shared /tmp
+    of Linux, whose listing shows the names and times of the files to every local user, or a
+    Windows TEMP outside the profile) a folder .borehole_sections_tmp in the user's home
+    directory (mode 0700), which only the user (and administrators) can read.
     When that private folder cannot be made or verified, ViewerDirError is raised: the shared
     temp directory is NOT used as a fallback."""
     d = tempfile.gettempdir()
@@ -620,7 +636,7 @@ def _private_dir_problem(path):
             if st.st_uid != os.getuid():
                 return "owned by another user"
             if st.st_mode & 0o077:
-                os.chmod(path, 0o700)
+                os.chmod(path, 0o700)  # nosec B103 - owner-only directory permissions (rwx------)
                 if os.lstat(path).st_mode & 0o077:
                     return "its permissions cannot be restricted"
     except OSError as e:
@@ -629,11 +645,17 @@ def _private_dir_problem(path):
 
 
 def _temp_dir_is_private():
-    """Age cleanup may touch foreign-looking files only in a temp directory of this user.
-    POSIX: file owners are checked per file.  Windows has no getuid(), so the temp directory
-    must lie inside the user profile (a shared TEMP such as C:\\Temp is not cleaned)."""
+    """Is the temp directory private to this user (nobody else can even list the names and
+    times of the viewer files)?  POSIX: owned by this user and closed to group and others (the
+    per-user macOS temp folder; the shared /tmp of Linux, mode 1777, is not).  Windows has no
+    getuid(), so the temp directory must lie inside the user profile (a shared TEMP such as
+    C:\\Temp is not private)."""
     if hasattr(os, "getuid"):
-        return True
+        try:
+            st = os.stat(tempfile.gettempdir())
+        except OSError:
+            return False
+        return stat.S_ISDIR(st.st_mode) and st.st_uid == os.getuid() and not st.st_mode & 0o077
     profile = os.environ.get("USERPROFILE")
     if not profile:
         return False
@@ -652,11 +674,19 @@ def remove_old_files(*a, **k):
 def _remove_old_files(max_age=2 * 3600):
     """Remove viewer files of this plugin older than two hours (the browser timer is one hour) from the temp directory (only
     regular files owned by the current user; links and foreign files are never touched)."""
+    dirs = []
     try:
-        d = _viewer_dir()
+        dirs.append(_viewer_dir())
     except ViewerDirError as e:
-        _log.debug("old viewer files are not removed: %s", e)
-        return                                  # no private directory, so no viewer files there
+        _log.debug("old viewer files are not removed from the private directory: %s", e)
+    shared = tempfile.gettempdir()             # files of the versions that wrote there (own files only)
+    if hasattr(os, "getuid") and not any(_same_dir(shared, x) for x in dirs):
+        dirs.append(shared)                    # POSIX only: the owner of every file is checked
+    for d in dirs:
+        _remove_old_files_in(d, max_age)
+
+
+def _remove_old_files_in(d, max_age):
     now = time.time()
     uid = os.getuid() if hasattr(os, "getuid") else None
     try:
