@@ -1068,15 +1068,16 @@ def project_boreholes(points, boreholes, max_offset, min_gap=0.0):
                 d_top = line.lineLocatePoint(g_top)
                 d_bot = line.lineLocatePoint(g_bot)
             d_mid = 0.5 * (d_top + d_bot)
-            path = None
-            if len(points) >= 3 and math.hypot(bx - b.x, by - b.y) > 1e-6:
-                def path(md, b=b):          # point of the hole at md projected on the broken line
-                    x, y, _ = b.point_at(md)
-                    g = QgsGeometry.fromPointXY(QgsPointXY(x, y))
-                    d = (ext_line.lineLocatePoint(g) - ext) if has_ext else line.lineLocatePoint(g)
-                    return d, signed_offset(sp, x, y)
+            def trace_path(md, b=b):        # point of the hole at md projected on the broken line
+                x, y, _ = b.point_at(md)
+                g = QgsGeometry.fromPointXY(QgsPointXY(x, y))
+                d = (ext_line.lineLocatePoint(g) - ext) if has_ext else line.lineLocatePoint(g)
+                return d, signed_offset(sp, x, y)
+
+            bends = len(points) >= 3 and math.hypot(bx - b.x, by - b.y) > 1e-6
+            path_fn = trace_path if bends else None
             out.append(Projected(b, d_mid, off, d_top, d_bot,
-                                 signed_offset(sp, b.x, b.y), signed_offset(sp, bx, by), path=path))
+                                 signed_offset(sp, b.x, b.y), signed_offset(sp, bx, by), path=path_fn))
     out.sort(key=lambda p: p.dist)
     return drop_close_boreholes(out, min_gap)
 
