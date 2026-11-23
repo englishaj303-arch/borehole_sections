@@ -66,7 +66,7 @@ _EASTNORTH = ("Easting (E) [m]", "Northing (N) [m]",
 # authid None = UTM family: the EPSG code follows from the zone (see UTM_FAMILIES, crs_authid)
 INPUT_CRS = {
     "sjtsk": ("EPSG:5514", "S-JTSK (EPSG:5514)",
-              "X (southing / Krovak X [m])", "Y (westing / Krovak Y [m])", ["x"], ["y"]),
+              "X (northing, latitude)", "Y (easting, longitude)", ["x"], ["y"]),
     "wgs84": ("EPSG:4326", "WGS84 geographic - lon/lat in degrees (EPSG:4326)", *_LONLAT),
     "etrs89": ("EPSG:4258", "ETRS89 geographic - lon/lat in degrees (EPSG:4258)", *_LONLAT),
     "nad83": ("EPSG:4269", "NAD83 geographic - lon/lat in degrees (EPSG:4269)", *_LONLAT),

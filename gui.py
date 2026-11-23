@@ -1,4 +1,4 @@
-from qgis.PyQt.QtCore import Qt, QRectF, QSize, QTimer, pyqtSignal
+from qgis.PyQt.QtCore import Qt, QEvent, QRectF, QSize, QSortFilterProxyModel, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import (QColor, QGuiApplication, QIcon, QImage, QPainter, QPdfWriter,
                              QStandardItem, QStandardItemModel,
                              QPageSize, QPageLayout, QPixmap)
@@ -8,7 +8,7 @@ from qgis.PyQt.QtWidgets import (
     QComboBox, QCheckBox, QPushButton, QLabel, QPlainTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QDoubleSpinBox, QGraphicsView, QFileDialog,
     QMessageBox, QSplitter, QSpinBox, QScrollArea, QFrame, QListWidget, QListWidgetItem,
-    QApplication, QInputDialog,
+    QApplication, QInputDialog, QLineEdit, QListView,
 )
 from qgis.core import (
     Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsCsException, QgsGeometry,
@@ -35,6 +35,104 @@ def _busy():
 
 
 # ---------------------------------------------------------------- map tool
+class _PatternPopup(QFrame):
+    """Drop-down of PatternCombo: a search line above the list of the patterns (with icons).
+    Typing filters the list (case-insensitive, anywhere in the code or the name); Up / Down
+    move in the list, Enter or a click chooses, Esc closes."""
+
+    def __init__(self, combo):
+        super().__init__(combo, Qt.WindowType.Popup)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self._combo = combo
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(4)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search pattern (code or name)...")
+        self.search.setClearButtonEnabled(True)
+        lay.addWidget(self.search)
+        self._proxy = QSortFilterProxyModel(self)
+        self._proxy.setSourceModel(combo.model())
+        self._proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self._proxy.setFilterRole(Qt.ItemDataRole.DisplayRole)
+        self.view = QListView()
+        self.view.setModel(self._proxy)
+        self.view.setIconSize(QSize(48, 36))
+        self.view.setUniformItemSizes(True)
+        self.view.setEditTriggers(QListView.EditTrigger.NoEditTriggers)
+        lay.addWidget(self.view)
+        self.search.textChanged.connect(self._filter)
+        self.search.installEventFilter(self)
+        self.view.clicked.connect(self._choose)
+        self.view.activated.connect(self._choose)
+
+    def _filter(self, text):
+        self._proxy.setFilterFixedString(text.strip())
+        if self._proxy.rowCount():
+            self.view.setCurrentIndex(self._proxy.index(0, 0))
+            self.view.scrollToTop()
+
+    def _choose(self, index):
+        if not index.isValid():
+            return
+        row = self._proxy.mapToSource(index).row()
+        self.close()
+        self._combo.setCurrentIndex(row)
+        self._combo.activated.emit(row)
+
+    def eventFilter(self, obj, ev):
+        if obj is self.search and ev.type() == QEvent.Type.KeyPress:
+            key = ev.key()
+            if key in (Qt.Key.Key_Down, Qt.Key.Key_Up, Qt.Key.Key_PageDown, Qt.Key.Key_PageUp):
+                self.view.setFocus()
+                QApplication.sendEvent(self.view, ev)
+                return True
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self._choose(self.view.currentIndex())
+                return True
+        return super().eventFilter(obj, ev)
+
+    def popup(self):
+        combo = self._combo
+        w = max(combo.width(), 420)
+        h = 8 + self.search.sizeHint().height() + 4 + 12 * 40 + 6
+        below = combo.mapToGlobal(combo.rect().bottomLeft())
+        above = combo.mapToGlobal(combo.rect().topLeft())
+        scr = combo.screen().availableGeometry() if combo.screen() else None
+        x, y = below.x(), below.y()
+        if scr is not None:
+            if y + h > scr.bottom():
+                y = above.y() - h if above.y() - h >= scr.top() else max(scr.top(), scr.bottom() - h)
+            x = max(scr.left(), min(x, scr.right() - w))
+        self.setGeometry(x, y, w, h)
+        self.search.clear()
+        self._proxy.setFilterFixedString("")
+        cur = self._proxy.index(max(combo.currentIndex(), 0), 0)
+        self.view.setCurrentIndex(cur)
+        self.show()
+        self.view.scrollTo(cur, QListView.ScrollHint.PositionAtCenter)
+        self.search.setFocus()
+
+
+class PatternCombo(QComboBox):
+    """Combo box of the lithologic patterns: the closed box shows the icon and the name, the
+    drop-down has a search line (see _PatternPopup) above the list."""
+
+    def showPopup(self):
+        if self.model() is None or self.model().rowCount() == 0:
+            return
+        pop = getattr(self, "_popup", None)
+        if pop is None:
+            pop = self._popup = _PatternPopup(self)
+        pop.popup()
+
+    def hidePopup(self):
+        pop = getattr(self, "_popup", None)
+        if pop is not None and pop.isVisible():
+            pop.close()
+        super().hidePopup()
+
+
 class SectionLineTool(QgsMapTool):
     lineFinished = pyqtSignal(list)
     cancelled = pyqtSignal()
@@ -672,7 +770,7 @@ class BoreholeDialog(QDialog):
         w = QWidget()
         lay = QVBoxLayout(w)
         self.tbl = QTableWidget(0, 4)
-        self.tbl.verticalHeader().setDefaultSectionSize(42)     # room for the 48x36 pattern icons
+        self.tbl.verticalHeader().setDefaultSectionSize(30)     # compact rows (32x24 pattern icons)
         self.tbl.setHorizontalHeaderLabels(["Lithology", "Colour", "Grain size", "Pattern"])
         self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         lay.addWidget(self.tbl)
@@ -1163,9 +1261,8 @@ class BoreholeDialog(QDialog):
             gb.setCurrentIndex(logs.GRAINS.index(logs.guess_grain(lit)))
             self.tbl.setCellWidget(i, 2, gb)
             self.grain_boxes[lit] = gb
-            pb = QComboBox()
-            pb.setIconSize(QSize(48, 36))
-            pb.setMaxVisibleItems(12)
+            pb = PatternCombo()
+            pb.setIconSize(QSize(32, 24))
             pb.setModel(pat_model)               # one model (133 icons) for all rows
             pb.setCurrentIndex(max(pb.findData(patterns.default_pattern(lit)), 0))
             self.tbl.setCellWidget(i, 3, pb)
