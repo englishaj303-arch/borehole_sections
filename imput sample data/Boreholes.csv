@@ -1,4 +1,4 @@
-﻿Borehole name;X (northing, latitude);Y (easting, latitude);Altitude Z;Total depth;Azimuth[deg];Dip/deviation [deg];;;;;;;;;;;;;;
+﻿Borehole name;X (northing, latitude);Y (easting, longitude);Altitude Z;Total depth;Azimuth[deg];Dip/deviation [deg];;;;;;;;;;;;;;
 PL 1;1056082,42;820903,49;484,04;16;;;;;;;;;;;;;;;
 MK 101;1055733,85;820953,92;472,43;14;;;;;;;;;;;;;;;
 MK 102;1055661,34;820917,98;466,98;10;;;;;;;;;;;;;;;
