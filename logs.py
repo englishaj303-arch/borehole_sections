@@ -82,8 +82,11 @@ def wrap_text(s, width, measure, size=9.0):
 # ----------------------------------------------------------------- ruler
 def _nice_steps(px_per_m, min_px=38.0):
     """(major, minor) tick step in metres; major ticks are at least `min_px` apart."""
+    if not math.isfinite(px_per_m) or px_per_m <= 0:      # NaN / inf / zero scale
+        px_per_m = 1.0
     raw = min_px / max(px_per_m, 1e-9)
     mag = 10 ** math.floor(math.log10(raw))
+    major = 10 * mag
     for m in (1, 2, 5, 10):
         if raw <= m * mag:
             major = m * mag
@@ -184,6 +187,8 @@ def build_profiles(bhs, colors, patterns, mode="depth", px_per_m=0.0, measure=ap
     colors: litho -> '#rrggbb';  patterns: litho -> FGDC pattern code ('' = none);
     mode: 'depth' or 'alt'.  Left to right: the lithology column, the description of the
     layers and (when the layers have a stratigraphy) the stratigraphy column."""
+    if not bhs:
+        return []
     cmds = []
     v_top, v_bot = _extent(bhs, mode)
     span = max(v_bot - v_top if mode == "depth" else v_top - v_bot, 1e-6)
@@ -207,10 +212,11 @@ def build_profiles(bhs, colors, patterns, mode="depth", px_per_m=0.0, measure=ap
         z0 = bh.z
         lx0, lx1 = x0 + COL_W + 6, x0 + COL_W + LABEL_W          # description column
         sx = lx1 + 6                                             # stratigraphy column
-        cmds.append(_text(bh.name, x0 + COL_W / 2, TOP - 50, 15, "c", bold=True))
+        # three header lines with 20 px between them (name 15 pt, the others 8 pt)
+        cmds.append(_text(bh.name, x0 + COL_W / 2, TOP - 62, 15, "c", bold=True))
         if bh.dip > 0:
             cmds.append(_text(f"az {bh.azimuth:g}°, dip {bh.dip:g}°",
-                              x0 + COL_W / 2, TOP - 32, 8, "c"))
+                              x0 + COL_W / 2, TOP - 40, 8, "c"))
         cmds.append(_text("Lithology", x0 + COL_W / 2, TOP - 20, 8, "c"))
         # ground marker
         ytop = y_of(0.0 if mode == "depth" else z0)
@@ -259,6 +265,7 @@ def build_profiles(bhs, colors, patterns, mode="depth", px_per_m=0.0, measure=ap
 # ---------------------------------------------------------- 2) sedimentary record
 CELL = 22.0           # width of one grain-size class
 HEAD_H = 58.0
+LEGEND_TEXT_W = 260.0     # legend descriptions wrap at this width (px)
 REC_TOP = 110.0
 
 
@@ -268,6 +275,8 @@ def build_records(bhs, colors, grains, patterns=None, px_per_m=0.0, measure=appr
 
     grains: litho -> grain class (column width);  patterns: litho -> FGDC pattern code."""
     patterns = patterns or {}
+    if not bhs:
+        return []
     cmds = []
     v_top, v_bot = _extent(bhs, mode)
     span = max(v_bot - v_top if mode == "depth" else v_top - v_bot, 1e-6)
@@ -277,7 +286,13 @@ def build_records(bhs, colors, grains, patterns=None, px_per_m=0.0, measure=appr
         return REC_TOP + ((v - v_top) if mode == "depth" else (v_top - v)) * k
 
     gw = CELL * len(GRAINS)
-    x0 = 100.0
+    # width of the widest ruler label: the ruler of the next borehole must not run into the
+    # previous column (altitudes such as -1250.5 m), and the first one needs room on the left
+    lo_v, hi_v = (v_top, v_bot) if mode == "depth" else (v_bot, v_top)
+    lab_w = max(measure(f"{v:g}", 9.0) for v in (lo_v, hi_v, (lo_v + hi_v) / 2.0))
+    ruler_room = lab_w + 30.0                     # tick + gap + label
+    x0 = max(100.0, ruler_room + 12.0)
+    pitch = gw + max(100.0, ruler_room + 40.0)
     bottom_px = y_of(v_bot)
     used = []
     for n, bh in enumerate(bhs):
@@ -288,7 +303,10 @@ def build_records(bhs, colors, grains, patterns=None, px_per_m=0.0, measure=appr
         if n == 0:
             cmds.append(_text("Depth [m]" if mode == "depth" else "Altitude [m a.s.l.]",
                               x0 - 60, REC_TOP - HEAD_H - 40, 9, "l", bold=True))
-        cmds.append(_text(bh.name, x0 + gw / 2, REC_TOP - HEAD_H - 40, 14, "c", bold=True))
+        cmds.append(_text(bh.name, x0 + gw / 2, REC_TOP - HEAD_H - 46, 14, "c", bold=True))
+        if bh.dip > 0:                  # inclined hole: the depths are measured along the hole
+            cmds.append(_text(f"az {bh.azimuth:g}°, dip {bh.dip:g}°",
+                              x0 + gw / 2, REC_TOP - HEAD_H - 24, 8, "c"))
         # header: four grain-size cells with vertical captions
         for i, g in enumerate(GRAINS):
             cmds.append(_rect(x0 + i * CELL, REC_TOP - HEAD_H, CELL, HEAD_H, "#ffffff", "#000000", 0.9))
@@ -312,20 +330,24 @@ def build_records(bhs, colors, grains, patterns=None, px_per_m=0.0, measure=appr
         if letters:
             cmds.append(_text(string.ascii_lowercase[n % 26], x0 + gw / 2, bottom_px + 12, 14,
                               "c", bold=True))
-        x0 += gw + 100.0
+        x0 += pitch
 
     if legend and used:
         lx = x0 + 10
         ly = REC_TOP - 8
         cmds.append(_text("Legend", lx, ly - 34, 14, "l", bold=True, italic=True, underline=True))
-        row = 26.0
-        for i, (lit, text) in enumerate(used):
-            y = ly + i * row
+        y = ly
+        for lit, text in used:
             gr = grains.get(lit, DEFAULT_GRAIN)
+            # a long description wraps, so that it does not stretch the scene (and with it the
+            # exported image) far to the right
+            lines = wrap_text(f"{text}  ({GRAIN_LABELS[gr].lower()})", LEGEND_TEXT_W, measure, 10)
             cmds.append(_rect(lx, y, 40, 18, colors.get(lit, "#cccccc"), "#000000", 0.9))
             if patterns.get(lit):
                 cmds.append(_rect(lx, y, 40, 18, None, "#000000", 0.0, patterns[lit]))
-            cmds.append(_text(f"{text}  ({GRAIN_LABELS[gr].lower()})", lx + 50, y + 1, 10, "l"))
+            for n_l, ln in enumerate(lines):
+                cmds.append(_text(ln, lx + 50, y + 1 + n_l * 13.0, 10, "l"))
+            y += max(26.0, 13.0 * len(lines) + 10.0)
     return cmds
 
 

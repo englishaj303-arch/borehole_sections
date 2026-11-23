@@ -94,7 +94,7 @@ _KEYWORDS = [
 
 def default_pattern(litho):
     """Pattern code guessed from the name of a lithology; '' when nothing fits (plain colour)."""
-    from . import core
+    from . import core        # local import: core imports this module at load time (circular)
     n = core._norm(litho)
     best = None
     for code, keys in _KEYWORDS:
@@ -110,6 +110,10 @@ def label(code):
 
 
 def tile_path(code):
+    """Path of the PNG tile of a known pattern code (ValueError otherwise: the code is used to
+    build a file name, so nothing but the codes in NAMES may get through)."""
+    if code not in NAMES:
+        raise ValueError(f"Unknown pattern code: {code!r}")
     return os.path.join(PATTERN_DIR, f"{code}.png")
 
 
@@ -132,9 +136,27 @@ def tile_pixmap(code, scale=0.45, oversample=OVERSAMPLE):
         else:
             k = 0.25 * scale * oversample
             w, h = max(8, round(pm.width() * k)), max(8, round(pm.height() * k))
-            _cache[key] = pm.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
-                                    Qt.TransformationMode.SmoothTransformation)
+            small = pm.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
+                              Qt.TransformationMode.SmoothTransformation)
+            _cache[key] = _boost_lines(small)
     return _cache[key]
+
+
+LINE_BOOST = 0.6        # extra opacity added to the thin 1-2 px lines of the 1200 dpi tiles
+
+
+def _boost_lines(pm):
+    """The 1-2 px lines of the tiles are averaged with the transparent background when the tile
+    is reduced 4x or more and fade away; adding the pixmap to itself (opacity LINE_BOOST)
+    raises the alpha of the pale pixels by 60 % (black stays black, full alpha stays full)."""
+    from qgis.PyQt.QtGui import QPainter, QPixmap
+    out = QPixmap(pm)
+    p = QPainter(out)
+    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
+    p.setOpacity(LINE_BOOST)
+    p.drawPixmap(0, 0, pm)
+    p.end()
+    return out
 
 
 def pattern_brush(code, scale=0.45):

@@ -117,6 +117,7 @@ class SectionViewer(QDialog):
         self.split = split
         split.addWidget(self.view)
         self.panel = None
+        self.btn_regen = None
         self._strat0 = strat0
         if proj is not None and rebuild is not None and len(proj) > 1:
             side = QWidget()
@@ -138,6 +139,7 @@ class SectionViewer(QDialog):
             btn = QPushButton("Regenerate section")
             btn.clicked.connect(self.regenerate)
             sl.addWidget(btn)
+            self.btn_regen = btn
             split.addWidget(side)
             split.setStretchFactor(0, 3)
             split.setStretchFactor(1, 2)
@@ -167,6 +169,16 @@ class SectionViewer(QDialog):
             it.setVisible(self.chk_v_ground.isChecked())
         for it in geo.get("hatch_items", []):
             it.setVisible(self.chk_v_hatch.isChecked())
+
+    def mark_stale(self):
+        """The data were loaded again: Regenerate would redraw the OLD set of boreholes, so it is
+        switched off; the drawing stays available (view, export) and a new section can be drawn."""
+        if self.btn_regen is not None:
+            self.btn_regen.setEnabled(False)
+            self.btn_regen.setToolTip("The data were loaded again after this section was drawn. "
+                                      "Draw the section again to use the new data.")
+            self.btn_regen.setText("Regenerate section (data reloaded - draw the section again)")
+        self.setWindowTitle(self.windowTitle() + " [old data]")
 
     def regenerate(self):
         faults = self.panel.faults() or None
@@ -519,7 +531,7 @@ class BoreholeDialog(QDialog):
         box = QGroupBox(title)
         form = QFormLayout(box)
         fw = QgsFileWidget()
-        fw.setFilter("CSV files (*.csv *.txt);;All files (*)")
+        fw.setFilter("CSV files (*.csv *.tsv *.txt);;All files (*)")
         form.addRow("File", fw)
         dl = QComboBox()
         for label, val in core.DELIMITERS:
@@ -716,6 +728,11 @@ class BoreholeDialog(QDialog):
         self.sp_xdip.setToolTip("Manual cross slope of the strata: + = rising to the left of "
                                 "the section line (looking from its start to its end).")
         form.addRow("Cross slope of the strata (manual)", self.sp_xdip)
+
+        def _xdip_mode(*_):                       # the angle matters only in the manual mode
+            self.sp_xdip.setEnabled(self.cb_xdip.currentData() == "manual")
+        self.cb_xdip.currentIndexChanged.connect(_xdip_mode)
+        _xdip_mode()
         self.sp_vex = QDoubleSpinBox()
         self.sp_vex.setRange(0, 100)
         self.sp_vex.setSpecialValueText("Auto")
@@ -1019,6 +1036,10 @@ class BoreholeDialog(QDialog):
             QMessageBox.critical(self, "Error", str(e))
             return
         self.log.clear()
+        for v in list(self.viewers):         # open windows drawn from the previous data set
+            stale = getattr(v, "mark_stale", None)
+            if stale is not None:
+                stale()
         self.scene3d.clear()                 # models of the previous data set
         self.scene3d_colors.clear()
         self.scene3d_bhs.clear()
