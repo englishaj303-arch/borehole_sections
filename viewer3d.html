@@ -130,6 +130,8 @@ select{background:var(--box);border:1px solid var(--line);border-radius:4px;padd
     <fieldset id="ffs"><legend>Faults</legend>
       <div class="fl" id="flist"></div>
       <div class="btns"><button id="fadd">Add fault</button><button id="fdup">Duplicate</button><button id="fdel">Delete</button></div>
+      <div class="btns"><button id="fexp" title="Save the faults to a JSON file (they are lost when the page is closed)">Export faults</button><button id="fimp" title="Add the faults of a JSON file">Import faults</button></div>
+      <input id="ffile" type="file" accept=".json,application/json" hidden>
       <div id="fform" class="off">
         <div class="row"><label for="fname">Name</label><input id="fname" type="text" maxlength="60"></div>
         <div class="row"><label for="fmode">Position by</label>
@@ -173,7 +175,7 @@ select{background:var(--box);border:1px solid var(--line);border-radius:4px;padd
   </aside>
 </div>
 <script>
-const FAULTS_INIT = /*FAULTS_JSON*/[];
+const FAULTS_INIT = [];
 const FAULT_KEEP = '__borehole_faults__:';
 const SCENE = /*SCENE_JSON*/null;
 (function () {
@@ -187,7 +189,8 @@ if (!S || !S.meshes || !S.meshes.length) { window.__webgl2_ok = true; fail('No m
 const gl = canvas.getContext('webgl2', {antialias: true, preserveDrawingBuffer: true, alpha: false});
 if (!gl) {
   window.__webgl2_ok = false;
-  try { const t = document.createElement('canvas'); window.__webgl_info = 'WebGL 1: ' + (t.getContext('webgl') ? 'available' : 'not available'); } catch (e) { window.__webgl_info = 'WebGL 1: unknown'; }
+  try { const t = document.createElement('canvas'); const g1 = t.getContext('webgl'); window.__webgl_info = 'WebGL 1: ' + (g1 ? 'available' : 'not available');
+    if (g1) { const lc = g1.getExtension('WEBGL_lose_context'); if (lc) lc.loseContext(); } } catch (e) { window.__webgl_info = 'WebGL 1: unknown'; }
   fail('WebGL 2 is not available in this window. Open the viewer in a web browser (Chrome, Edge, Firefox, Safari) instead.');
   return;
 }
@@ -197,9 +200,10 @@ canvas.addEventListener('webglcontextlost', ev => {
   fail('The graphics context was lost (GPU reset or out of memory). Trying to restore it - if nothing happens reload the page (F5) or open the viewer in a web browser.');
 });
 // After the browser restores the context all buffers, textures and shaders are empty: the page is
-// built again from its own data; the faults the user added are carried over in window.name.
+// built again from its own data; the faults the user added are carried over in sessionStorage.
 canvas.addEventListener('webglcontextrestored', () => {
-  try { window.name = FAULT_KEEP + JSON.stringify(window.__getFaults ? window.__getFaults() : []); } catch (e) { window.name = ''; }
+  // sessionStorage (this tab and this file only), not window.name, which would follow the tab to other sites
+  try { sessionStorage.setItem(FAULT_KEEP, JSON.stringify(window.__getFaults ? window.__getFaults() : [])); } catch (e) { /* the faults of the file are kept */ }
   location.reload();
 });
 $('title').textContent = S.title || '3D model';
@@ -227,7 +231,10 @@ const dot = (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2];
 const crs = (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]];
 const nrm = a => { const l = Math.hypot(a[0], a[1], a[2]) || 1; return [a[0] / l, a[1] / l, a[2] / l]; };
 function lookAt(e, c, u) {
-  const z = nrm(sub(e, c)), x = nrm(crs(u, z)), y = crs(z, x), m = new Float32Array(16);
+  const z = nrm(sub(e, c));
+  let ux = crs(u, z);
+  if (Math.hypot(ux[0], ux[1], ux[2]) < 1e-6) ux = crs([0, 1, 0], z);   // looking straight along 'up' (Top view)
+  const x = nrm(ux), y = crs(z, x), m = new Float32Array(16);
   m[0] = x[0]; m[1] = y[0]; m[2] = z[0]; m[4] = x[1]; m[5] = y[1]; m[6] = z[1];
   m[8] = x[2]; m[9] = y[2]; m[10] = z[2];
   m[12] = -dot(x, e); m[13] = -dot(y, e); m[14] = -dot(z, e); m[15] = 1; return m;
@@ -269,7 +276,7 @@ void main(){
 const FS = `#version 300 es
 precision highp float;
 in vec3 vWorld; in vec3 vPosV; in vec3 vWS;
-uniform mediump sampler2DArray uTex; uniform float uTexLayer; uniform float uTexScale; uniform float uTexAsp;
+uniform mediump sampler2DArray uTex; uniform float uTexLayer; uniform float uTexScale; uniform float uTexAsp; uniform vec3 uTexLine;
 uniform vec3 uColor; uniform float uAlpha; uniform int uMode; uniform vec2 uId;
 uniform int uClipAxis; uniform float uClipPos; uniform float uClipSign;
 layout(location=0) out vec4 o0;
@@ -317,7 +324,7 @@ void main(){
     vec2 gx = (plan ? dWx.xy : vec2(dot(dWx.xy, t), dWx.z)) / sc;
     vec2 gy = (plan ? dWy.xy : vec2(dot(dWy.xy, t), dWy.z)) / sc;
     float a = textureGrad(uTex, vec3(uv / sc, uTexLayer), gx, gy).a;
-    col = mix(col, vec3(0.04), a * 0.9);
+    col = mix(col, uTexLine, a * 0.9);        // dark lines, or light ones on a dark colour (lightLines)
   }
   o0 = vec4(col * min(l, 1.15), uAlpha);
   o1 = vec4(0.0);
@@ -337,7 +344,7 @@ try {
   if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
 } catch (e) { fail('Shader error: ' + e.message); return; }
 const U = {};
-['uV', 'uP', 'uZs', 'uColor', 'uAlpha', 'uMode', 'uId', 'uClipAxis', 'uClipPos', 'uClipSign', 'uTex', 'uTexLayer', 'uTexScale', 'uTexAsp']
+['uV', 'uP', 'uZs', 'uColor', 'uAlpha', 'uMode', 'uId', 'uClipAxis', 'uClipPos', 'uClipSign', 'uTex', 'uTexLayer', 'uTexScale', 'uTexAsp', 'uTexLine']
   .forEach(n => U[n] = gl.getUniformLocation(prog, n));
 
 // ------------------------------------------------------------------ data
@@ -489,6 +496,13 @@ function updateMatrices() {
     P = persp(cam.fov, asp, Math.max(cam.dist * 0.01, R * 0.002), cam.dist + 3 * R);
   }
 }
+// colour of the hatching lines: light on a dark layer colour, dark otherwise (the same rule and limit
+// as patterns.line_is_light in patterns.py - change both together)
+const TEX_DARK = [0.04, 0.04, 0.04], TEX_LIGHT = [246 / 255, 240 / 255, 220 / 255], LIGHT_BELOW = 0.12;
+function lightLines(c) {                        // c = [r, g, b] 0..1
+  const lin = v => v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+  return 0.2126 * lin(c[0]) + 0.7152 * lin(c[1]) + 0.0722 * lin(c[2]) < LIGHT_BELOW;
+}
 function hex(c) { const n = parseInt(c.slice(1), 16); return [(n >> 16 & 255) / 255, (n >> 8 & 255) / 255, (n & 255) / 255]; }
 function clipUniforms() {
   const ax = st.clipAxis;
@@ -503,6 +517,7 @@ function visible(m) { return st.vis[m.litho] && st.gvis[m.group] !== false && st
 
 // ------------------------------------------------------------------ picking target
 let fbo = null, fbTex0 = null, fbTex1 = null, fbDepth = null, fbW = 0, fbH = 0;
+let fboOk = true;
 function ensureFbo() {
   if (fbo && fbW === canvas.width && fbH === canvas.height) return;
   if (fbo) { gl.deleteFramebuffer(fbo); gl.deleteTexture(fbTex0); gl.deleteTexture(fbTex1); gl.deleteRenderbuffer(fbDepth); }
@@ -517,6 +532,7 @@ function ensureFbo() {
   gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, fbTex0, 0);
   gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, fbTex1, 0);
   gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, fbDepth);
+  fboOk = gl.checkFramebufferStatus(gl.FRAMEBUFFER) === gl.FRAMEBUFFER_COMPLETE;   // some drivers refuse it
   gl.bindFramebuffer(gl.FRAMEBUFFER, null);
 }
 
@@ -559,7 +575,8 @@ function drawMeshes(mode) {
   const list = meshes.filter(visible);
   gl.uniform1i(U.uMode, mode); clipUniforms();
   const one = (m, ch) => {
-    gl.uniform3fv(U.uColor, hex(colors[m.litho]));
+    const mc = hex(colors[m.litho]);
+    gl.uniform3fv(U.uColor, mc); gl.uniform3fv(U.uTexLine, lightLines(mc) ? TEX_LIGHT : TEX_DARK);
     gl.uniform1f(U.uTexLayer, st.tex ? m.tex : -1); gl.uniform1f(U.uTexAsp, m.asp);
     gl.uniform2f(U.uId, (m.id & 255) / 255, (m.id >> 8) / 255);
     gl.bindVertexArray(ch ? ch.vao : m.vaoT); gl.drawElements(gl.TRIANGLES, ch ? ch.n : m.nT, gl.UNSIGNED_INT, 0);
@@ -642,7 +659,7 @@ function render() {
 // ------------------------------------------------------------------ overlay (labels, gizmo)
 const labelsDiv = $('labels');
 const bhLabels = traces.map(t => { const d = document.createElement('div'); d.className = 'lab'; d.textContent = t.name; labelsDiv.appendChild(d); return d; });
-const ztick = []; for (let i = 0; i < 14; i++) { const d = document.createElement('div'); d.className = 'lab zt'; labelsDiv.appendChild(d); ztick.push(d); }
+const ztick = []; for (let i = 0; i < 24; i++) { const d = document.createElement('div'); d.className = 'lab zt'; labelsDiv.appendChild(d); ztick.push(d); }
 function project(p) {
   const x = p[0], y = p[1], z = p[2] * st.zs;
   const vx = V[0] * x + V[4] * y + V[8] * z + V[12], vy = V[1] * x + V[5] * y + V[9] * z + V[13],
@@ -706,6 +723,7 @@ function pick(px, py) {
   // px, py in canvas (device) pixels, origin top-left; returns {m, p:[x,y,z]} or null
   if (canvas.width <= 0 || canvas.height <= 0) return null;   // minimized window: no 0x0 framebuffer
   ensureFbo(); updateMatrices();
+  if (!fboOk) return null;                                    // the picking buffer is not usable
   const x = Math.floor(px), y = canvas.height - 1 - Math.floor(py);
   if (x < 0 || y < 0 || x >= canvas.width || y >= canvas.height) return null;
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
@@ -749,7 +767,7 @@ canvas.addEventListener('pointerdown', e => {
   drag = {x: e.clientX, y: e.clientY, pan: e.button === 2 || e.button === 1 || e.shiftKey || e.ctrlKey, moved: 0};
 });
 canvas.addEventListener('pointerup', e => {
-  const d = drag; drag = null; try { canvas.releasePointerCapture(e.pointerId); } catch (_) {}
+  const d = drag; drag = null; try { canvas.releasePointerCapture(e.pointerId); } catch (_) { /* already released */ }
   if (d && !d.pan && d.moved < 4) {                // a click (no drag) selects the layer under the cursor
     const r = canvas.getBoundingClientRect(), k = dpr();
     const hit = pick((e.clientX - r.left) * k, (e.clientY - r.top) * k);
@@ -761,7 +779,8 @@ canvas.addEventListener('pointermove', e => {
     const dx = e.clientX - drag.x, dy = e.clientY - drag.y; drag.x = e.clientX; drag.y = e.clientY; drag.moved += Math.abs(dx) + Math.abs(dy);
     if (drag.pan) {
       const f = 2 * cam.dist * Math.tan(cam.fov / 2) / H;
-      const ex = eyePos(), fw = nrm(sub(cam.target, ex)), r = nrm(crs(fw, [0, 0, 1])), u = crs(r, fw);
+      if (!V) updateMatrices();
+      const r = [V[0], V[4], V[8]], u = [V[1], V[5], V[9]];     // camera axes from the view matrix (never degenerate)
       for (let a = 0; a < 3; a++) cam.target[a] += -r[a] * dx * f + u[a] * dy * f;
     } else {
       cam.az -= dx * 0.006;
@@ -795,7 +814,7 @@ setInterval(() => {
 
 // ------------------------------------------------------------------ panel
 const body = document.body;
-$('ptoggle').onclick = () => { body.classList.toggle('noside'); $('ptoggle').innerHTML = body.classList.contains('noside') ? '&#9666; Panel' : 'Panel &#9656;'; dirty(); };
+$('ptoggle').onclick = () => { body.classList.toggle('noside'); $('ptoggle').textContent = body.classList.contains('noside') ? '\u25c2 Panel' : 'Panel \u25b8'; dirty(); };
 (function () {                                           // drag the splitter to resize the panel
   const split = $('split'), side = $('side'); let sx = null, sw = 0;
   split.addEventListener('pointerdown', e => { sx = e.clientX; sw = side.offsetWidth; split.setPointerCapture(e.pointerId); });
@@ -887,7 +906,7 @@ function syncRows() {
   const ref = t ? st.op[t[0]] : (order.length ? st.op[order[0]] : 1);
   $('op').value = Math.round(ref * 100); $('opv').textContent = Math.round(ref * 100) + '%';
 }
-function setSel(list) { st.sel = list.slice(); syncRows(); }
+function setSel(list) { st.sel = list.slice(); if (!st.sel.length) lastClicked = null; syncRows(); }
 function selectLayer(l, add) {
   if (add) { const i = st.sel.indexOf(l); if (i >= 0) st.sel.splice(i, 1); else st.sel.push(l); setSel(st.sel); }
   else setSel([l]);
@@ -958,7 +977,7 @@ function faultPoint(f) {                      // [x, y] of the fault on the surf
   const x = f.x - ORG[0], y = f.y - ORG[1];
   return [x, y, surfaceZ(x, y)];
 }
-const surfCache = new Map();
+const surfCache = new Map();                    // z of the surface by (x, y); cleared when it grows (see surfaceZ)
 function surfaceZ(x, y) {                     // highest model point above (x, y); the nearest vertex's Z outside the model
   const key = x + ',' + y; if (surfCache.has(key)) return surfCache.get(key);
   let best = -Infinity, nz = bmax[2], nd = Infinity;
@@ -967,7 +986,7 @@ function surfaceZ(x, y) {                     // highest model point above (x, y
     for (let k = 0; k + 2 < T.length; k += 3) {
       const a = 3 * T[k], b = 3 * T[k + 1], c = 3 * T[k + 2];
       const ax = P[a], ay = P[a + 1], bx = P[b], by = P[b + 1], cx = P[c], cy = P[c + 1];
-      for (const q of [a, b, c]) { const d = (P[q] - x) * (P[q] - x) + (P[q + 1] - y) * (P[q + 1] - y); if (d < nd) { nd = d; nz = P[q + 2]; } }
+      for (const q of [a, b, c]) { const d = (P[q] - x) * (P[q] - x) + (P[q + 1] - y) * (P[q + 1] - y); if (d < nd - 1e-9 || (Math.abs(d - nd) <= 1e-9 && P[q + 2] > nz)) { nd = d; nz = P[q + 2]; } }
       const det = (by - cy) * (ax - cx) + (cx - bx) * (ay - cy);
       if (Math.abs(det) < 1e-12) continue;                       // vertical or degenerate in plan view
       const l1 = ((by - cy) * (x - cx) + (cx - bx) * (y - cy)) / det;
@@ -978,6 +997,7 @@ function surfaceZ(x, y) {                     // highest model point above (x, y
     }
   }
   const z = isFinite(best) ? best : nz;
+  if (surfCache.size >= 2000) surfCache.clear();     // dragging a fault would otherwise fill it endlessly
   surfCache.set(key, z); return z;
 }
 function faultGeom(f) {
@@ -1067,7 +1087,7 @@ function refreshDerived() {                        // texts and computed values 
   $('falv').textContent = f ? Math.round(f.alpha * 100) + '%' : '';
   if (!f) { $('fdist').textContent = ''; $('fstrike').textContent = ''; return; }
   const g = faultGeom(f);
-  $('fstrike').textContent = 'Strike ' + String(Math.round((f.dipdir + 270) % 360)).padStart(3, '0') + '\u00b0' +
+  $('fstrike').textContent = 'Strike ' + String(Math.round((f.dipdir + 270) % 360) % 360).padStart(3, '0') + '\u00b0' +
     (g ? '  \u2022  width down the dip ' + r1(g.w, 1) + ' m' : '');
   if (f.mode === 'bh') {
     const A = bhPoint(f.a), B = bhPoint(f.b);
@@ -1121,7 +1141,7 @@ function addFault(src) {
   faults.push(f); fSel = f.id; rebuildFaultGl(); refreshList(); toForm();
 }
 $('fadd').onclick = () => addFault();
-$('fdup').onclick = () => { const f = curFault(); if (f) { const c = Object.assign({}, f); c.name = f.name + ' (copy)'; c.pos = Math.min(100, f.pos + 5); addFault(c); } };
+$('fdup').onclick = () => { const f = curFault(); if (f) { const c = Object.assign({}, f); c.name = f.name + ' (copy)'; c.pos = Math.min(100, f.pos + 5); if (f.mode === 'xy') { const st = Math.max(1, Math.round(0.03 * Math.max(bmax[0] - bmin[0], bmax[1] - bmin[1]))); c.x = f.x + st; c.y = f.y + st; } addFault(c); } };
 $('fdel').onclick = () => {
   const i = faults.findIndex(f => f.id === fSel); if (i < 0) return;
   faults.splice(i, 1); fSel = faults.length ? faults[Math.min(i, faults.length - 1)].id : null;
@@ -1133,14 +1153,18 @@ $('fname').oninput = onForm(f => { f.name = $('fname').value.slice(0, 60); });  
 $('fname').onchange = onForm(f => { if (!f.name.trim()) { f.name = 'Fault ' + f.id; $('fname').value = f.name; } });
 $('fmode').onchange = onForm(f => {
   const m = $('fmode').value === 'xy' || traces.length < 2 ? 'xy' : 'bh';
-  if (m === 'xy' && f.mode === 'bh') { const P = faultPoint(f); if (P) { f.x = P[0] + ORG[0]; f.y = P[1] + ORG[1]; } }
+  if (m === 'xy' && f.mode === 'bh') {
+    const P = faultPoint(f);
+    if (P && isFinite(P[0]) && isFinite(P[1])) { f.x = P[0] + ORG[0]; f.y = P[1] + ORG[1]; }
+    else { f.x = (bmin[0] + bmax[0]) / 2 + ORG[0]; f.y = (bmin[1] + bmax[1]) / 2 + ORG[1]; }   // the middle of the model
+  }
   f.mode = m; toForm();
 });
 $('fa').onchange = onForm(f => { f.a = parseInt($('fa').value) || 0; });
 $('fb').onchange = onForm(f => { f.b = parseInt($('fb').value) || 0; });
 $('fpos').oninput = onForm(f => { f.pos = numOr('fpos', 0, 100, f.pos); });
-$('fx').oninput = onForm(f => { f.x = numOr('fx', -1e9, 1e9, f.x); });
-$('fy').oninput = onForm(f => { f.y = numOr('fy', -1e9, 1e9, f.y); });
+$('fx').onchange = onForm(f => { f.x = numOr('fx', -1e9, 1e9, f.x); });
+$('fy').onchange = onForm(f => { f.y = numOr('fy', -1e9, 1e9, f.y); });
 $('fdd').oninput = onForm(f => { f.dipdir = numOr('fdd', 0, 360, f.dipdir) % 360; });
 $('fdta').onclick = onForm(f => { const A = bhPoint(f.a), B = bhPoint(f.b); if (A && B && (A[0] !== B[0] || A[1] !== B[1])) { f.dipdir = Math.round(bearing(B, A)); $('fdd').value = f.dipdir; } });
 $('fdtb').onclick = onForm(f => { const A = bhPoint(f.a), B = bhPoint(f.b); if (A && B && (A[0] !== B[0] || A[1] !== B[1])) { f.dipdir = Math.round(bearing(A, B)); $('fdd').value = f.dipdir; } });
@@ -1164,12 +1188,43 @@ $('flab').onchange = e => { st.fLabels = e.target.checked; dirty(); };
 window.__getFaults = () => faults.map(f => ({name: f.name, vis: f.vis, mode: f.mode, a: f.a, b: f.b, pos: f.pos, x: f.x, y: f.y,
   dipdir: f.dipdir, dip: f.dip, len: f.len, autoTop: f.autoTop, top: f.top, toBottom: f.toBottom, depth: f.depth, color: f.color, alpha: f.alpha}));
 window.__faults = {faults, faultGeom, normFault, addFault};
+
+// faults to a JSON file and back: a page opened in a web browser cannot save itself, so the faults
+// would be lost with the tab; the file is also a way to carry them to another model
+$('fexp').onclick = () => {
+  const data = {format: 'borehole-geology-faults', version: 1, faults: window.__getFaults()};
+  const blob = new Blob([JSON.stringify(data, null, 1)], {type: 'application/json'});
+  const a = document.createElement('a'); a.href = URL.createObjectURL(blob);
+  a.download = ((S.title || 'model3d').replace(/[^\w\-]+/g, '_')) + '_faults.json';
+  document.body.appendChild(a); a.click(); setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 2000);
+};
+$('fimp').onclick = () => $('ffile').click();
+$('ffile').onchange = e => {
+  const file = e.target.files && e.target.files[0]; e.target.value = '';       // the same file can be chosen again
+  if (!file) return;
+  if (file.size > 2e6) { alert('The file is too large for a list of faults (more than 2 MB).'); return; }
+  const rd = new FileReader();
+  rd.onerror = () => alert('The file could not be read.');
+  rd.onload = () => {
+    let list = null;
+    try { const d = JSON.parse(String(rd.result)); list = Array.isArray(d) ? d : (d && d.faults); } catch (err) { list = null; }
+    if (!Array.isArray(list)) { alert('This is not a file of faults (expected the output of \u201cExport faults\u201d).'); return; }
+    const room = Math.max(0, 200 - faults.length), take = list.filter(r => r && typeof r === 'object').slice(0, room);
+    take.forEach(r => addFault(r));                                           // addFault checks every value (normFault)
+    if (take.length < list.length) alert('Imported ' + take.length + ' of ' + list.length + ' faults (at most 200 faults, others were skipped).');
+  };
+  rd.readAsText(file);
+};
 fillBoreholeSelects();
 $('fmode').options[0].disabled = traces.length < 2;      // between boreholes needs two of them
 let faultsStart = Array.isArray(FAULTS_INIT) ? FAULTS_INIT : [];
-if (typeof window.name === 'string' && window.name.indexOf(FAULT_KEEP) === 0) {        // page rebuilt after a lost WebGL context
-  try { const k = JSON.parse(window.name.slice(FAULT_KEEP.length)); if (Array.isArray(k)) faultsStart = k; } catch (e) { /* keep the faults of the file */ }
-  window.name = '';
+{        // page rebuilt after a lost WebGL context
+  try {
+    const raw = sessionStorage.getItem(FAULT_KEEP);
+    sessionStorage.removeItem(FAULT_KEEP);
+    const k = raw ? JSON.parse(raw) : null;
+    if (Array.isArray(k)) faultsStart = k;
+  } catch (e) { /* keep the faults of the file */ }
 }
 faultsStart.slice(0, 200).forEach(r => faults.push(normFault(r)));
 fSel = faults.length ? faults[0].id : null;

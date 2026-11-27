@@ -1,5 +1,7 @@
 """Data handling, section drawing and 3D layer creation (no GUI widgets)."""
+import contextlib
 import csv
+import functools
 import difflib
 import io
 import itertools
@@ -8,7 +10,6 @@ import math
 import os
 import re
 import stat
-import unicodedata
 from dataclasses import dataclass, field
 
 from qgis.PyQt.QtCore import Qt, QPointF
@@ -19,6 +20,7 @@ from qgis.core import (
     QgsMessageLog, Qgis,
 )
 
+from . import edits as _edits
 from . import patterns as _patterns
 
 LOG_TAG = "Borehole Geology"
@@ -26,6 +28,10 @@ LOG_TAG = "Borehole Geology"
 
 def log_warning(msg):
     QgsMessageLog.logMessage(msg, LOG_TAG, Qgis.MessageLevel.Warning)
+
+
+def log_debug(msg):
+    QgsMessageLog.logMessage(msg, LOG_TAG, Qgis.MessageLevel.Info)
 
 
 _GEOM_ISSUES = {}          # message -> number of occurrences since the last take_geometry_issues()
@@ -49,21 +55,193 @@ def take_geometry_issues():
 
 
 CRS_SJTSK = "EPSG:5514"
+CRS_WEB_MERCATOR = "EPSG:3857"
+WEB_MERCATOR_LIMIT = 20037508.35
+WEB_MERCATOR_RADIUS = 6378137.0
+
+_LONLAT = ("Longitude [deg]", "Latitude [deg]",
+           ["lon", "lng", "longitude", "x"], ["lat", "latitude", "y"])
+_EASTNORTH = ("Easting (E) [m]", "Northing (N) [m]",
+              ["easting", "east", "e", "x"], ["northing", "north", "n", "y"])
 
 # key -> (authid, label, x label, y label, x keywords, y keywords)
+# authid None = UTM family: the EPSG code follows from the zone (see UTM_FAMILIES, crs_authid)
 INPUT_CRS = {
     "sjtsk": ("EPSG:5514", "S-JTSK (EPSG:5514)",
               "X (northing, latitude)", "Y (easting, longitude)", ["x"], ["y"]),
-    "wgs84": ("EPSG:4326", "WGS84 geographic - lon/lat in degrees (EPSG:4326)",
-              "Longitude [deg]", "Latitude [deg]",
-              ["lon", "lng", "longitude", "x"], ["lat", "latitude", "y"]),
-    "etrs89": ("EPSG:4258", "ETRS89 geographic - lon/lat in degrees (EPSG:4258)",
-               "Longitude [deg]", "Latitude [deg]",
-               ["lon", "lng", "longitude", "x"], ["lat", "latitude", "y"]),
-    "etrs89_utm33": ("EPSG:25833", "ETRS89 / UTM zone 33N (EPSG:25833)",
-                     "Easting (E) [m]", "Northing (N) [m]",
-                     ["easting", "east", "e", "x"], ["northing", "north", "n", "y"]),
+    "wgs84": ("EPSG:4326", "WGS84 geographic - lon/lat in degrees (EPSG:4326)", *_LONLAT),
+    "etrs89": ("EPSG:4258", "ETRS89 geographic - lon/lat in degrees (EPSG:4258)", *_LONLAT),
+    "nad83": ("EPSG:4269", "NAD83 geographic - lon/lat in degrees (EPSG:4269)", *_LONLAT),
+    "nad83_harn": ("EPSG:4152", "NAD83(HARN) geographic - lon/lat in degrees (EPSG:4152)",
+                   *_LONLAT),
+    "nad83_nsrs2007": ("EPSG:4759", "NAD83(NSRS2007) geographic - lon/lat in degrees (EPSG:4759)",
+                       *_LONLAT),
+    "nad83_2011": ("EPSG:6318", "NAD83(2011) geographic - lon/lat in degrees (EPSG:6318)",
+                   *_LONLAT),
+    "nad83_csrs": ("EPSG:4617", "NAD83(CSRS) geographic - lon/lat in degrees (EPSG:4617)",
+                   *_LONLAT),
+    "utm_wgs84": (None, "WGS84 / UTM zone (Universal Transverse Mercator, EPSG:326xx N, 327xx S)", *_EASTNORTH),
+    "utm_nad83": (None, "NAD83 / UTM zone 1N-23N (Universal Transverse Mercator, EPSG:269xx)", *_EASTNORTH),
+    "utm_etrs89": (None, "ETRS89 / UTM zone 28N-38N (Universal Transverse Mercator, EPSG:258xx)", *_EASTNORTH),
+    "utm_nad83_csrs": (None, "NAD83(CSRS) / UTM zone 7N-22N (Universal Transverse Mercator)",
+                       *_EASTNORTH),
+    "utm_nad83_2011": (None, "NAD83(2011) / UTM zone 10N-19N (Universal Transverse Mercator)",
+                       *_EASTNORTH),
+    "utm_nad83_harn": (None, "NAD83(HARN) / UTM zone 4N-5N, 10N-19N (Universal Transverse Mercator)",
+                       *_EASTNORTH),
+    "webmerc": (CRS_WEB_MERCATOR, "Web Mercator / Pseudo-Mercator (EPSG:3857)", *_EASTNORTH),
 }
+
+# UTM families: key -> (EPSG base of the northern zones, base of the southern zones or None,
+#                       first zone, last zone, default zone)
+UTM_FAMILIES = {
+    "utm_wgs84": (32600, 32700, 1, 60, 33),     # WGS84 / UTM zone 1N..60N (EPSG:326xx), 1S..60S (327xx)
+    "utm_nad83": (26900, None, 1, 23, 14),      # NAD83 / UTM zone 1N..23N (EPSG:269xx)
+    "utm_etrs89": (25800, None, 28, 38, 33),    # ETRS89 / UTM zone 28N..38N (EPSG:258xx)
+}
+
+# geographic systems of the NAD83 family: their metric working system is NAD83 / UTM
+_NAD83_GEOGRAPHIC = ("EPSG:4269", "EPSG:4152", "EPSG:4759", "EPSG:6318", "EPSG:4617")
+
+
+# UTM of the NAD83 realizations: key -> (name in the EPSG registry, first zone, last zone,
+# default zone, {zone: EPSG code}).  The codes are only the first guess: every one is checked
+# against the name QGIS has for it, and when it does not match (or is missing) the EPSG codes are
+# searched for the name "<name> / UTM zone <n>N", so a wrong code can never be used silently.
+_HARN_UTM = {4: 3750, 5: 3751, **{z: 3740 + z - 10 for z in range(10, 20)}}    # no 6N-9N in EPSG
+
+_UTM_NAMED = {
+    "utm_nad83_csrs": ("NAD83(CSRS)", 7, 22, 17,
+                       {7: 3154, 8: 3155, 9: 3156, 10: 3157, 11: 2955, 12: 2956, 13: 2957,
+                        14: 3158, 15: 3159, 16: 3160, 17: 2958, 18: 2959, 19: 2960, 20: 2961,
+                        21: 2962, 22: 3761}),
+    "utm_nad83_2011": ("NAD83(2011)", 10, 19, 17,
+                       {z: 6339 + z - 10 for z in range(10, 20)}),
+    "utm_nad83_harn": ("NAD83(HARN)", 4, 19, 17, _HARN_UTM),
+}
+_UTM_FOUND = {}                      # (key, zone) -> authid, found once per session
+
+
+def is_utm(crs_key):
+    return crs_key in UTM_FAMILIES or crs_key in _UTM_NAMED
+
+
+def utm_zone_info(crs_key):
+    """(first zone, last zone, default zone, southern hemisphere possible) of a UTM entry."""
+    if crs_key in _UTM_NAMED:
+        _, z0, z1, default, _ = _UTM_NAMED[crs_key]
+        return z0, z1, default, False
+    _, south_base, z0, z1, default = UTM_FAMILIES[crs_key]
+    return z0, z1, default, south_base is not None
+
+
+def utm_valid_zones(crs_key):
+    """Sorted list of the UTM zones that exist for a UTM entry (the datums NAD83(HARN) has gaps)."""
+    if crs_key in _UTM_NAMED and _UTM_NAMED[crs_key][4]:
+        return sorted(_UTM_NAMED[crs_key][4])
+    z0, z1, _, _ = utm_zone_info(crs_key)
+    return list(range(z0, z1 + 1))
+
+
+def _utm_name_matches(description, name, zone):  # noqa: D401
+    """True for '<name> / UTM zone <zone>N', also when a newer PROJ/GDAL adds a realization or
+    an epoch to the datum name (e.g. 'NAD83(CSRS)v7 / UTM zone 17N')."""
+    pattern = (re.escape(name) + r"(?:\s*v\d+(?:\.\d+)?|\s*\([^)]*\))*\s*/\s*UTM\s+zone\s+"
+               + str(int(zone)) + r"N\b")
+    # re.match: an authority or a locale added after the name ("... 17N [EPSG:2958]") is allowed
+    return re.match(pattern, description.strip(), re.IGNORECASE) is not None
+
+
+def _find_named_utm(crs_key, zone):
+    """EPSG code of '<datum> / UTM zone <zone>N' (names are checked, see _UTM_NAMED)."""
+    if (crs_key, zone) in _UTM_FOUND:
+        return _UTM_FOUND[(crs_key, zone)]
+    name, _, _, _, known = _UTM_NAMED[crs_key]
+    want = f"{name} / UTM zone {zone}N"
+    first = known.get(zone)
+    # the search is limited to the blocks of the EPSG registry where these systems are
+    blocks = itertools.chain(range(2955, 2963), range(3154, 3161), range(3740, 3762),
+                             range(6330, 6350))
+    codes = ([first] if first else []) + [c for c in blocks if c != first]
+    for code in codes:
+        crs = QgsCoordinateReferenceSystem(f"EPSG:{code}")
+        if crs.isValid() and _utm_name_matches(crs.description(), name, zone):
+            _UTM_FOUND[(crs_key, zone)] = f"EPSG:{code}"
+            return _UTM_FOUND[(crs_key, zone)]
+    raise ValueError(f"'{want}' was not found in the coordinate systems of this QGIS "
+                     "installation - choose another zone or coordinate system.")
+
+
+def crs_authid(crs_key, zone=None, south=False):
+    """EPSG code of an input system; the UTM entries need the zone (and the hemisphere)."""
+    if not is_utm(crs_key):
+        return INPUT_CRS[crs_key][0]
+    z0, z1, default, south_ok = utm_zone_info(crs_key)
+    zone = default if zone is None else int(zone)
+    if not z0 <= zone <= z1:
+        raise ValueError(f"UTM zone {zone} is outside {z0}..{z1} for this datum.")
+    if south and not south_ok:
+        raise ValueError("The southern hemisphere is not available for this datum.")
+    if crs_key in _UTM_NAMED:
+        if _UTM_NAMED[crs_key][4] and zone not in _UTM_NAMED[crs_key][4]:
+            raise ValueError(f"{_UTM_NAMED[crs_key][0]} / UTM zone {zone}N does not exist "
+                             f"(zones: {', '.join(str(z) for z in sorted(_UTM_NAMED[crs_key][4]))}).")
+        return _find_named_utm(crs_key, zone)
+    north, south_base = UTM_FAMILIES[crs_key][:2]
+    return f"EPSG:{(south_base if south else north) + zone}"
+
+
+_GEOGRAPHIC_TO_UTM_KEY = {"EPSG:4617": "utm_nad83_csrs", "EPSG:6318": "utm_nad83_2011",
+                           "EPSG:4152": "utm_nad83_harn"}
+
+
+def utm_authid_and_note(lon, lat, src_authid):
+    """(metric UTM system, note) for a point in degrees.  The UTM of the same datum realization
+    is used where there is one; otherwise the note says which other datum is the fallback
+    (it is empty when the realization is kept)."""
+    zone = min(max(int(math.floor((lon + 180.0) / 6.0)) + 1, 1), 60)
+    key = _GEOGRAPHIC_TO_UTM_KEY.get(src_authid)
+    if key and lat >= 0:                   # NAD83(CSRS), NAD83(2011), NAD83(HARN): no datum shift
+        with contextlib.suppress(ValueError):      # zone outside the range of that realization
+            return crs_authid(key, zone), ""
+    if src_authid in _NAD83_GEOGRAPHIC and lat >= 0 and 1 <= zone <= 23:
+        auth, other = f"EPSG:{26900 + zone}", "NAD83 / UTM"
+    elif src_authid == "EPSG:4258" and lat >= 0 and 28 <= zone <= 38:
+        return f"EPSG:{25800 + zone}", ""
+    else:
+        auth, other = f"EPSG:{(32600 if lat >= 0 else 32700) + zone}", "WGS84 / UTM"
+    note = ""
+    if key or src_authid == "EPSG:4759":      # a realization of its own (plain NAD83 = NAD83 / UTM)
+        note = (f"no UTM zone {zone}{'N' if lat >= 0 else 'S'} of the same NAD83 realization as the "
+                f"file ({src_authid}) - the working system is {other} ({auth}); the datums differ "
+                "by up to about 1-2 m")
+    return auth, note
+
+
+def utm_authid_for(lon, lat, src_authid):
+    """Metric UTM system (the same datum realization where there is one) for a point in degrees."""
+    return utm_authid_and_note(lon, lat, src_authid)[0]
+
+
+# The coordinate system of the loaded boreholes: the one chosen for the CSV file ("source"), and
+# the metric one the plugin works in ("work": map layers, sections, 3D).  They are the same for
+# every projected system; a geographic system (degrees) and Web Mercator (distances are
+# stretched by 1 / cos(latitude)) cannot be used for distances in metres, so the plugin works in
+# the UTM zone of the data and the QGIS project keeps the system of the CSV file.
+_DATA_CRS = {"source": CRS_SJTSK, "work": CRS_SJTSK}
+
+
+def source_crs_authid():
+    return _DATA_CRS["source"]
+
+
+def work_crs_authid():
+    return _DATA_CRS["work"]
+
+
+def work_crs():
+    return QgsCoordinateReferenceSystem(_DATA_CRS["work"])
+
 
 DELIMITERS = [("Auto-detect", None), ("Semicolon ;", ";"), ("Comma ,", ","),
               ("Tab", "\t"), ("Space", " "), ("Pipe |", "|")]
@@ -82,8 +260,8 @@ class Layer:
 @dataclass
 class Borehole:
     name: str
-    x: float          # QGIS easting  (EPSG:5514)
-    y: float          # QGIS northing (EPSG:5514)
+    x: float          # easting in the working CRS (work_crs_authid())
+    y: float          # northing in the working CRS (work_crs_authid())
     z: float          # collar altitude
     depth: float
     layers: list = field(default_factory=list)
@@ -116,6 +294,7 @@ class Projected:
     s_top: float = 0.0     # signed distance of the collar from the section line (+ = left of it)
     s_bot: float = 0.0     # the same for the bottom of the borehole
     kx: float = 0.0        # gradient of the strata perpendicular to the section (m per m, + = rising to the left)
+    path: object = None    # inclined hole + broken line: md -> (distance along the line, signed offset)
 
     def __post_init__(self):
         if self.d_top is None:
@@ -127,6 +306,8 @@ class Projected:
         """Distance along section polyline at measured along-hole depth `md`."""
         if self.bh.depth <= 1e-9:
             return self.d_top
+        if self.path is not None:          # the trace of the hole bends with the line: no interpolation
+            return self.path(md)[0]
         t = md / self.bh.depth
         return self.d_top + (self.d_bot - self.d_top) * t
 
@@ -135,6 +316,8 @@ class Projected:
         (an inclined borehole crosses the plane in one point only, there s = 0)."""
         if self.bh.depth <= 1e-9:
             return self.s_top
+        if self.path is not None:
+            return self.path(md)[1]
         return self.s_top + (self.s_bot - self.s_top) * md / self.bh.depth
 
     def z_at(self, md):
@@ -146,19 +329,33 @@ class Projected:
 
 # ----------------------------------------------------------------- CSV input
 def _norm(s):
-    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode()
-    return s.strip().lower()
+    """Text without diacritics, lower case (shared with patterns.py, which core imports)."""
+    return _patterns.norm_text(s)
 
 
 MAX_TABLE_BYTES = 100 * 1024 * 1024
 # Plausible ranges of the input values; anything outside is a data error (units, a shifted
 # column ...) and would only produce absurdly large models.
 MAX_COORD = 1e8                 # projected coordinates [m]
+# physically sensible ranges of some projected systems [m]: (min, max) of easting and northing
+UTM_EASTING = (0.0, 1000000.0)      # the zones overlap: eastings beyond 100-900 km are legal
+UTM_NORTHING = (0.0, 10000000.0)
+UTM_LAT_MIN, UTM_LAT_MAX = -80.0, 84.0     # latitudes covered by UTM (poles: UPS, not supported)
+SJTSK_LIMIT = 3e6               # |X| and |Y| of S-JTSK (the Czech Republic: ~0.4-1.3 million)
 MAX_ELEV = 12000.0              # ground elevation [m a.s.l.]: -MAX_ELEV .. +MAX_ELEV
 MAX_DEPTH = 20000.0             # total depth and layer depths [m] (deepest borehole: 12.3 km)
 MAX_TABLE_ROWS = 1_000_000
 MAX_TABLE_COLUMNS = 1000
 MAX_TABLE_CELL = 32768
+MAX_NAME_LEN = 256                # borehole names and lithology names are cut to this (labels, textures)
+_CONTROL_CHARS = re.compile(r"[\x00-\x1f\x7f]+")
+
+
+def clean_name(text):
+    """Name of a borehole / lithology: control characters (a tab or a line break inside a quoted CSV
+    cell) become one space - the file of section edits refuses such names, so edits of a project
+    that has them could not be loaded again."""
+    return _CONTROL_CHARS.sub(" ", text).strip()
 
 
 _BLANK_HEADER_RE = re.compile(r"^\(column \d+\)$")
@@ -175,15 +372,16 @@ def read_table(path, delimiter=None, max_rows=None, max_bytes=MAX_TABLE_BYTES):
     N rows) - enough for a preview of the column names of a big file.  A file larger than
     max_bytes (when read whole) or a binary file (NUL bytes) is rejected."""
     try:
-        st = os.stat(path)
+        fh = open(path, "rb")                 # open first, then check the descriptor (no TOCTOU)
     except OSError as e:
         raise ValueError(f"Cannot read the file ({e.strerror or e}): {path}")
-    if not stat.S_ISREG(st.st_mode):          # FIFO, device ...: size 0, read() could block forever
-        raise ValueError("Not a regular file: " + path)
-    if max_rows is None and st.st_size > max_bytes:
-        raise ValueError(f"File is larger than {max_bytes // (1024 * 1024)} MB - "
-                         f"not a CSV table: {path}")
-    with open(path, "rb") as fh:
+    with fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):      # FIFO, device ...: size 0, read() could block forever
+            raise ValueError("Not a regular file: " + path)
+        if max_rows is None and st.st_size > max_bytes:
+            raise ValueError(f"File is larger than {max_bytes // (1024 * 1024)} MB - "
+                             f"not a CSV table: {path}")
         head = fh.read(2)
         fh.seek(0)
         utf16 = head in (b"\xff\xfe", b"\xfe\xff")
@@ -226,7 +424,7 @@ def read_table(path, delimiter=None, max_rows=None, max_bytes=MAX_TABLE_BYTES):
         else:
             delimiter = " " if len(first.split()) > 1 else ","
     if max_rows is not None:
-        text = text[:100000]               # a preview needs only the first lines
+        text = text[:262144]               # a preview needs only the first lines (as many characters as bytes read)
     raw = None                             # raw bytes and text would otherwise coexist with rows
     rows = []
     try:
@@ -276,14 +474,28 @@ def to_float(s):
     return v if math.isfinite(v) else None
 
 
-# Stratigraphy, youngest -> oldest (index grows with age)
-STRAT_NAMES = ["kvarter", "neogen", "paleogen", "krida", "jura", "trias", "perm",
-               "karbon", "devon", "silur", "ordovik", "kambrium", "proterozoikum"]
-STRAT_LABELS = ["kvartér", "neogén", "paleogén", "křída", "jura", "trias", "perm",
-                "karbon", "devon", "silur", "ordovik", "kambrium", "proterozoikum"]
-STRAT_ENGLISH = ["Quaternary", "Neogene", "Palaeogene", "Cretaceous", "Jurassic", "Triassic",
-                 "Permian", "Carboniferous", "Devonian", "Silurian", "Ordovician", "Cambrian",
-                 "Proterozoic"]
+# Stratigraphy, youngest -> oldest (index grows with age): ONE table, so that the names, the
+# labels and the colours (ICS) of a period can never get out of step
+STRATIGRAPHY = [
+    # (key, Czech label, English name, colour)
+    ("kvarter", "kvartér", "Quaternary", "#F9F97F"),
+    ("neogen", "neogén", "Neogene", "#FFE619"),
+    ("paleogen", "paleogén", "Palaeogene", "#FD9A52"),
+    ("krida", "křída", "Cretaceous", "#7FC64E"),
+    ("jura", "jura", "Jurassic", "#34B2C9"),
+    ("trias", "trias", "Triassic", "#812B92"),
+    ("perm", "perm", "Permian", "#F04028"),
+    ("karbon", "karbon", "Carboniferous", "#67A599"),
+    ("devon", "devon", "Devonian", "#CB8C37"),
+    ("silur", "silur", "Silurian", "#B3E1B6"),
+    ("ordovik", "ordovik", "Ordovician", "#009270"),
+    ("kambrium", "kambrium", "Cambrian", "#7FA056"),
+    ("proterozoikum", "proterozoikum", "Proterozoic", "#F74370"),
+]
+STRAT_NAMES = [r[0] for r in STRATIGRAPHY]
+STRAT_LABELS = [r[1] for r in STRATIGRAPHY]
+STRAT_ENGLISH = [r[2] for r in STRATIGRAPHY]
+STRAT_COLORS = [r[3] for r in STRATIGRAPHY]
 _STRAT_TERMS = {n: (i, i) for i, n in enumerate(STRAT_NAMES)}
 _STRAT_TERMS.update({
     "tercier": (1, 2), "mesozoikum": (3, 5), "paleozoikum": (6, 11), "permokarbon": (6, 7),
@@ -301,14 +513,24 @@ _STRAT_TERMS.update({
 _STRAT_ENDING = re.compile(r"(?:(?:ov|sk|ck|n)?(?:y|a|e|i|ym|ych|ymi|eho|ou|em|ni)|a|u|y|e|ou)?")
 
 
+@functools.lru_cache(maxsize=256)
+def _garbled_rx(word):
+    """Pattern of a word whose ? and * stand for a lost character (one compile per word)."""
+    return re.compile("^" + "".join("." if c in "?*" else re.escape(c) for c in word) + "$")
+
+
+_STRAT_STEMS = {"jura": "jur"}          # jurasky is not "jura" + ending: the adjective is jursky
+MAX_STRAT_WORD = 64                     # no period name is longer: longer "words" are not examined
+
+
 def _strat_word(word):
     """Whole-word match of a period name: the word is the name itself or its Czech adjective
     ('triasovy', 'permsky'); 'permeable' or 'industrial' do not match."""
     if word in _STRAT_TERMS:
         return _STRAT_TERMS[word]
     for name in sorted(_STRAT_TERMS, key=len, reverse=True):
-        stem = name[:-1] if name.endswith("a") and len(name) > 4 else name
-        if len(stem) >= 4 and word.startswith(stem) and \
+        stem = _STRAT_STEMS.get(name) or (name[:-1] if name.endswith("a") and len(name) > 4 else name)
+        if len(stem) >= (3 if name in _STRAT_STEMS else 4) and word.startswith(stem) and \
                 _STRAT_ENDING.fullmatch(word[len(stem):]):
             return _STRAT_TERMS[name]
     return None
@@ -325,6 +547,9 @@ def parse_strat(text):
     found = []
     left = []
     for word in re.findall(r"[a-z?*]+", t):
+        if len(word) > MAX_STRAT_WORD:                 # not a period name (and keeps the regexes fast)
+            continue
+        word = word.rstrip("?*") if word.strip("?*") else word   # 'kreda?', 'trias??': uncertain, not damaged
         if "?" not in word and "*" not in word:
             hit = _strat_word(word)
             if hit is not None:
@@ -333,7 +558,7 @@ def parse_strat(text):
         left.append(word)
     # what is left: words with a lost or garbled character
     for word in (w for w in left if len(w) >= 4):
-        rx = re.compile("^" + "".join("." if c in "?*" else re.escape(c) for c in word) + "$")
+        rx = _garbled_rx(word)
         hits = [n for n in _STRAT_TERMS if rx.match(n)]
         if not hits:
             hits = difflib.get_close_matches(word.replace("?", "").replace("*", ""),
@@ -359,7 +584,10 @@ def age_label(a):
 
 
 def guess_column(header, keywords, default=0):
-    """Index of best matching column (exact match first, then 'contains')."""
+    """Index of best matching column: the whole heading, then a heading that CONTAINS the
+    keyword (keywords of 3+ characters), then a heading that has a short keyword (x, y, to, do,
+    e, n...) as a whole word - so "X (northing, latitude)" is found by "x" and "Layer to [m]" by
+    "to", while "to" is never taken from the middle of another word ("total")."""
     h = [_norm(x) for x in header]
     for k in keywords:
         if k in h:
@@ -369,24 +597,130 @@ def guess_column(header, keywords, default=0):
             for i, c in enumerate(h):
                 if k in c:
                     return i
+    words = [set(re.findall(r"[^\W_]+", c)) for c in h]      # the words of every heading
+    for k in keywords:
+        if len(k) < 3:
+            for i, w in enumerate(words):
+                if k in w:
+                    return i
     return default
 
 
-def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=False):
+def _convert_to_work_crs(bhs, raw_line, src, src_id, warnings):
+    """Boreholes given in degrees (or Web Mercator) -> metres of the UTM zone of their centre.
+
+    bhs: name -> Borehole with the coordinates of the file; the boreholes that cannot be
+    converted are removed.  Returns the EPSG code of the working system."""
+    ctx = QgsProject.instance().transformContext()
+    geographic = src.isGeographic()
+
+    def lonlat(b):
+        """Longitude / latitude [deg] of a borehole without a transformation: the file is in
+        degrees (of its own datum - the difference to WGS84 does not matter for the zone) or in
+        Web Mercator (spherical formulas of EPSG:3857)."""
+        if geographic:
+            return b.x, b.y
+        return (math.degrees(b.x / WEB_MERCATOR_RADIUS),
+                math.degrees(2.0 * math.atan(math.exp(b.y / WEB_MERCATOR_RADIUS)) - math.pi / 2.0))
+    # centre of the boreholes in degrees: the longitude is a circular mean (boreholes at 179.9
+    # and -179.9 deg lie at the antimeridian, not at 0 deg); at most ~2000 boreholes are used
+    items = list(bhs.values())
+    step = max(1, len(items) // 2000)
+    try:
+        s_sin = s_cos = s_lat = 0.0
+        n_ok = 0
+        for b in items[::step]:
+            try:
+                w_lon, w_lat = lonlat(b)
+            except (OverflowError, ValueError) as e:     # the borehole is skipped for the centre
+                log_debug(f"Centre of the boreholes: {b.name} skipped ({type(e).__name__}: {e})")
+                continue
+            if not (math.isfinite(w_lon) and math.isfinite(w_lat)):
+                continue
+            if not (UTM_LAT_MIN <= w_lat <= UTM_LAT_MAX):    # polar outliers are skipped below:
+                continue                                      # they must not move the centre
+            rl = math.radians(w_lon)
+            s_sin += math.sin(rl)
+            s_cos += math.cos(rl)
+            s_lat += w_lat
+            n_ok += 1
+        if n_ok == 0:
+            raise ValueError("centre of the boreholes is not finite")
+        lon = math.degrees(math.atan2(s_sin, s_cos))
+        lat = s_lat / n_ok
+        if not (math.isfinite(lon) and math.isfinite(lat)):
+            raise ValueError("centre of the boreholes is not finite")
+    except Exception as e:                 # QgsCsException, ValueError
+        raise ValueError(f"Cannot find the UTM zone of the boreholes ({type(e).__name__}: {e}); "
+                         "check the coordinate system.") from e
+    work_id, note = utm_authid_and_note(lon, lat, src_id)
+    if note:
+        warnings.append("Coordinate system: " + note)
+    xform = QgsCoordinateTransform(src, QgsCoordinateReferenceSystem(work_id), ctx)
+    zone_c = min(max(int(math.floor((lon + 180.0) / 6.0)) + 1, 1), 60)
+    cm = (zone_c - 1) * 6.0 - 180.0 + 3.0                  # central meridian of the chosen zone
+    n_far, far_max, n_other_hemi = 0, 0.0, 0
+    for name in list(bhs):
+        bh = bhs[name]
+        try:
+            b_lat = lonlat(bh)[1]
+            if not (UTM_LAT_MIN <= b_lat <= UTM_LAT_MAX):      # beyond the UTM grid (polar caps)
+                raise ValueError(f"latitude {b_lat:.2f} deg is outside the UTM range "
+                                 f"{UTM_LAT_MIN:g}..{UTM_LAT_MAX:g} deg")
+            p = xform.transform(QgsPointXY(bh.x, bh.y))
+            if not (math.isfinite(p.x()) and math.isfinite(p.y())
+                    and abs(p.x()) <= MAX_COORD and abs(p.y()) <= MAX_COORD):
+                raise ValueError("outside the valid range")
+            if not (UTM_EASTING[0] <= p.x() <= UTM_EASTING[1] and abs(p.y()) <= UTM_NORTHING[1]):
+                raise ValueError(f"UTM coordinates {p.x():.0f}, {p.y():.0f} are outside the range of the "
+                                 "zone (the boreholes are too far from its central meridian)")
+            b_lon = lonlat(bh)[0]
+            d_lon = abs(((b_lon - cm + 180.0) % 360.0) - 180.0)
+            if d_lon > 9.0:
+                n_far += 1
+                far_max = max(far_max, d_lon)
+            if (b_lat >= 0) != (lat >= 0):
+                n_other_hemi += 1
+        except Exception as e:             # QgsCsException, ValueError (range) and the like
+            warnings.append(f"Boreholes file, line {raw_line.get(name, '?')} ({name}): coordinate "
+                            f"transformation failed ({type(e).__name__}: {e}) - skipped")
+            del bhs[name]
+            continue
+        bh.x, bh.y = p.x(), p.y()
+    if n_far:
+        warnings.append(f"Coordinate system: {n_far} borehole(s) lie more than 9 deg of longitude "
+                        f"(up to {far_max:.1f} deg) from the central meridian of the working UTM zone "
+                        f"{work_id} - distances there are distorted; the data should lie in one or two "
+                        "neighbouring zones")
+    if n_other_hemi:
+        warnings.append(f"Coordinate system: {n_other_hemi} borehole(s) lie in the other hemisphere than "
+                        f"the centre of the data - their northings are negative / shifted by 10 000 000 m "
+                        f"in {work_id}")
+    return work_id
+
+
+def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", utm_zone=None, utm_south=False):
     """m1: dict name,x,y,z,depth[,azimuth,dip] -> column index (-1 = none).
     m2: dict name,top,bottom,litho[,strat] -> column index (-1 = none).
 
-    Input CRS is given by crs_key (see INPUT_CRS); all boreholes are converted
-    to S-JTSK (EPSG:5514) which is used for map, section and 3D.
+    The coordinate system of the CSV file is given by crs_key (see INPUT_CRS; for the UTM
+    families also utm_zone and utm_south).  A projected system is used as it is - the boreholes
+    keep the coordinates of the file.  A geographic system (degrees) and Web Mercator cannot be
+    used for distances in metres, so those boreholes are converted to the UTM zone of the data
+    (see work_crs_authid()); source_crs_authid() is the system of the file.
     S-JTSK: column 'x' = X (northing), 'y' = Y (easting), both negative in
-    EPSG:5514; QGIS point = (-Y, -X). `negate` adds the minus sign.
+    EPSG:5514; QGIS point = (-Y, -X).  The minus sign is made automatically: in the whole area of
+    EPSG:5514 (Czech Republic, Slovakia) both coordinates are negative, so a positive value (the
+    usual way of writing S-JTSK) can only be a missing sign and is made negative.
     Other CRS: column 'x' = lon/easting, 'y' = lat/northing.
-    `swap` exchanges the meaning of the two coordinate columns.
     """
-    src = QgsCoordinateReferenceSystem(INPUT_CRS[crs_key][0])
-    dst = QgsCoordinateReferenceSystem(CRS_SJTSK)
-    xform = None if crs_key == "sjtsk" else QgsCoordinateTransform(
-        src, dst, QgsProject.instance().transformContext())
+    src_id = crs_authid(crs_key, utm_zone, utm_south)
+    src = QgsCoordinateReferenceSystem(src_id)
+    if not src.isValid():
+        raise ValueError(f"The coordinate system {src_id} is not known to this QGIS installation.")
+    # degrees and Web Mercator (scale 1/cos(lat)) are not metric: work in a local UTM zone
+    needs_work_crs = src.isGeographic() or src_id == CRS_WEB_MERCATOR
+    raw_line = {}                      # borehole name -> line of the file (for the warnings)
     for key in ("name", "x", "y", "z", "depth"):
         if m1.get(key, -1) < 0:
             raise ValueError(f"Boreholes file: no column selected for '{key}'.")
@@ -394,11 +728,16 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
         if m2.get(key, -1) < 0:
             raise ValueError(f"Layers file: no column selected for '{key}'.")
     warnings, bhs, bad_strat = [], {}, set()
+    n_unsigned = 0                     # S-JTSK rows written without the minus sign (it is added)
+    n_cut = 0                          # names cut to MAX_NAME_LEN
     az_idx = m1.get("azimuth", -1)
     dip_idx = m1.get("dip", -1)
     for n, r in enumerate(r1, start=2):
         try:
-            name = r[m1["name"]].strip()
+            name = clean_name(r[m1["name"]])
+            if len(name) > MAX_NAME_LEN:
+                name = name[:MAX_NAME_LEN]
+                n_cut += 1
             sx, sy = to_float(r[m1["x"]]), to_float(r[m1["y"]])
             z, depth = to_float(r[m1["z"]]), to_float(r[m1["depth"]])
         except IndexError:
@@ -418,6 +757,9 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
         if depth is None and r[m1["depth"]].strip():
             warnings.append(f"Boreholes file, line {n} ({name}): invalid total depth "
                             f"'{r[m1['depth']].strip()}' - the depth of the layers is used")
+        if depth == 0:
+            warnings.append(f"Boreholes file, line {n} ({name}): total depth 0 - the depth of the "
+                            "layers is used")
         if depth is not None and depth < 0:
             warnings.append(f"Boreholes file, line {n} ({name}): negative total depth {depth:g} "
                             "- replaced by 0 (the depth of the layers is used)")
@@ -449,42 +791,60 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
             if dip > 89.0:                    # cos(90 deg) = 0: the hole would collapse to zero height
                 warnings.append(f"Boreholes file, line {n} ({name}): dip/deviation {dip:g} deg - limited to 89 deg")
                 dip = 89.0
-            elif dip > 85.0:
+            if dip > 85.0:
                 warnings.append(f"Boreholes file, line {n} ({name}): nearly horizontal borehole "
                                 f"(dip {dip:g} deg) - the 2D section uses at most 85 deg")
 
-        if swap:
-            sx, sy = sy, sx
         # geographic systems are in degrees, projected ones (S-JTSK, ETRS89 / UTM 33N) in metres
-        lim_x, lim_y = (180.0, 90.0) if src.isGeographic() else (MAX_COORD, MAX_COORD)
+        if src.isGeographic():
+            lim_x, lim_y = 180.0, 90.0
+        elif src_id == CRS_WEB_MERCATOR:
+            lim_x = lim_y = WEB_MERCATOR_LIMIT          # the whole world: +-20037508.34 m
+        elif crs_key == "sjtsk":
+            lim_x = lim_y = SJTSK_LIMIT
+        else:
+            lim_x, lim_y = MAX_COORD, MAX_COORD
+        if is_utm(crs_key):                # easting / northing in metres (a unit or decimal error)
+            ex, ny = sx, sy
+            ok = (UTM_EASTING[0] <= ex <= UTM_EASTING[1] and UTM_NORTHING[0] <= ny <= UTM_NORTHING[1])
+            if not ok:
+                warnings.append(f"Boreholes file, line {n} ({name}): UTM coordinates {sx:g}, {sy:g} "
+                                f"are outside the range of easting {UTM_EASTING[0]:g}-{UTM_EASTING[1]:g} m "
+                                f"and northing {UTM_NORTHING[0]:g}-{UTM_NORTHING[1]:g} m "
+                                "(units? shifted decimal point? swapped columns?) - skipped")
+                continue
         if abs(sx) > lim_x or abs(sy) > lim_y:
             warnings.append(f"Boreholes file, line {n} ({name}): coordinates {sx:g}, {sy:g} are "
                             "outside the valid range - skipped")
             continue
         if crs_key == "sjtsk":
             qx, qy = sy, sx
-            if negate:
-                qx, qy = -abs(qx), -abs(qy)
+            if qx > 0 or qy > 0:
+                n_unsigned += 1
+            qx, qy = -abs(qx), -abs(qy)       # both are negative everywhere in EPSG:5514
         else:
-            try:
-                p = xform.transform(QgsPointXY(sx, sy))
-                qx, qy = p.x(), p.y()
-                if not (math.isfinite(qx) and math.isfinite(qy)
-                        and abs(qx) <= MAX_COORD and abs(qy) <= MAX_COORD):
-                    raise ValueError("outside the valid range")
-            except Exception as e:            # QgsCsException, ValueError (range) and the like
-                warnings.append(f"Boreholes file, line {n}: coordinate transformation failed "
-                                f"({type(e).__name__}: {e}) - skipped")
-                continue
+            qx, qy = sx, sy                   # kept as in the file (converted below if not metric)
         if name in bhs:
-            warnings.append(f"Duplicate borehole '{name}' - last one used")
+            # the layers file refers to a borehole by its name only: with two holes of one name
+            # their layers would be poured into one borehole, so only the first one is kept
+            warnings.append(f"Boreholes file, line {n}: duplicate borehole '{name}' - skipped, the "
+                            f"first one (line {raw_line.get(name, '?')}) is used; give the holes "
+                            "different names to keep both")
+            continue
         bhs[name] = Borehole(name, qx, qy, z, depth or 0.0, azimuth=az, dip=dip)
+        raw_line[name] = n
 
     for n, r in enumerate(r2, start=2):
         try:
-            name = r[m2["name"]].strip()
+            name = clean_name(r[m2["name"]])
+            if len(name) > MAX_NAME_LEN:
+                name = name[:MAX_NAME_LEN]
+                n_cut += 1
             t, b = to_float(r[m2["top"]]), to_float(r[m2["bottom"]])
-            lit = r[m2["litho"]].strip() or "(unknown)"
+            lit = clean_name(r[m2["litho"]]) or "(unknown)"
+            if len(lit) > MAX_NAME_LEN:
+                lit = lit[:MAX_NAME_LEN]
+                n_cut += 1
             raw_age = r[m2["strat"]].strip() if 0 <= m2.get("strat", -1) < len(r) else ""
         except IndexError:
             warnings.append(f"Layers file, line {n}: too few columns - skipped")
@@ -495,14 +855,15 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
         if t is None or b is None or b <= t:
             warnings.append(f"Layers file, line {n} ({name}): invalid interval - skipped")
             continue
-        if t < -MAX_DEPTH or b > MAX_DEPTH:
+        if t < -1e-6 or b > MAX_DEPTH:          # depths run downwards from the collar: no negative top
             warnings.append(f"Layers file, line {n} ({name}): depth {t:g}-{b:g} m is outside "
                             f"+-{MAX_DEPTH:g} m - skipped")
             continue
         age = parse_strat(raw_age) if raw_age else None
         if raw_age and age is None:
             bad_strat.add(raw_age)
-        extra = {h: r[i].strip() for i, h in enumerate(h2) if i < len(r)}
+        extra = {h: r[i].strip() for i, h in enumerate(h2)
+                 if i < len(r) and not is_blank_header(h)}
         bhs[name].layers.append(Layer(t, b, lit, age, extra))
 
     for bh in bhs.values():
@@ -513,58 +874,143 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", negate=True, swap=F
                 if bh.depth:
                     warnings.append(f"{bh.name}: layers go deeper ({last}) than total depth ({bh.depth})")
                 bh.depth = last
+            running_bottom = bh.layers[0].bottom       # deepest bottom of the layers above
+            prev_aged = None           # the last layer above with a known age (gaps and unknown ages
+            for L in bh.layers:        # in between do not hide an inversion)
+                if L.age:
+                    if prev_aged is not None and L.age[1] < prev_aged.age[0]:
+                        warnings.append(f"{bh.name}: younger stratigraphy ({age_label(L.age)}) below "
+                                        f"older ({age_label(prev_aged.age)}) at {L.top} m - "
+                                        "fault or data error?")
+                    prev_aged = L
             for a, b in zip(bh.layers, bh.layers[1:]):
-                if a.age and b.age and b.age[1] < a.age[0]:
-                    warnings.append(f"{bh.name}: younger stratigraphy ({age_label(b.age)}) below "
-                                    f"older ({age_label(a.age)}) at {b.top} m - fault or data error?")
-                if b.top < a.bottom - 1e-6:
+                if b.top < running_bottom - 1e-6:
                     warnings.append(f"{bh.name}: overlapping layers at {b.top} m")
-                elif b.top > a.bottom + 1e-6:
-                    warnings.append(f"{bh.name}: gap between {a.bottom} and {b.top} m")
+                elif b.top > running_bottom + 1e-6:
+                    warnings.append(f"{bh.name}: gap between {running_bottom} and {b.top} m")
+                running_bottom = max(running_bottom, b.bottom)
         else:
             warnings.append(f"{bh.name}: no layers")
     for raw in sorted(bad_strat):
         warnings.append(f"Unknown stratigraphy '{raw}' - layer treated as unknown age")
-    # sanity check: should lie within the Czech Republic (lon 11.5-19.5, lat 48.4-51.2)
-    try:
-        to_wgs = QgsCoordinateTransform(dst, QgsCoordinateReferenceSystem("EPSG:4326"),
-                                        QgsProject.instance().transformContext())
-        out = 0
-        for bh in bhs.values():
-            p = to_wgs.transform(QgsPointXY(bh.x, bh.y))
-            if not (11.5 <= p.x() <= 19.5 and 48.4 <= p.y() <= 51.2):
-                out += 1
-        if out:
-            warnings.insert(0, f"{out} borehole(s) lie outside the Czech Republic - check the "
-                               "coordinate system, the minus-sign option and the swap option")
-    except Exception as e:
-        # the location check is only advisory; keep the data but record why it was skipped
-        log_warning(f"Coordinate plausibility check skipped: {type(e).__name__}: {e}")
+    if n_cut:
+        warnings.append(f"{n_cut} borehole or lithology name(s) longer than {MAX_NAME_LEN} "
+                        "characters were cut")
+    if n_unsigned:
+        warnings.append(f"S-JTSK: the minus sign was added to the coordinates of {n_unsigned} "
+                        "borehole(s) written without it (EPSG:5514 has negative coordinates)")
+    work_id = src_id
+    if needs_work_crs and bhs:
+        work_id = _convert_to_work_crs(bhs, raw_line, src, src_id, warnings)
+    if bhs:                    # no valid borehole: the system of the previous data stays
+        wcrs = QgsCoordinateReferenceSystem(work_id)
+        if not wcrs.isValid() or wcrs.isGeographic():
+            raise ValueError(f"The working coordinate system {work_id or '(none)'} is not a metric "
+                             "projected system - the distances in metres cannot be computed.")
+        _DATA_CRS["source"] = src_id
+        _DATA_CRS["work"] = work_id
+    if crs_key == "sjtsk":
+        # S-JTSK is used in the Czech Republic and Slovakia: a point elsewhere means a wrong
+        # system, a missing minus sign or swapped columns (lon 11.5-22.7, lat 47.7-51.2)
+        try:
+            to_wgs = QgsCoordinateTransform(src, QgsCoordinateReferenceSystem("EPSG:4326"),
+                                            QgsProject.instance().transformContext())
+            out = 0
+            for bh in bhs.values():
+                p = to_wgs.transform(QgsPointXY(bh.x, bh.y))
+                if not (11.5 <= p.x() <= 22.7 and 47.7 <= p.y() <= 51.2):
+                    out += 1
+            if out:
+                warnings.insert(0, f"{out} borehole(s) lie outside the Czech Republic and Slovakia - "
+                                   "check the coordinate system and the columns X / Y (swapped?)")
+        except Exception as e:
+            # the location check is only advisory; keep the data but record why it was skipped
+            log_warning(f"Coordinate plausibility check skipped: {type(e).__name__}: {e}")
     return list(bhs.values()), warnings
 
 
 # ------------------------------------------------------------------- colours
+# The first entry with a matching word decides (specific words before general ones: "organic
+# clay" before "clay", "souvkova hlina" before "hlina", "weathered rock" before "rock").
+# A key starting with ^ must begin a word.  RGB from the table of the author of the plugin.
 _KEYWORDS = [
-    (("jilovec",), "#6b4423"), (("pisk", "sandstone"), "#e6c27a"),     # specific words first,
-    (("jil", "clay"), "#8b5a2b"),                                       # else "jil" / "sand" win
+    (("uhli", "^coal"), "#000000"),
+    (("organic", "organick"), "#5c4e3e"),                                # organic clay
+    (("weathered", "zvetral"), "#a2988a"),
+    (("sandy gravel", "gravelly sand", "piscity sterk", "sterkopis"), "#dab068"),
+    (("slepenec", "conglomerate"), "#9a7322"), (("arkoz", "arkos"), "#cbc9a0"),
+    (("sinter", "sintr", "travertin", "marlstone"), "#acb59c"),
+    (("slin", "marl"), "#b0bca2"),
+    (("shale", "lupek", "jilovit"), "#867c76"),                          # clay shale
+    (("slate", "bridlic"), "#80888e"),
+    (("^till", "morena", "souvkov"), "#a89888"),
+    (("rubble", "^sut", "scree"), "#b2a494"),
+    (("colluvium", "koluvium", "deluvium", "svahovin"), "#c29e76"),
+    (("alluvium", "aluvium", "naplav"), "#d4c292"),
+    (("eluvium",), "#bca27c"),
+    (("jilovec", "claystone"), "#6b4423"), (("pisk", "sandstone"), "#e6c27a"),
+    (("jil", "clay"), "#60574f"),
     (("pisek", "sand"), "#f2d16b"), (("sterk", "stk", "gravel"), "#e0a458"),
-    (("hlina", "silt", "loam"), "#c9a66b"), (("navaz", "fill"), "#9a9a9a"),
-    (("skal", "rock", "granit", "rula", "bridlic"), "#6e7b8b"),
-    (("slin", "sinter"), "#a0a98f"),
-    (("humus", "orn", "topsoil", "soil"), "#4b3621"), (("rasel", "peat"), "#3b3b2b"),
+    (("hlina", "silt", "loam", "prach"), "#c9a66b"), (("navaz", "^fill"), "#9a9a9a"),
+    (("skal", "rock", "granit", "zula", "rula", "gneis"), "#6e7b8b"),
+    (("^dirt",), "#362616"),
+    (("humus", "orn", "topsoil", "soil"), "#654423"), (("rasel", "^peat"), "#3b3b2b"),
     (("vapen", "limestone"), "#cfd8dc"),
+    (("spras", "loess"), "#ecd68e"), (("brekcie", "breccia"), "#bd7c60"),
+    (("krida", "kreda", "chalk"), "#eef0e8"), (("sadrovec", "gypsum"), "#e8dee6"),
+    (("dolomit", "dolostone"), "#b6c6d0"), (("bazalt", "basalt", "cedic"), "#585e66"),
+    (("^tuf",), "#c6b2c0"), (("kremenec", "kvarcit", "quartzite"), "#dac0cc"),
+    (("svor", "schist"), "#8e9c98"),
 ]
 _PALETTE = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b",
             "#e377c2", "#7f7f7f", "#bcbd22", "#17becf"]
 
 
+# A colour in the NAME of a lithology (green clay, cervený jil, seda hlina) is the default
+# colour; the words are matched on whole words, English and Czech (without diacritics).
+_COLOUR_WORDS = [
+    (r"\b(red|cerven\w*)\b", "#c0463c"), (r"\b(green|zelen\w*)\b", "#60a850"),
+    (r"\b(yellow|zlut\w*)\b", "#ebd750"), (r"\b(brown|hned\w*)\b", "#8b5a2b"),
+    (r"\b(blue|modr\w*)\b", "#5a8cc8"), (r"\b(grey|gray|sed[yaei]|sedou)\b", "#969696"),
+    (r"\b(white|bil[yaeu])\b", "#f0f0eb"), (r"\b(black|cern[yaeu])\b", "#1e1e1e"),
+    (r"\b(orange|oranz\w*)\b", "#f09632"), (r"\b(pink|ruzov\w*)\b", "#e696aa"),
+    (r"\b(purple|violet|fialov\w*)\b", "#966eaa"), (r"\b(beige|bezov\w*)\b", "#e1cda5"),
+    (r"\b(olive|olivov\w*)\b", "#8c8c3c"),
+]
+_DARK_WORDS = r"\b(dark|tmav\w*)\b"
+_LIGHT_WORDS = r"\b(light|pale|svetl\w*|bled\w*)\b"
+
+
+def colour_from_name(name):
+    """QColor for a colour word in the lithology name (the first one in the text), a darker /
+    lighter shade for dark / light; None when the name has no colour."""
+    n = _norm(name)
+    best = None
+    for rx, c in _COLOUR_WORDS:
+        m = re.search(rx, n)
+        if m and (best is None or m.start() < best[0]):
+            best = (m.start(), c)
+    if best is None:
+        return None
+    col = QColor(best[1])
+    if re.search(_DARK_WORDS, n):
+        col = col.darker(140)
+    elif re.search(_LIGHT_WORDS, n):
+        col = col.lighter(130)
+    return col
+
+
 def default_colors(lithos):
     out, i = {}, 0
     for lit in lithos:
+        named = colour_from_name(lit)
+        if named is not None:
+            out[lit] = named
+            continue
         n = _norm(lit)
         col = None
         for keys, c in _KEYWORDS:
-            if any(k in n for k in keys):
+            if any(_patterns.find_key(n, k) >= 0 for k in keys):
                 col = c
                 break
         if col is None:
@@ -644,9 +1090,12 @@ def signed_offset(points, x, y):
         for c1, c2 in zip(ties, ties[1:]):
             if c1[4] == c2[3]:
                 bx_, by_ = c1[2][0] + c2[2][0], c1[2][1] + c2[2][1]
+                vx, vy = c1[4]
                 if math.hypot(bx_, by_) > 1e-12:
-                    vx, vy = c1[4]
                     sign = 1.0 if bx_ * (y - vy) - by_ * (x - vx) >= 0 else -1.0
+                else:                       # the line turns back by 180 deg: normal of the first segment
+                    nx_, ny_ = -c1[2][1], c1[2][0]
+                    sign = 1.0 if nx_ * (x - vx) + ny_ * (y - vy) >= 0 else -1.0
                 break
     return best * sign
 
@@ -713,8 +1162,16 @@ def project_boreholes(points, boreholes, max_offset, min_gap=0.0):
                 d_top = line.lineLocatePoint(g_top)
                 d_bot = line.lineLocatePoint(g_bot)
             d_mid = 0.5 * (d_top + d_bot)
+            def trace_path(md, b=b):        # point of the hole at md projected on the broken line
+                x, y, _ = b.point_at(md)
+                g = QgsGeometry.fromPointXY(QgsPointXY(x, y))
+                d = (ext_line.lineLocatePoint(g) - ext) if has_ext else line.lineLocatePoint(g)
+                return d, signed_offset(sp, x, y)
+
+            bends = len(points) >= 3 and math.hypot(bx - b.x, by - b.y) > 1e-6
+            path_fn = trace_path if bends else None
             out.append(Projected(b, d_mid, off, d_top, d_bot,
-                                 signed_offset(sp, b.x, b.y), signed_offset(sp, bx, by)))
+                                 signed_offset(sp, b.x, b.y), signed_offset(sp, bx, by), path=path_fn))
     out.sort(key=lambda p: p.dist)
     return drop_close_boreholes(out, min_gap)
 
@@ -758,21 +1215,50 @@ def merge_same_lithology(layers, tol=1e-6):
     return out
 
 
-def align_layers(LA, LB, zA, zB):
+def _forced_pairs(pairs):
+    """Order-consistent subset of manually forced pairs (crossing ones are dropped)."""
+    keep = []
+    for i, j in sorted(pairs):
+        if all((a - i) * (b - j) >= 0 for a, b in keep):
+            keep.append((i, j))
+        else:
+            log_warning(f"Manual correlation ({i}, {j}) crosses another manual link - ignored")
+    return set(keep)
+
+
+def align_layers(LA, LB, zA, zB, edit=None, ca=1.0, cb=1.0):
     """Order-preserving, non-crossing correlation of two layer sequences.
 
     Returns a set of (i, j) pairs (indices into LA / LB).  One layer may be
-    paired with several layers of the other borehole (splitting / merging)."""
+    paired with several layers of the other borehole (splitting / merging).
+
+    edit (edits.PairEdit) = the geologist's corrections: forced pairs are always kept (their
+    layers are left out of the automatic matching, which works around them), forbidden pairs
+    are never made."""
     n, m = len(LA), len(LB)
+    forced, forbid = set(), set()
+    if edit is not None and (edit.forced or edit.forbidden):
+        ia = {id(L): i for i, L in enumerate(LA)}
+        ib = {id(L): j for j, L in enumerate(LB)}
+        forced = _forced_pairs({(ia[a], ib[b]) for a, b in edit.forced if a in ia and b in ib})
+        forbid = {(ia[a], ib[b]) for a, b in edit.forbidden if a in ia and b in ib} - forced
+    fA, fB = {i for i, _ in forced}, {j for _, j in forced}
 
     def mid(L):
         return (L.top + L.bottom) / 2.0
 
     def same(i, j):
+        if forced or forbid:
+            if (i, j) in forbid or i in fA or j in fB:
+                return False
+            if not all((a - i) * (b - j) >= 0 for a, b in forced):
+                return False
         return LA[i].litho == LB[j].litho and ages_compatible(LA[i].age, LB[j].age)
 
     def dz(i, j):
-        return abs((zA - mid(LA[i])) - (zB - mid(LB[j])))
+        # elevation of the layer middles: ca / cb = metres of elevation per metre along the hole
+        # (1 for a vertical one), so an inclined hole is compared by elevation, not by length
+        return abs((zA - ca * mid(LA[i])) - (zB - cb * mid(LB[j])))
 
     def w(i, j):
         return 1.0 + 0.4 / (1.0 + dz(i, j))
@@ -784,7 +1270,7 @@ def align_layers(LA, LB, zA, zB):
             if same(i - 1, j - 1):
                 best = max(best, f[i - 1][j - 1] + w(i - 1, j - 1))
             f[i][j] = best
-    pairs, i, j = set(), n, m
+    pairs, i, j = set(forced), n, m
     while i > 0 and j > 0:
         if (same(i - 1, j - 1)
                 and abs(f[i][j] - (f[i - 1][j - 1] + w(i - 1, j - 1))) < 1e-12):
@@ -799,7 +1285,12 @@ def align_layers(LA, LB, zA, zB):
     def consistent(i, j):
         return all((a - i) * (b - j) >= 0 for a, b in pairs)
 
-    # extension: split (one A layer -> several B layers) and merge (the opposite)
+    # extension: split (one A layer -> several B layers) and merge (the opposite); every pass
+    # looks at n*m candidates and there may be many passes, so a huge pair of columns (thousands
+    # of layers) is left with the matching found above
+    if n * m > 250000:
+        log_warning(f"Correlation: {n} x {m} layers - splitting / merging of layers skipped")
+        return pairs
     while True:
         mA, mB = {a for a, _ in pairs}, {b for _, b in pairs}
         cands = []
@@ -906,7 +1397,8 @@ def _clip_halfplane(pts, f, keep_negative=True):
 
 
 def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
-                   dips=None, transitions=True, bedrock=None, cover=False):
+                   dips=None, transitions=True, bedrock=None, cover=False, edit=None,
+                   pairs_out=None, ca=1.0, cb=1.0):
     """Polygons between two neighbouring borehole columns.
 
     YA(depth) / YB(depth) -> scene y.  dips = (secant, slope_at_A, slope_at_B)
@@ -926,10 +1418,18 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
       * otherwise: layers taper out; thin layers end close to their own
         borehole, thick layers reach further.
     Everything is constructed inside the space left by the neighbours, so the
-    polygons do not overlap."""
+    polygons do not overlap.
+
+    edit (edits.PairEdit): correlation corrected by hand, layers whose lens is suppressed.
+    pairs_out: a list that receives (id(layer A), id(layer B)) of the pairs used.
+    The polygons are (points, litho, age) or (points, litho, age, meta) - meta says what the
+    polygon is (("pair", id A, id B), ("lens", id), ...) for the editing tools."""
     if not LA or not LB:
         return []
-    pairs = sorted(align_layers(LA, LB, zA, zB))
+    pairs = sorted(align_layers(LA, LB, zA, zB, edit, ca, cb))
+    if pairs_out is not None:
+        pairs_out.extend((id(LA[i]), id(LB[j])) for i, j in pairs)
+    short = edit.short if edit is not None else frozenset()
     span = xb - xa
     xm = (xa + xb) / 2.0
     kc = min(max(curvature, 0.0), 1.0)
@@ -970,10 +1470,12 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
         res = {}
         for i in {p[idx_own] for p in pairs}:
             parts = [p for p in pairs if p[idx_own] == i]
-            tot = sum(other[p[idx_other]].bottom - other[p[idx_other]].top for p in parts)
+            ts = [other[p[idx_other]].bottom - other[p[idx_other]].top for p in parts]
+            if sum(ts) <= 1e-12:               # zero-thickness layers: share equally
+                ts = [1.0] * len(parts)
+            tot = sum(ts)
             cum = 0.0
-            for p in parts:
-                t = other[p[idx_other]].bottom - other[p[idx_other]].top
+            for p, t in zip(parts, ts):
                 th = own[i].bottom - own[i].top
                 res[p] = (own[i].top + th * cum / tot, own[i].top + th * (cum + t) / tot)
                 cum += t
@@ -991,7 +1493,7 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
             f0 = min(max((L[i].top - d0) / run, 0.0), 1.0)
             f1 = min(max((L[i].bottom - d0) / run, 0.0), 1.0)
             pts = ([(x, cf(x, f0)) for x in xsw] + [(x, cf(x, f1)) for x in reversed(xsw)])
-            res.append((pts, L[i].litho, L[i].age))
+            res.append((pts, L[i].litho, L[i].age, ("fan", id(L[i]))))
         return res
 
     def trough_end(Ubase, xO, xY):
@@ -1032,15 +1534,17 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
         for i in G:
             lay = L[i]
             if lay.top > cur + 1e-9:
-                segs.append([Ysrc(lay.top) - Ysrc(cur), None, None])
-            segs.append([Ysrc(lay.bottom) - Ysrc(lay.top), lay.litho, lay.age])
+                segs.append([Ysrc(lay.top) - Ysrc(cur), None, None, None])
+            segs.append([Ysrc(lay.bottom) - Ysrc(lay.top), lay.litho, lay.age, id(lay)])
             cur = lay.bottom
         if dd[1] > cur + 1e-9:
-            segs.append([Ysrc(dd[1]) - Ysrc(cur), None, None])
+            segs.append([Ysrc(dd[1]) - Ysrc(cur), None, None, None])
         dist = []
-        for h, lit, _age in segs:
+        for h, lit, _age, lid in segs:
             if lit is None:
                 dist.append(None)
+            elif lid in short:          # lens suppressed by the geologist: a short stub only
+                dist.append(span * 0.03)
             else:
                 dist.append(span * (0.08 + (dmax - 0.08)
                                     * (1.0 - math.exp(-max(h, 0.0) / (0.25 * span)))))
@@ -1059,7 +1563,11 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
         def omega(i, x):
             xt = tips[i]
             if side == "A":
+                if xt - xa <= 1e-12:                 # zero-length wedge: no division by zero
+                    return 0.0
                 return hs[i] * wf((xt - x) / (xt - xa)) if x <= xt else 0.0
+            if xb - xt <= 1e-12:
+                return 0.0
             return hs[i] * wf((x - xt) / (xb - xt)) if x >= xt else 0.0
 
         def frac(j, x):
@@ -1070,7 +1578,7 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
             return sum(om[:j]) / tot
 
         res = []
-        for s, (h, lit, age) in enumerate(segs):
+        for s, (h, lit, age, lid) in enumerate(segs):
             if lit is None or h <= 1e-9:
                 continue
             xt = tips[s]
@@ -1080,7 +1588,7 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
                 xsw = [xt + (xb - xt) * (k / 16.0) ** 2 for k in range(0, 17)]
             up = [(x, ctop(x) + (cbot(x) - ctop(x)) * frac(s, x)) for x in xsw]
             lo = [(x, ctop(x) + (cbot(x) - ctop(x)) * frac(s + 1, x)) for x in reversed(xsw)]
-            res.append((up + lo, lit, age))
+            res.append((up + lo, lit, age, ("lens", lid)))
         return res
 
     gaps = []
@@ -1124,6 +1632,9 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
             mode = "ext"
         elif Bg and c == nP and _older(runB, LA):
             mode = "ext"
+        if short and not cover and (any(id(LA[i]) in short for i in Ag)
+                                    or any(id(LB[j]) in short for j in Bg)):
+            mode, young = "lens", None      # the geologist suppressed the lens of a layer
 
         polys = []
         if mode == "lens":
@@ -1199,7 +1710,7 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
                     s = 0.0
                     for (ua, sa), (ub, sb) in zip(verts, verts[1:]):
                         if ua <= u <= ub:
-                            s = sa + (sb - sa) * ((u - ua) / (ub - ua))
+                            s = sa + (sb - sa) * ((u - ua) / (ub - ua)) if ub - ua > 1e-12 else sa
                             break
                     x = xm + amp * s
                     return (x, cq(x, u))
@@ -1218,13 +1729,13 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
                     f0, f1 = frac(LA, i, *dA)
                     pts = ([(x, cq(x, f0)) for x in xl] + zz(f0, f1)
                            + [(x, cq(x, f1)) for x in reversed(xl)])
-                    polys.append((pts, LA[i].litho, LA[i].age))
+                    polys.append((pts, LA[i].litho, LA[i].age, ("trans", id(LA[i]))))
                 for j in Bg:
                     g0, g1 = frac(LB, j, *dB)
                     zp = zz(g0, g1)
                     pts = ([zp[0]] + [(x, cq(x, g0)) for x in xr]
                            + [(x, cq(x, g1)) for x in reversed(xr)] + list(reversed(zp)))
-                    polys.append((pts, LB[j].litho, LB[j].age))
+                    polys.append((pts, LB[j].litho, LB[j].age, ("trans", id(LB[j]))))
 
         else:                   # "stack": younger layers lap onto the older surface
             ctop, cbot = T, Bt
@@ -1271,7 +1782,7 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
                     return y + base(x) - base(xY)
                 top = (lambda x, T=T: T(x)) if k == 0 else (lambda x, ct=ct, T=T: max(ct(x), T(x)))
                 bot = U if k == len(GY) - 1 else (lambda x, cb=cb, U=U: min(cb(x), U(x)))
-                polys += [(p, L.litho, L.age) for p in _band(top, bot, xd)]
+                polys += [(p, L.litho, L.age, ("stack", id(L))) for p in _band(top, bot, xd)]
             for k, idx in enumerate(GO):
                 L = LO[idx]
 
@@ -1286,7 +1797,7 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
                        if k == len(GO) - 1 else
                        (lambda x, cb=cb, U=U, Bt=Bt, wO=wO:
                         U(x) + (min(cb(x), Bt(x)) - U(x)) * wO(x)))
-                polys += [(p, L.litho, L.age) for p in _band(top, bot, xdo)]
+                polys += [(p, L.litho, L.age, ("stack", id(L))) for p in _band(top, bot, xdo)]
 
         gaps.append({"ctop": ctop, "cbot": cbot, "polys": polys, "has": bool(Ag or Bg)})
 
@@ -1298,7 +1809,8 @@ def fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB, curvature=0.6, roundness=0.6,
         bot = (adjust(gaps[c + 1]["ctop"], YA(lb), YB(rb)) if gaps[c + 1]["has"]
                else S(YA(lb), YB(rb)))
         pts = [(x, top(x)) for x in xs] + [(x, bot(x)) for x in reversed(xs)]
-        out_main.append((pts, LA[p[0]].litho, LA[p[0]].age or LB[p[1]].age))
+        out_main.append((pts, LA[p[0]].litho, LA[p[0]].age or LB[p[1]].age,
+                         ("pair", id(LA[p[0]]), id(LB[p[1]]))))
     for g in gaps:
         out_wedge += g["polys"]
     return _no_overlap(out_main + out_wedge)
@@ -1342,6 +1854,8 @@ def fault_polygons(LA, LB, xa, xb, YA, YB, pos, dip_deg, direction, mA, mB, aspe
     if not LA and not LB:
         return [], None                 # nothing below the cover: no fault line to draw
     span = xb - xa
+    if span <= 1e-6:
+        return [], None                 # the two columns are at the same place
     if G is None:
         def G(x):
             return YA(0.0) + (YB(0.0) - YA(0.0)) * (x - xa) / span
@@ -1404,6 +1918,10 @@ def _segments_conflict(p, q, a, b, eps):
             tb = ((b[0] - p[0]) * dx + (b[1] - p[1]) * dy) / n2
             return max(min(ta, tb), 0.0) < min(max(ta, tb), 1.0) - 1e-12
         return False
+    m = 1e-6                                            # quick reject: the boxes do not meet
+    if (max(p[0], q[0]) < min(a[0], b[0]) - m or min(p[0], q[0]) > max(a[0], b[0]) + m
+            or max(p[1], q[1]) < min(a[1], b[1]) - m or min(p[1], q[1]) > max(a[1], b[1]) + m):
+        return False
     d1, d2 = _cross(p, q, a), _cross(p, q, b)
     d3, d4 = _cross(a, b, p), _cross(a, b, q)
     if ((d1 > eps and d2 < -eps) or (d1 < -eps and d2 > eps)) and \
@@ -1455,9 +1973,10 @@ def _bridge_holes(rings):
         return sum(1 for r in orig if len(r) >= 3 and point_in_polygon(pt, r)) % 2 == 1
 
     todo = list(holes)
+    stalled = 0
     while todo:
-        hole = todo.pop(0)
-        others = [e for h in todo for e in _ring_edges(h)]
+        hole = todo[0]
+        others = [e for h in todo[1:] for e in _ring_edges(h)]
         own = _ring_edges(hole)
         edges = _ring_edges(outer)
         pairs = sorted(((outer[a][0] - hole[b][0]) ** 2 + (outer[a][1] - hole[b][1]) ** 2, a, b)
@@ -1474,6 +1993,14 @@ def _bridge_holes(rings):
                 continue
             best = (i, j)
             break
+        if best is None and stalled < len(todo) - 1:
+            # this hole cannot see the outline yet (another hole is in the way): join the others
+            # first - the bridges change the outline - and come back to it
+            todo.append(todo.pop(0))
+            stalled += 1
+            continue
+        todo.pop(0)
+        stalled = 0
         if best is None:
             geometry_issue("2D section: a hole of a polygon could not be joined to the outline by "
                            "a connection lying inside the polygon (invalid or degenerate "
@@ -1492,8 +2019,12 @@ def _no_overlap(items):
     When a GEOS operation fails (the result is a null geometry, or an exception is raised), the
     polygon is kept as it was - it is NOT corrected - and the failure is written to the QGIS log
     and registered with geometry_issue(), so the dialog can warn the user that the overlaps of
-    that section were not removed."""
-    acc, out = None, []
+    that section were not removed.
+
+    Only the earlier polygons whose bounding box meets the polygon are subtracted: the others
+    cannot overlap it, and the union of everything drawn so far (which grows with every polygon)
+    is never built - the work stays almost linear for long sections with many boreholes."""
+    prior, out = [], []          # prior: (bounding box, geometry) of the polygons kept so far
     try:
         for item in items:
             pts, rest = item[0], item[1:]
@@ -1504,10 +2035,13 @@ def _no_overlap(items):
                     g = g.makeValid()
                     if g.isNull():
                         failed = "makeValid()"
-                if failed is None and acc is not None:
-                    g = g.difference(acc)
-                    if g.isNull():              # an empty result is fine, a null one is an error
-                        failed = "difference()"
+                if failed is None:
+                    box = g.boundingBox()
+                    near = [pg for pb, pg in prior if pb.intersects(box)]
+                    if near:
+                        g = g.difference(near[0] if len(near) == 1 else QgsGeometry.unaryUnion(near))
+                        if g.isNull():          # an empty result is fine, a null one is an error
+                            failed = "difference()"
             except Exception as e:
                 failed = f"{type(e).__name__}: {e}"
             if failed is not None:
@@ -1516,24 +2050,14 @@ def _no_overlap(items):
                                f"shown)")
                 out.append((list(pts),) + rest)
                 try:                           # at least keep the polygon out of the later ones
-                    merged = raw if acc is None else acc.combine(raw)
-                    if not merged.isNull():
-                        acc = merged
+                    prior.append((raw.boundingBox(), raw))
                 except Exception as e:
-                    log_warning(f"2D section: combine() of an uncorrected polygon failed: "
+                    log_warning(f"2D section: an uncorrected polygon could not be remembered: "
                                 f"{type(e).__name__}: {e}")
                 continue
             if g.isEmpty():
                 continue
-            if acc is None:
-                acc = g
-            else:
-                merged = acc.combine(g)
-                if merged.isNull():
-                    geometry_issue("2D section: GEOS operation combine() failed - later polygons "
-                                   "may overlap the earlier ones")
-                else:
-                    acc = merged
+            prior.append((g.boundingBox(), g))
             for part in g.asGeometryCollection():
                 if part.type() != Qgis.GeometryType.Polygon:
                     continue        # degenerate line / point left by difference()
@@ -1644,7 +2168,7 @@ def _top_envelope(polys, xl):
             for k in range(m):
                 x1, y1 = pts[k]
                 x2, y2 = pts[(k + 1) % m]
-                if (x1 <= x < x2) or (x2 <= x < x1):
+                if ((x1 <= x < x2) or (x2 <= x < x1)) and abs(x2 - x1) > 1e-12:
                     y = y1 + (y2 - y1) * (x - x1) / (x2 - x1)
                     if ymin is None or y < ymin:
                         ymin = y
@@ -1749,11 +2273,11 @@ def _map_to_inclined(pts, span_ref, x_A, x_B, y_cross_hi=None, y_cross_lo=None):
 MAX_GROUND_SLOPE = 10.0          # limit of the ground slope (scene dy/dx) between two columns
 
 
-def _fence_secant_inclined(LA, LB, YA, YB, x_A, x_B, zA=0.0, zB=0.0):
+def _fence_secant_inclined(LA, LB, YA, YB, x_A, x_B, zA=0.0, zB=0.0, edit=None, ca=1.0, cb=1.0):
     """Median apparent dip (scene dy/dx) of correlated contacts between inclined walls.
     zA, zB: elevations of the collars - the same correlation as the one that is drawn."""
     sl = []
-    for i, j in align_layers(LA, LB, zA, zB):
+    for i, j in align_layers(LA, LB, zA, zB, edit, ca, cb):
         ya_t, yb_t = YA(LA[i].top), YB(LB[j].top)
         dx_t = x_B(yb_t) - x_A(ya_t)
         if abs(dx_t) > 1e-6:
@@ -1768,13 +2292,27 @@ def _fence_secant_inclined(LA, LB, YA, YB, x_A, x_B, zA=0.0, zB=0.0):
     return sl[len(sl) // 2]
 
 
+def _poly_meta(k, meta, idkey):
+    """What a correlation polygon is, in terms that survive a rebuild (layer keys, not ids)."""
+    if not meta:
+        return {"k": k, "kind": "other"}
+    if meta[0] == "pair":
+        return {"k": k, "kind": "pair", "a": idkey.get(meta[1]), "b": idkey.get(meta[2])}
+    return {"k": k, "kind": meta[0], "layer": idkey.get(meta[1])}
+
+
 def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
                          use_dip=True, transitions=True, faults=None, aspect=1.0,
-                         bedrock=None):
+                         bedrock=None, edits=None, info=None):
     """All correlation polygons of a section (supports both vertical and inclined boreholes).
     faults = {k: {"pos": 0..1, "dip": degrees, "dir": +1/-1/0}} for the fence
     between proj[k] and proj[k+1].  Layers of Quaternary age are not cut by
-    faults.  Returns ([(points, litho, age)], fault_lines: one polyline [(x, y), ...] per fault)."""
+    faults.  Returns ([(points, litho, age)], fault_lines: one polyline [(x, y), ...] per fault).
+
+    edits (edits.SectionEdits): the geologist's correlation links and suppressed lenses.
+    info (dict, optional) receives "meta" (what each returned polygon is, same order), "links"
+    (the correlation links drawn: {"k", "a", "b", "state", "p1", "p2"}), "removed" (removed
+    links that could be restored) and "missing" (edits that no longer match any layer)."""
     faults = faults or {}
     cols_geom = [_bh_column_geom(p, X, Y, cw) for p in proj]
     fences = []
@@ -1823,10 +2361,12 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
 
         LAk, LBk = LAY[id(a.bh)], LAY[id(b.bh)]
         zA0, zB0 = a.z_at(0.0), b.z_at(0.0)
+        cA, cB = zA0 - a.z_at(1.0), zB0 - b.z_at(1.0)      # elevation lost per metre along the hole
         faulted = k in faults
+        pe = edits.resolve(a.bh.name, LAk, b.bh.name, LBk) if edits is not None else None
         sec = qsec = None
         if not faulted:
-            sec = _fence_secant_inclined(LAk, LBk, YA, YB, x_A, x_B, zA0, zB0)
+            sec = _fence_secant_inclined(LAk, LBk, YA, YB, x_A, x_B, zA0, zB0, pe, cA, cB)
         matched = sec is not None
         dx_g = pLB0[0] - pRA0[0]
         # ground slope; a (nearly) vertical projection must not give a huge slope
@@ -1835,13 +2375,14 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
         if faulted:
             qa, qb = _quat_run(LAk), _quat_run(LBk)
             if qa and qb:
-                qsec = _fence_secant_inclined(LAk[:qa], LBk[:qb], YA, YB, x_A, x_B, zA0, zB0)
+                qsec = _fence_secant_inclined(LAk[:qa], LBk[:qb], YA, YB, x_A, x_B, zA0, zB0, pe,
+                                              cA, cB)
                 if qsec is None:
                     qsec = ground
         if sec is None:         # nothing correlated: follow the ground surface
             sec = ground
         fences.append((0.0, span_ref, YA, YB, sec, faulted, qsec, matched,
-                       x_A, x_B, y_cross_hi, y_cross_lo))
+                       x_A, x_B, y_cross_hi, y_cross_lo, pe, []))
 
     def real_sec(k):            # dip usable for neighbours (Quaternary continues over faults)
         fc = fences[k] if 0 <= k < len(fences) else None
@@ -1853,20 +2394,24 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
         fc = fences[k] if 0 <= k < len(fences) else None
         return fc[4] if fc and not fc[5] and fc[7] else None
 
-    out, lines = [], []
+    out, lines, metas = [], [], []
     for k, fc in enumerate(fences):
         if fc is None:
             continue
-        xa, xb, YA, YB, sec, faulted, qsec, matched, x_A, x_B, y_cross_hi, y_cross_lo = fc
+        xa, xb, YA, YB, sec, faulted, qsec, matched, x_A, x_B, y_cross_hi, y_cross_lo, pe, plist = fc
         LA, LB = LAY[id(proj[k].bh)], LAY[id(proj[k + 1].bh)]
         zA, zB = proj[k].z_at(0.0), proj[k + 1].z_at(0.0)
+        cA, cB = zA - proj[k].z_at(1.0), zB - proj[k + 1].z_at(1.0)
+        idkey = {id(L): _edits.layer_key(proj[k].bh.name, L) for L in LA}
+        idkey.update({id(L): _edits.layer_key(proj[k + 1].bh.name, L) for L in LB})
 
-        def map_polys(raw_polys):
+        def map_polys(raw_polys, k=k, idkey=idkey):
             res = []
-            for pts, lit, age in raw_polys:
-                mp = _map_to_inclined(pts, xb, x_A, x_B, y_cross_hi, y_cross_lo)
+            for item in raw_polys:
+                mp = _map_to_inclined(item[0], xb, x_A, x_B, y_cross_hi, y_cross_lo)
                 if len(mp) >= 3:
-                    res.append((mp, lit, age))
+                    res.append((mp, item[1], item[2]))
+                    metas.append(_poly_meta(k, item[3] if len(item) > 3 else None, idkey))
             return res
 
         if faulted:
@@ -1883,7 +2428,8 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
                 dipsq = (qsec, blend_slopes(real_sec(k - 1), qsec),
                          blend_slopes(qsec, real_sec(k + 1))) if use_dip else None
                 out += map_polys(fence_polygons(LA[:qa], LB[:qb], zA, zB, xa, xb, YA, YB,
-                                                curvature, roundness, dipsq, transitions, None, True))
+                                                curvature, roundness, dipsq, transitions, None, True,
+                                                pe, plist, cA, cB))
                 G = _contact_curve(xa, xb, YA(dq[0]), YB(dq[1]), dipsq, curvature)
                 LA, LB = LA[qa:], LB[qb:]
             polys, line = fault_polygons(LA, LB, xa, xb, YA, YB, f.get("pos", 0.5),
@@ -1926,23 +2472,89 @@ def correlation_polygons(proj, LAY, X, Y, cw, curvature=0.6, roundness=0.6,
         if qa and qb and qa < len(LA) and qb < len(LB):
             # Quaternary cover is a separate, continuous sequence (never terminated)
             out += map_polys(fence_polygons(LA[:qa], LB[:qb], zA, zB, xa, xb, YA, YB,
-                                            curvature, roundness, dips, transitions, None, True))
+                                            curvature, roundness, dips, transitions, None, True,
+                                            pe, plist, cA, cB))
             qlast = (LA[qa - 1], LB[qb - 1])
+            # The gap under the cover is filled with the lowest cover layer of each borehole.  A
+            # cover that is ONE thin top layer (soil, humus) must not fill a wedge under the
+            # thicker cover of the neighbour: that side takes the neighbour's lowest layer.
+            if qa == 1 and qb > 1:
+                fill = (qlast[1], qlast[1])
+            elif qb == 1 and qa > 1:
+                fill = (qlast[0], qlast[0])
+            else:
+                fill = qlast
             base = _contact_curve(xa, xb, YA(qlast[0].bottom), YB(qlast[1].bottom), dips,
                                   curvature)
             LA, LB = LA[qa:], LB[qb:]
             rest = fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB,
-                                  curvature, roundness, dips, transitions, bedrock)
+                                  curvature, roundness, dips, transitions, bedrock, False,
+                                  pe, plist, cA, cB)
             out += map_polys(rest)
-            out += map_polys(_fill_cover_gap(rest, base, xa, xb, qlast[0], qlast[1]))
+            out += map_polys(_fill_cover_gap(rest, base, xa, xb, fill[0], fill[1]))
         else:
             out += map_polys(fence_polygons(LA, LB, zA, zB, xa, xb, YA, YB,
-                                            curvature, roundness, dips, transitions, bedrock))
+                                            curvature, roundness, dips, transitions, bedrock,
+                                            False, pe, plist, cA, cB))
+    if info is not None:
+        info["meta"] = metas
+        info["links"], info["removed"] = _link_info(proj, LAY, fences, cols_geom, edits)
+        info["missing"] = _missing_edits(proj, LAY, edits)
     return out, lines
+
+
+def _link_info(proj, LAY, fences, cols_geom, edits):
+    """Correlation links of the section for the editing tools: the links that were drawn and
+    the removed ones (drawn dashed so that they can be restored)."""
+    links, removed = [], []
+    for k, fc in enumerate(fences):
+        if fc is None or fc[5]:                 # no fence / a fault: blocks are not correlated
+            continue
+        a, b = proj[k], proj[k + 1]
+        byA = {id(L): L for L in LAY[id(a.bh)]}
+        byB = {id(L): L for L in LAY[id(b.bh)]}
+        keyA = {_edits.layer_key(a.bh.name, L): L for L in byA.values()}
+        keyB = {_edits.layer_key(b.bh.name, L): L for L in byB.values()}
+        gA, gB = cols_geom[k], cols_geom[k + 1]
+
+        def mk(la, lb, state, a=a, b=b, k=k, gA=gA, gB=gB):
+            return {"k": k, "a": _edits.layer_key(a.bh.name, la), "b": _edits.layer_key(b.bh.name, lb),
+                    "state": state, "same": la.litho == lb.litho,
+                    "p1": gA["right"](0.5 * (la.top + la.bottom)),
+                    "p2": gB["left"](0.5 * (lb.top + lb.bottom))}
+        seen = set()
+        for ida, idb in fc[13]:
+            if (ida, idb) in seen or ida not in byA or idb not in byB:
+                continue
+            seen.add((ida, idb))
+            la, lb = byA[ida], byB[idb]
+            key = (_edits.layer_key(a.bh.name, la), _edits.layer_key(b.bh.name, lb))
+            links.append(mk(la, lb, (edits.forced.get(key) if edits is not None else None) or "auto"))
+        if edits is not None:
+            for ka, kb in edits.forbidden:
+                if ka in keyA and kb in keyB:
+                    removed.append(mk(keyA[ka], keyB[kb], "removed"))
+    return links, removed
+
+
+def _missing_edits(proj, LAY, edits):
+    """Number of correlation edits whose layers are not found next to each other any more
+    (e.g. after merging identical lithologies)."""
+    if edits is None:
+        return 0
+    keys = {i: {_edits.layer_key(p.bh.name, L) for L in LAY[id(p.bh)]} for i, p in enumerate(proj)}
+    fences = {(i, i + 1) for i in range(len(proj) - 1)}
+    n = 0
+    for ka, kb in list(edits.forced) + list(edits.forbidden):
+        ok = any(ka in keys[i] and kb in keys[j] for i, j in fences)
+        n += 0 if ok else 1
+    return n
 
 
 def _section_bounds(proj):
     """(d0, d1, zmax, zmin) accounting for collar and inclined bottom positions."""
+    if not proj:
+        raise ValueError("No borehole lies near the section line - there is nothing to draw.")
     ds = [d for p in proj for d in (p.d_top, p.d_bot)]
     d0, d1 = min(ds), max(ds)
     zmax = max(p.z_at(0.0) for p in proj)
@@ -1981,16 +2593,23 @@ def section_geo(proj, vexag=0.0, curvature=0.6, roundness=0.6, merge_same=False,
             "line": None, "strat_items": [], "terrain_items": []}
 
 
-def hatch_brush(code):
-    """Brush with the FGDC lithologic pattern `code` (patterns.py); None when there is none."""
-    return _patterns.pattern_brush(code, 0.35) if code else None
+def hatch_brush(code, color=None):
+    """Brush with the FGDC lithologic pattern `code` (patterns.py); None when there is none.
+    `color` = the colour of the lithology: a dark one gets light pattern lines, any other black."""
+    return _patterns.pattern_brush(code, 0.35, color) if code else None
 
 
 def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
                         curvature=0.6, roundness=0.6, merge_same=False,
                         use_dip=True, transitions=True, faults=None, bedrock_dip=0.0,
-                        strat_lines=True, patterns=None, off_tol=OFF_LINE_TOL):
-    """Return a QGraphicsScene with the cross section. vexag<=0 -> auto."""
+                        strat_lines=True, patterns=None, off_tol=OFF_LINE_TOL,
+                        edits=None, poly_cache=None):
+    """Return a QGraphicsScene with the cross section. vexag<=0 -> auto.
+
+    edits (edits.SectionEdits) = the interactive corrections of the geologist (correlation
+    links, suppressed lenses, moved boundaries, hand-drawn lenses); passing it also draws the
+    correlation links (hidden) for the editing tools.  poly_cache (dict) keeps the correlation
+    polygons, so edits that only move a boundary or add a lens do not run the correlation again."""
     scene = QGraphicsScene()
     scene.setBackgroundBrush(QBrush(Qt.GlobalColor.white))
 
@@ -2044,7 +2663,9 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
     no_pen = QPen(Qt.PenStyle.NoPen)
 
     def add_hatch(item_poly, lit, z):
-        brush = hatch_brush(patterns.get(lit)) if patterns else None
+        # black lines, or light ones on a dark colour of the lithology (the same in the columns,
+        # in the correlated polygons and in the legend)
+        brush = hatch_brush(patterns.get(lit), colors.get(lit)) if patterns else None
         if brush is not None:
             h = item_poly(brush)
             h.setZValue(z)
@@ -2052,18 +2673,56 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
             hatch_items.append(h)
 
     # correlation polygons
-    polys = []
+    polys, meta, info, missing = [], [], {}, 0
     if correlate:
         bedrock = (math.tan(math.radians(bedrock_dip)) * ky / kx) if bedrock_dip and bedrock_dip > 0 else None
-        polys, flines = correlation_polygons(proj, LAY, X, Y, cw, curvature, roundness,
-                                             use_dip, transitions, faults, ky / kx, bedrock)
-        for pts, lit, age in polys:
+        ckey = None
+        if poly_cache is not None:
+            ckey = (tuple(sorted((k, tuple(sorted(v.items()))) for k, v in (faults or {}).items())),
+                    edits.corr_signature() if edits is not None else None)
+        hit = poly_cache.get(ckey) if poly_cache is not None else None
+        if hit is None:
+            info = {}
+            polys, flines = correlation_polygons(proj, LAY, X, Y, cw, curvature, roundness,
+                                                 use_dip, transitions, faults, ky / kx, bedrock,
+                                                 edits, info)
+            if poly_cache is not None:
+                if len(poly_cache) >= 12:                 # undo / redo steps come back quickly
+                    poly_cache.pop(next(iter(poly_cache)))
+                poly_cache[ckey] = (polys, flines, info)
+        else:
+            polys, flines, info = hit
+        meta = list(info.get("meta", []))
+        polys = list(polys)
+        missing = info.get("missing", 0)
+        if edits is not None and (edits.shifts or edits.lenses):
+            polys, meta, bad = apply_edit_geometry(polys, meta, edits, X, Y, ky)
+            missing += bad
+        # "merge neighbouring layers of the same lithology": polygons of the same lithology (and
+        # age) that touch are drawn as ONE shape, so no outline runs through the lithology
+        if merge_same:
+            # "Merge neighbouring layers of the same lithology": the polygons of one lithology AND
+            # one age that touch (or lie a hairline apart) are ONE shape, so no outline runs
+            # through it; layers of different ages are never joined.  Hairline holes are closed
+            # (they would show as white specks); the big shapes are drawn first so a lens inside
+            # one stays visible.
+            shapes = []
+            for rings, lit, age in _merged_shapes(polys):
+                holes = [h for h in rings[1:] if abs(_ring_area(h)) > MIN_HOLE_AREA]
+                shapes.append(([rings[0]] + holes, lit, age))
+            shapes.sort(key=lambda s_: -abs(_ring_area(s_[0][0])))
+        else:
+            shapes = [([pts], lit, age) for pts, lit, age in polys]
+        for rings, lit, age in shapes:
             c = QColor(colors.get(lit, QColor(Qt.GlobalColor.gray)))
             c.setAlpha(170)
-            poly = QPolygonF([QPointF(x, y) for x, y in pts])
-            it = scene.addPolygon(poly, QPen(c.darker(150), 0.6), QBrush(c))
+            shape = QPainterPath()                 # even-odd fill: the holes stay open
+            for ring in rings:
+                shape.addPolygon(QPolygonF([QPointF(x, y) for x, y in ring]))
+                shape.closeSubpath()
+            it = scene.addPath(shape, QPen(c.darker(150), 0.6), QBrush(c))
             it.setZValue(0)
-            add_hatch(lambda b, poly=poly: scene.addPolygon(poly, no_pen, b), lit, 0.5)
+            add_hatch(lambda b, shape=shape: scene.addPath(shape, no_pen, b), lit, 0.5)
         for n_f, fpts in enumerate(flines, start=1):
             pen = QPen(QColor(170, 0, 0), 2.6)
             for (xa_, ya_), (xb_, yb_) in zip(fpts, fpts[1:]):
@@ -2112,11 +2771,14 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
     strat_pen = QPen(QColor(30, 30, 30), 2.6)
     strat_pen.setCapStyle(Qt.PenCapStyle.RoundCap)
     strat_pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
-    cols = []
-    for p in proj:
+    cols, col_layers = [], []
+    for ip, p in enumerate(proj):
         cg = col_geoms[id(p.bh)]
         for L in LAY[id(p.bh)]:
-            cols.append((cg["quad"](L.top, L.bottom), L.litho, L.age))
+            quad = cg["quad"](L.top, L.bottom)
+            cols.append((quad, L.litho, L.age))
+            col_layers.append({"i": ip, "key": _edits.layer_key(p.bh.name, L), "quad": quad,
+                               "litho": L.litho})
     strat_found = False
     strat_items, terrain_items = [], []
     if strat_lines:
@@ -2143,6 +2805,34 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
         except Exception as e:
             # stratigraphic boundary lines are optional decoration; the section is still drawn
             log_warning(f"Stratigraphic boundary lines skipped: {type(e).__name__}: {e}")
+
+    # correlation links and marks of suppressed lenses (editing tools)
+    links, link_items, mark_items = [], [], []
+    if edits is not None:
+        for lk in list(info.get("links", [])) + list(info.get("removed", [])):
+            st = lk["state"]
+            col = {"auto": QColor(70, 70, 70, 190), "locked": QColor(230, 120, 0),
+                   "manual": QColor(0, 110, 220), "removed": QColor(200, 0, 0)}[st]
+            pen = QPen(col, 2.4 if st in ("locked", "manual") else 1.3)
+            if st == "removed" or not lk["same"]:
+                pen.setStyle(Qt.PenStyle.DashLine)
+            path = QPainterPath()
+            path.moveTo(*lk["p1"])
+            path.lineTo(*lk["p2"])
+            for (ex, ey) in (lk["p1"], lk["p2"]):
+                path.addEllipse(QPointF(ex, ey), 2.6, 2.6)
+            it = scene.addPath(path, pen)
+            it.setZValue(6)
+            it.setVisible(False)
+            links.append(lk)
+            link_items.append(it)
+        for cl in col_layers:
+            if cl["key"] in edits.short:
+                pen = QPen(QColor(200, 0, 0), 1.6)
+                pen.setStyle(Qt.PenStyle.DashLine)
+                it = scene.addPolygon(QPolygonF([QPointF(x, y) for x, y in cl["quad"]]), pen)
+                it.setZValue(6)
+                mark_items.append(it)
 
     # terrain (connects borehole collars)
     pen = QPen(QColor(40, 120, 40), 1.6)
@@ -2172,22 +2862,120 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
     scene.geo = {"polys": list(polys), "cols": cols, "d0": d0, "kx": kx, "ky": ky,
                  "zmax": zmax, "line": None,
                  "strat_items": strat_items, "terrain_items": terrain_items,
-                 "hatch_items": hatch_items}
+                 "hatch_items": hatch_items,
+                 # for the editing tools
+                 "meta": meta, "links": links, "link_items": link_items,
+                 "mark_items": mark_items, "col_layers": col_layers, "edits_missing": missing}
     return scene
+
+
+MERGE_CLOSE = 0.6           # scene units: polygons of one lithology closer than 2x this are joined
+
+
+def _close_hairlines(g):
+    """Morphological closing of a shape: polygons of the same layer that only almost touch
+    (a hairline gap left by the construction) become one shape.  Corners stay sharp (mitre
+    joins); when the result looks wrong the shape is returned unchanged."""
+    try:
+        args = (4, Qgis.EndCapStyle.Flat, Qgis.JoinStyle.Miter, 2.0)
+        grown = g.buffer(MERGE_CLOSE, *args)
+        if grown.isNull() or grown.isEmpty():
+            return g
+        c = grown.buffer(-MERGE_CLOSE, *args)
+        if not c.isNull() and not c.isEmpty() and c.area() <= g.area() * 1.02 + 50.0:
+            return c
+    except Exception as e:
+        log_warning(f"2D section: closing hairline gaps failed ({type(e).__name__}: {e})")
+    return g
+
+
+MIN_HOLE_AREA = 60.0        # scene units^2: smaller holes inside a merged shape are closed
+
+
+def _merged_shapes(polys, by_age=True):
+    """[(rings, litho, age)]: touching polygons of the same lithology (and, with by_age, the
+    same age) joined into one shape (rings = the outline followed by its holes).  Used for
+    DRAWING only - the polygons themselves (3D export, the editing tools, the stratigraphic
+    boundaries) stay as they are.  When GEOS fails the polygons of the group are drawn
+    separately."""
+    groups = {}
+    for pts, lit, age in polys:
+        groups.setdefault((lit, repr(age) if by_age else None), []).append((pts, age))
+    out = []
+    for (lit, _a), members in groups.items():
+        age = members[0][1] if by_age else None
+        if len(members) > 1:
+            try:
+                geoms = []
+                for pts, _ag in members:
+                    g = QgsGeometry.fromPolygonXY([[QgsPointXY(x, y) for x, y in pts]])
+                    if not g.isGeosValid():
+                        g = g.makeValid()
+                    geoms.append(g)
+                u = QgsGeometry.unaryUnion(geoms)
+                u = _close_hairlines(u)
+                parts = [] if u.isNull() else [p for p in u.asGeometryCollection()
+                                               if p.type() == Qgis.GeometryType.Polygon]
+                if parts:
+                    for part in parts:
+                        rings = [[(q.x(), q.y()) for q in ring] for ring in part.asPolygon()]
+                        if rings and len(rings[0]) >= 3:
+                            out.append((rings, lit, age))
+                    continue
+            except Exception as e:
+                log_warning(f"2D section: joining the polygons of {lit} failed "
+                            f"({type(e).__name__}: {e}) - they are drawn separately")
+        out.extend(([pts], lit, age) for pts, age in members)
+    return out
+
+
+def apply_edit_geometry(polys, meta, edits, X, Y, ky):
+    """Moved boundaries and hand-drawn lenses on top of the correlation polygons.
+
+    Returns (polygons, meta, number of edits that could not be applied)."""
+    bad = 0
+    polys = list(polys)
+    for sh in edits.shifts:
+        if sh.get("la") is not None and sh.get("lb") is not None:
+            ct = _edits.find_contact(polys, X(sh["d"]), Y(sh["z"]), 60.0, sh["la"], sh["lb"])
+        else:
+            ct = _edits.find_contact(polys, X(sh["d"]), Y(sh["z"]), 6.0)
+        if ct is None:
+            bad += 1
+            continue
+        up, down = _edits.shift_limits(ct)
+        dy = max(-up, min(down, -sh["dz"] * ky))      # elevation up = scene y down
+        polys = _edits.apply_shift(polys, ct, dy)
+    if edits.lenses:
+        items = []
+        for i, ln in enumerate(edits.lenses):
+            pts = _edits.lens_outline((X(ln["d1"]), Y(ln["z1"])), (X(ln["d2"]), Y(ln["z2"])),
+                                      ln["thick"] * ky)
+            if len(pts) < 3:                          # no area (tips on top of each other)
+                continue
+            items.append((pts, ln["litho"], None, {"k": -1, "kind": "manual", "idx": i}))
+        items += [(p[0], p[1], p[2], m) for p, m in zip(polys, meta)]
+        res = _no_overlap(items)
+        polys = [(r[0], r[1], r[2]) for r in res]
+        meta = [r[3] for r in res]
+    return polys, meta, bad
 
 
 # ------------------------------------------------------------------- layers
 def make_borehole_point_layer(boreholes):
     lyr = QgsVectorLayer(
-        f"PointZ?crs={CRS_SJTSK}&field=name:string&field=z:double&field=depth:double"
+        "PointZ?field=name:string(256)&field=z:double&field=depth:double"
         "&field=azimuth:double&field=dip:double",
         "Boreholes", "memory")
+    lyr.setCrs(work_crs())              # the CRS object, not an authid text in the URI
     feats = []
     for b in boreholes:
         f = QgsFeature(lyr.fields())
         f.setGeometry(QgsGeometry(QgsPoint(b.x, b.y, b.z)))
         f.setAttributes([b.name, b.z, b.depth, b.azimuth, b.dip])
         feats.append(f)
-    lyr.dataProvider().addFeatures(feats)
+    ok, _added = lyr.dataProvider().addFeatures(feats)
+    if not ok:
+        log_warning("The layer of the boreholes could not be filled (the provider refused the features)")
     lyr.updateExtents()
     return lyr

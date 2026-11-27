@@ -1,4 +1,4 @@
-from qgis.PyQt.QtCore import Qt, QRectF, QSize, QTimer, pyqtSignal
+from qgis.PyQt.QtCore import Qt, QEvent, QRectF, QSize, QSortFilterProxyModel, QTimer, pyqtSignal
 from qgis.PyQt.QtGui import (QColor, QGuiApplication, QIcon, QImage, QPainter, QPdfWriter,
                              QStandardItem, QStandardItemModel,
                              QPageSize, QPageLayout, QPixmap)
@@ -8,7 +8,7 @@ from qgis.PyQt.QtWidgets import (
     QComboBox, QCheckBox, QPushButton, QLabel, QPlainTextEdit, QTableWidget,
     QTableWidgetItem, QHeaderView, QDoubleSpinBox, QGraphicsView, QFileDialog,
     QMessageBox, QSplitter, QSpinBox, QScrollArea, QFrame, QListWidget, QListWidgetItem,
-    QApplication, QInputDialog,
+    QApplication, QInputDialog, QLineEdit, QListView,
 )
 from qgis.core import (
     Qgis, QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsCsException, QgsGeometry,
@@ -16,12 +16,19 @@ from qgis.core import (
 )
 from qgis.gui import QgsColorButton, QgsFileWidget, QgsMapTool, QgsRubberBand
 
+try:
+    from qgis.gui import QgsCollapsibleGroupBox
+except ImportError:                     # not expected; the groups are then plain boxes
+    QgsCollapsibleGroupBox = None
+
 import contextlib
 import os
 import math
 from dataclasses import replace
 
 from . import core, logs, model3d, patterns, viewer3d, viewer3d_window
+from . import edits as _edits
+from .section_editor import SectionEditor
 
 
 @contextlib.contextmanager
@@ -35,6 +42,104 @@ def _busy():
 
 
 # ---------------------------------------------------------------- map tool
+class _PatternPopup(QFrame):
+    """Drop-down of PatternCombo: a search line above the list of the patterns (with icons).
+    Typing filters the list (case-insensitive, anywhere in the code or the name); Up / Down
+    move in the list, Enter or a click chooses, Esc closes."""
+
+    def __init__(self, combo):
+        super().__init__(combo, Qt.WindowType.Popup)
+        self.setFrameShape(QFrame.Shape.StyledPanel)
+        self._combo = combo
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(4)
+        self.search = QLineEdit()
+        self.search.setPlaceholderText("Search pattern (code or name)...")
+        self.search.setClearButtonEnabled(True)
+        lay.addWidget(self.search)
+        self._proxy = QSortFilterProxyModel(self)
+        self._proxy.setSourceModel(combo.model())
+        self._proxy.setFilterCaseSensitivity(Qt.CaseSensitivity.CaseInsensitive)
+        self._proxy.setFilterRole(Qt.ItemDataRole.DisplayRole)
+        self.view = QListView()
+        self.view.setModel(self._proxy)
+        self.view.setIconSize(QSize(48, 36))
+        self.view.setUniformItemSizes(True)
+        self.view.setEditTriggers(QListView.EditTrigger.NoEditTriggers)
+        lay.addWidget(self.view)
+        self.search.textChanged.connect(self._filter)
+        self.search.installEventFilter(self)
+        self.view.clicked.connect(self._choose)
+        self.view.activated.connect(self._choose)
+
+    def _filter(self, text):
+        self._proxy.setFilterFixedString(text.strip())
+        if self._proxy.rowCount():
+            self.view.setCurrentIndex(self._proxy.index(0, 0))
+            self.view.scrollToTop()
+
+    def _choose(self, index):
+        if not index.isValid():
+            return
+        row = self._proxy.mapToSource(index).row()
+        self.close()
+        self._combo.setCurrentIndex(row)
+        self._combo.activated.emit(row)
+
+    def eventFilter(self, obj, ev):
+        if obj is self.search and ev.type() == QEvent.Type.KeyPress:
+            key = ev.key()
+            if key in (Qt.Key.Key_Down, Qt.Key.Key_Up, Qt.Key.Key_PageDown, Qt.Key.Key_PageUp):
+                self.view.setFocus()
+                QApplication.sendEvent(self.view, ev)
+                return True
+            if key in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
+                self._choose(self.view.currentIndex())
+                return True
+        return super().eventFilter(obj, ev)
+
+    def popup(self):
+        combo = self._combo
+        w = max(combo.width(), 420)
+        h = 8 + self.search.sizeHint().height() + 4 + 12 * 40 + 6
+        below = combo.mapToGlobal(combo.rect().bottomLeft())
+        above = combo.mapToGlobal(combo.rect().topLeft())
+        scr = combo.screen().availableGeometry() if combo.screen() else None
+        x, y = below.x(), below.y()
+        if scr is not None:
+            if y + h > scr.bottom():
+                y = above.y() - h if above.y() - h >= scr.top() else max(scr.top(), scr.bottom() - h)
+            x = max(scr.left(), min(x, scr.right() - w))
+        self.setGeometry(x, y, w, h)
+        self.search.clear()
+        self._proxy.setFilterFixedString("")
+        cur = self._proxy.index(max(combo.currentIndex(), 0), 0)
+        self.view.setCurrentIndex(cur)
+        self.show()
+        self.view.scrollTo(cur, QListView.ScrollHint.PositionAtCenter)
+        self.search.setFocus()
+
+
+class PatternCombo(QComboBox):
+    """Combo box of the lithologic patterns: the closed box shows the icon and the name, the
+    drop-down has a search line (see _PatternPopup) above the list."""
+
+    def showPopup(self):
+        if self.model() is None or self.model().rowCount() == 0:
+            return
+        pop = getattr(self, "_popup", None)
+        if pop is None:
+            pop = self._popup = _PatternPopup(self)
+        pop.popup()
+
+    def hidePopup(self):
+        pop = getattr(self, "_popup", None)
+        if pop is not None and pop.isVisible():
+            pop.close()
+        super().hidePopup()
+
+
 class SectionLineTool(QgsMapTool):
     lineFinished = pyqtSignal(list)
     cancelled = pyqtSignal()
@@ -95,9 +200,68 @@ class SectionLineTool(QgsMapTool):
 
 # ------------------------------------------------------------ section view
 class _View(QGraphicsView):
+    """Section view: wheel = zoom; with an editing tool active the left button belongs to the
+    tool (SectionEditor) and the middle button pans."""
+    editor = None
+    _pan_last = None
+
     def wheelEvent(self, e):
         f = 1.15 if e.angleDelta().y() > 0 else 1 / 1.15
         self.scale(f, f)
+
+    def _tool(self):
+        return self.editor is not None and self.editor.tool_active()
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.MouseButton.MiddleButton:
+            self._pan_last = e.position()
+            self.viewport().setCursor(Qt.CursorShape.ClosedHandCursor)
+            e.accept()
+            return
+        if self._tool():
+            if e.button() == Qt.MouseButton.RightButton:
+                self.editor.cancel()
+                e.accept()
+                return
+            if e.button() == Qt.MouseButton.LeftButton:
+                self.editor.press(self.mapToScene(e.position().toPoint()))
+                e.accept()
+                return
+        super().mousePressEvent(e)
+
+    def mouseMoveEvent(self, e):
+        if self._pan_last is not None:
+            d = e.position() - self._pan_last
+            self._pan_last = e.position()
+            hb, vb = self.horizontalScrollBar(), self.verticalScrollBar()
+            hb.setValue(hb.value() - int(d.x()))
+            vb.setValue(vb.value() - int(d.y()))
+            e.accept()
+            return
+        if self._tool() and self.editor.dragging():
+            if not (e.buttons() & Qt.MouseButton.LeftButton):
+                self.editor.cancel()              # the release happened outside the window
+                e.accept()
+                return
+            self.editor.move(self.mapToScene(e.position().toPoint()))
+            e.accept()
+            return
+        super().mouseMoveEvent(e)
+
+    def mouseReleaseEvent(self, e):
+        if e.button() == Qt.MouseButton.MiddleButton and self._pan_last is not None:
+            self._pan_last = None
+            if self._tool():
+                self.viewport().setCursor(Qt.CursorShape.CrossCursor)
+            else:
+                self.viewport().unsetCursor()
+            e.accept()
+            return
+        if self._tool() and e.button() == Qt.MouseButton.LeftButton and self.editor.dragging():
+            self.editor.release(self.mapToScene(e.position().toPoint()))
+            e.accept()
+            return
+        super().mouseReleaseEvent(e)
 
 
 class SectionViewer(QDialog):
@@ -105,7 +269,10 @@ class SectionViewer(QDialog):
                  title="Geological cross section"):
         super().__init__(parent)
         self.setWindowTitle(title)
-        _fit_to_screen(self, 1550, 780)
+        editable = proj is not None and rebuild is not None and len(proj) > 1
+        # the window with the editing panel is wider: the panel needs ~620 px, the section
+        # keeps about the width it had
+        _fit_to_screen(self, 1900 if editable else 1550, 780, 0.97 if editable else 0.9)
         self.scene = scene
         self.rebuild = rebuild
         self.view = _View(scene)
@@ -118,6 +285,8 @@ class SectionViewer(QDialog):
         split.addWidget(self.view)
         self.panel = None
         self.btn_regen = None
+        self.editor = None
+        self.applied_faults = None                # the faults of the last (re)generation
         self._strat0 = strat0
         if proj is not None and rebuild is not None and len(proj) > 1:
             side = QWidget()
@@ -134,15 +303,25 @@ class SectionViewer(QDialog):
             sl.addWidget(self.chk_v_strat)
             sl.addWidget(self.chk_v_ground)
             sl.addWidget(self.chk_v_hatch)
+            self.editor = SectionEditor(self, proj)
+            self.view.editor = self.editor
+            sl.addWidget(self.editor)
             self.panel = FaultPanel(proj)
             sl.addWidget(self.panel)
-            btn = QPushButton("Regenerate section")
+            btn = QPushButton("Regenerate section")     # placed in the bottom row (below)
             btn.clicked.connect(self.regenerate)
-            sl.addWidget(btn)
             self.btn_regen = btn
-            split.addWidget(side)
+            sl.addStretch()
+            scroll = QScrollArea()                 # the panel with the editing tools is tall
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setWidget(side)
+            scroll.setMinimumWidth(430)
+            split.addWidget(scroll)
+            split.setChildrenCollapsible(False)
             split.setStretchFactor(0, 3)
             split.setStretchFactor(1, 2)
+            split.setSizes([max(600, self.width() - 470), 470])
         lay.addWidget(split, 1)
         row = QHBoxLayout()
         for label, fn in (("Fit", self.fit), ("Export PNG", self.export_png),
@@ -150,10 +329,14 @@ class SectionViewer(QDialog):
             b = QPushButton(label)
             b.clicked.connect(fn)
             row.addWidget(b)
+        row.addWidget(QLabel("Mouse wheel = zoom, drag = pan (editing tools: middle button = pan)"))
         row.addStretch()
-        row.addWidget(QLabel("Mouse wheel = zoom, drag = pan"))
+        if self.panel is not None and self.btn_regen is not None:
+            row.addWidget(self.btn_regen)               # always visible, not in the scrolling panel
         lay.addLayout(row)
         self._apply_visibility()
+        if self.editor is not None:
+            self.editor.scene_changed()
 
     def _apply_visibility(self, *_):
         geo = getattr(self.scene, "geo", None)
@@ -173,6 +356,8 @@ class SectionViewer(QDialog):
     def mark_stale(self):
         """The data were loaded again: Regenerate would redraw the OLD set of boreholes, so it is
         switched off; the drawing stays available (view, export) and a new section can be drawn."""
+        if self.editor is not None:
+            self.editor.mark_stale()
         if self.btn_regen is not None:
             self.btn_regen.setEnabled(False)
             self.btn_regen.setToolTip("The data were loaded again after this section was drawn. "
@@ -180,19 +365,40 @@ class SectionViewer(QDialog):
             self.btn_regen.setText("Regenerate section (data reloaded - draw the section again)")
         self.setWindowTitle(self.windowTitle() + " [old data]")
 
-    def regenerate(self):
-        faults = self.panel.faults() or None
+    def regenerate(self, keep_view=False, quiet=False):
+        """Build the section again (faults of the panel + the edits of the editing tools).
+        keep_view: the zoom and the position are kept (used after every edit).
+        Returns False when the section could not be built."""
+        if keep_view and self.editor is not None:
+            faults = self.applied_faults          # an edit does not pick up unfinished fault inputs
+        else:
+            faults = (self.panel.faults() or None) if self.panel is not None else None
+            self.applied_faults = faults
+        edits = self.editor.state if self.editor is not None else None
         try:
-            scene = self.rebuild(faults)
+            with _busy():
+                scene = self.rebuild(faults, edits)
         except Exception as e:
-            QMessageBox.critical(self, "Error", str(e))
-            return
+            if not quiet:                       # quiet: the second try after a failed edit
+                QMessageBox.critical(self, "Error", f"{type(e).__name__}: {e}")
+            return False
         old = self.scene
+        tr = self.view.transform()
+        centre = self.view.mapToScene(self.view.viewport().rect().center())
+        rect = old.sceneRect()
         self.scene = scene
         self.view.setScene(scene)
-        self._apply_visibility()
-        self.fit()
+        if keep_view:
+            scene.setSceneRect(rect.united(scene.sceneRect()))
+            self.view.setTransform(tr)
+            self.view.centerOn(centre)
         old.deleteLater()
+        self._apply_visibility()
+        if not keep_view:
+            self.fit()
+        if self.editor is not None:
+            self.editor.scene_changed()
+        return True
 
     def showEvent(self, e):
         super().showEvent(e)
@@ -210,7 +416,9 @@ class SectionViewer(QDialog):
             return
         extra = vp.height() - int(vp.width() * r.height() / r.width()) - 6
         if extra > 20:
-            self.resize(self.width(), max(self.height() - extra, 300))
+            side = getattr(self, "_side_panel", None)      # the side panel of the log windows
+            floor = 300 if side is None else max(300, side.sizeHint().height() + 60)
+            self.resize(self.width(), max(self.height() - extra, floor))
             self.fit()
 
     def fit(self):
@@ -279,9 +487,11 @@ class SectionViewer(QDialog):
         if not path:
             return
         r = self.scene.sceneRect()
-        if r.width() <= 0 or r.height() <= 0:
+        if not (math.isfinite(r.width()) and math.isfinite(r.height())) \
+                or r.width() <= 0 or r.height() <= 0:
             QMessageBox.warning(self, "Export", "The scene is empty - nothing to export.")
             return
+        existed = os.path.exists(path)
         try:
             with open(path, "ab"):                  # can the file be written (not locked)?
                 pass
@@ -294,20 +504,26 @@ class SectionViewer(QDialog):
         g.setViewBox(QRectF(0, 0, r.width(), r.height()))
         p = QPainter(g)
         if not p.isActive():
+            if not existed:                          # the probe above created an empty file
+                with contextlib.suppress(OSError):
+                    os.remove(path)
             QMessageBox.warning(self, "Export", f"Could not write the SVG:\n{path}")
             return
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        self.scene.render(p, QRectF(0, 0, r.width(), r.height()), r)
-        p.end()
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            self.scene.render(p, QRectF(0, 0, r.width(), r.height()), r)
+        finally:
+            p.end()                                  # also when the rendering fails
 
     def export_pdf(self):
         path = self._ask("PDF (*.pdf)", ".pdf")
         if not path:
             return
         r = self.scene.sceneRect()
-        if r.width() <= 0 or r.height() <= 0:
+        if not (math.isfinite(r.width()) and math.isfinite(r.height())) \
+                or r.width() <= 0 or r.height() <= 0:
             QMessageBox.warning(self, "Export", "The scene is empty - nothing to export.")
             return
         w = QPdfWriter(path)
@@ -319,12 +535,14 @@ class SectionViewer(QDialog):
             QMessageBox.warning(self, "Export",
                                 f"Could not write the PDF (is it open in another program?):\n{path}")
             return
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-        target = QRectF(0, 0, p.device().width(), p.device().height())
-        self.scene.render(p, target, self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
-        p.end()
+        try:
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+            target = QRectF(0, 0, p.device().width(), p.device().height())
+            self.scene.render(p, target, self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
+        finally:
+            p.end()                                  # also when the rendering fails
 
 
 NO_STRAT = "(none)"
@@ -370,8 +588,10 @@ class LogViewer(SectionViewer):
             self.cb_strat = combo([NO_STRAT] + list(columns), start["strat"])
             form.addRow("Stratigraphy from column", self.cb_strat)
             sl.addWidget(box)
+        self._side_panel = side
         btn = QPushButton("Regenerate")
         btn.clicked.connect(self.regenerate_log)
+        self.btn_regen = btn                # mark_stale() disables it when the data are reloaded
         sl.addWidget(btn)
         sl.addStretch()
         side.setMinimumWidth(300)
@@ -435,7 +655,8 @@ class FaultPanel(QGroupBox):
                 self.tbl.setCellWidget(k, col, w)
             self.rows.append((chk, pos, dip, dirc))
         lay.addWidget(self.tbl)
-        self.setMinimumWidth(560)
+        self.tbl.horizontalHeader().setMinimumSectionSize(56)
+        self.setMinimumWidth(420)
 
     def faults(self):
         out = {}
@@ -460,12 +681,13 @@ LY_FIELDS = [("name", "Borehole name", ["name", "borehole", "vrt", "nazev", "id"
              ("strat", "Stratigraphy (optional)", ["strat", "period", "perioda", "utvar", "vek", "age", "system", "geolog"])]
 
 
-def _fit_to_screen(widget, width, height):
-    """Resize a window to the wanted size, but never larger than 90 % of the screen."""
+def _fit_to_screen(widget, width, height, max_width=0.9):
+    """Resize a window to the wanted size, but never larger than 90 % of the screen
+    (max_width: the share of the screen width that may be used)."""
     with contextlib.suppress(AttributeError, RuntimeError):      # no screen (yet): keep the size
         scr = widget.screen() or QGuiApplication.primaryScreen()
         area = scr.availableGeometry()
-        width, height = min(width, int(area.width() * 0.9)), min(height, int(area.height() * 0.85))
+        width, height = min(width, int(area.width() * max_width)), min(height, int(area.height() * 0.85))
     widget.resize(width, height)
 
 
@@ -476,6 +698,34 @@ def _scrolled(widget):
     sa.setFrameShape(QFrame.Shape.NoFrame)
     sa.setWidget(widget)
     return sa
+
+
+def _collapsible(title):
+    """A group box with a fold-away arrow (QGIS's own look), a plain one when it is not available.
+    The state is not remembered between sessions: the dialog always opens the same way.  Fold it
+    with _fold() only AFTER its content has been added."""
+    if QgsCollapsibleGroupBox is None:
+        return QGroupBox(title)
+    box = QgsCollapsibleGroupBox(title)
+    box.setSaveCollapsedState(False)
+    return box
+
+
+def _fold(box):
+    if hasattr(box, "setCollapsed"):
+        box.setCollapsed(True)
+
+
+def _accordion(*boxes):
+    """Opening one of the boxes folds the others away (only one long list of settings at a time)."""
+    def opened(box, collapsed):
+        if not collapsed:
+            for other in boxes:
+                if other is not box and hasattr(other, "setCollapsed"):
+                    other.setCollapsed(True)
+    for b in boxes:
+        if hasattr(b, "collapsedStateChanged"):
+            b.collapsedStateChanged.connect(lambda c, b=b: opened(b, c))
 
 
 def _strat_help():
@@ -513,6 +763,8 @@ class BoreholeDialog(QDialog):
         self.tool.cancelled.connect(self._line_cancel)
         self.tool.aborted.connect(self.show)
         self.bh_layer_id = None
+        QgsProject.instance().cleared.connect(self._project_cleared)
+        QgsProject.instance().layerWillBeRemoved.connect(self._layer_will_be_removed)
         self.viewers = []
         self.forms = {}
         self.scene3d, self.scene3d_colors, self.scene3d_bhs = {}, {}, {}   # models of the own 3D viewer
@@ -560,17 +812,33 @@ class BoreholeDialog(QDialog):
         for k, v in core.INPUT_CRS.items():
             self.cb_crs.addItem(v[1], k)
         self.forms["bh"][0].insertRow(2, "Input coordinate system", self.cb_crs)
+        # UTM zone (shown only for the UTM entries)
+        self.cb_utm_zone = QComboBox()      # only the zones that exist for the datum (HARN has gaps)
+        self.cb_utm_hemi = QComboBox()
+        self.cb_utm_hemi.addItem("N (northern hemisphere)", False)
+        self.cb_utm_hemi.addItem("S (southern hemisphere)", True)
+        self.utm_row = QWidget()
+        ul = QHBoxLayout(self.utm_row)
+        ul.setContentsMargins(0, 0, 0, 0)
+        ul.addWidget(self.cb_utm_zone)
+        ul.addWidget(self.cb_utm_hemi)
+        ul.addStretch()
+        self.forms["bh"][0].insertRow(3, "UTM zone", self.utm_row)
         lay.addWidget(b1)
         lay.addWidget(b2)
         strat_help = STRAT_HELP
         self.cb_ly["strat"].setToolTip(strat_help)
-        self.chk_neg = QCheckBox("Coordinates are given without minus sign (add it - S-JTSK only)")
-        self.chk_neg.setChecked(True)
-        self.chk_swap = QCheckBox("Swap the two coordinate columns (X<->Y / lon<->lat)")
-        lay.addWidget(self.chk_neg)
-        lay.addWidget(self.chk_swap)
+        self.chk_proj = QCheckBox("Set the QGIS project coordinate system to that of the CSV file "
+                                  "(when the boreholes are added to the map)")
+        self.chk_proj.setChecked(True)
+        lay.addWidget(self.chk_proj)
+        self._loaded_sig = None            # input settings of the loaded data
+        self._stale_warned = False
         self.cb_crs.currentIndexChanged.connect(self._crs_changed)
         self._crs_changed()
+        for sig in (self.cb_crs.currentIndexChanged, self.cb_utm_zone.currentIndexChanged,
+                    self.cb_utm_hemi.currentIndexChanged):
+            sig.connect(self._crs_settings_changed)
         row = QHBoxLayout()
         b = QPushButton("Load data")
         b.clicked.connect(self.load_data)
@@ -586,13 +854,53 @@ class BoreholeDialog(QDialog):
         lay.addStretch()
         return w
 
+    def _utm_zone(self):
+        z = self.cb_utm_zone.currentData()
+        return int(z) if z is not None else None
+
+    def _crs_signature(self):
+        """Input settings that decide the coordinates of the loaded boreholes."""
+        return (self.cb_crs.currentData(), self._utm_zone(), bool(self.cb_utm_hemi.currentData()))
+
+    def _crs_settings_changed(self, *_):
+        """The coordinate settings were changed after Load data: the boreholes (and the map layer,
+        sections, 3D models) still have the old coordinates, so say that they must be reloaded."""
+        if self.boreholes and self._loaded_sig is not None \
+                and self._crs_signature() != self._loaded_sig and not self._stale_warned:
+            self._stale_warned = True
+            self._msg("WARNING: the coordinate system settings were changed after the data were "
+                      "loaded - press Load data again, otherwise the old coordinates are used.")
+
+    def _source_crs_text(self):
+        """Name of the coordinate system chosen for the CSV file (with the UTM zone)."""
+        key = self.cb_crs.currentData()
+        if not core.is_utm(key):
+            return self.cb_crs.currentText()
+        try:
+            return core.crs_authid(key, self._utm_zone(), bool(self.cb_utm_hemi.currentData()))
+        except ValueError:
+            return self.cb_crs.currentText()
+
     def _crs_changed(self, *_):
         key = self.cb_crs.currentData()
         _, _, lx, ly, kx, ky = core.INPUT_CRS[key]
         form, combos = self.forms["bh"]
         form.labelForField(combos["x"]).setText(lx)
         form.labelForField(combos["y"]).setText(ly)
-        self.chk_neg.setEnabled(key == "sjtsk")
+        utm = core.is_utm(key)
+        form.labelForField(self.utm_row).setVisible(utm)
+        self.utm_row.setVisible(utm)
+        if utm:
+            z0, z1, default, south_ok = core.utm_zone_info(key)
+            self.cb_utm_zone.blockSignals(True)
+            self.cb_utm_zone.clear()
+            for z in core.utm_valid_zones(key):
+                self.cb_utm_zone.addItem(f"{z}", z)
+            self.cb_utm_zone.setCurrentIndex(max(self.cb_utm_zone.findData(default), 0))
+            self.cb_utm_zone.blockSignals(False)
+            if not south_ok:
+                self.cb_utm_hemi.setCurrentIndex(0)
+            self.cb_utm_hemi.setEnabled(south_ok)
         hdr = self.hdr.get("bh")
         if hdr:
             combos["x"].setCurrentIndex(core.guess_column(hdr, kx))
@@ -602,6 +910,7 @@ class BoreholeDialog(QDialog):
         w = QWidget()
         lay = QVBoxLayout(w)
         self.tbl = QTableWidget(0, 4)
+        self.tbl.verticalHeader().setDefaultSectionSize(30)     # compact rows (32x24 pattern icons)
         self.tbl.setHorizontalHeaderLabels(["Lithology", "Colour", "Grain size", "Pattern"])
         self.tbl.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
         lay.addWidget(self.tbl)
@@ -758,6 +1067,7 @@ class BoreholeDialog(QDialog):
         self.chk_corr = QCheckBox("Correlate same lithology between neighbouring boreholes")
         self.chk_corr.setChecked(True)
         self.chk_merge = QCheckBox("Merge neighbouring layers of the same lithology")
+        self.chk_merge.setChecked(True)
         self.chk_dip = QCheckBox("Follow the dip of neighbouring boreholes")
         self.chk_dip.setChecked(True)
         self.chk_trans = QCheckBox("Jagged boundary for lateral change of lithology")
@@ -816,7 +1126,7 @@ class BoreholeDialog(QDialog):
         cf.addRow(self.chk_sel)
         lay.addWidget(com)
 
-        gn = QGroupBox("A) Fence model - network of 2D sections between neighbouring boreholes")
+        gn = _collapsible("A) Fence model - network of 2D sections between neighbouring boreholes")
         fn = QFormLayout(gn)
         self.cb_net = QComboBox()
         self.cb_net.addItems(["Grid-like (nearest borehole in each direction)",
@@ -871,7 +1181,8 @@ class BoreholeDialog(QDialog):
         fn.addRow(bnet)
         lay.addWidget(gn)
 
-        ga = QGroupBox("B) Full model from boreholes (all boreholes interpolated, no sections needed)")
+        ga = _collapsible("B) Full model from boreholes (all boreholes interpolated, no sections needed)")
+        _accordion(gn, ga)                 # one of the two long lists of settings is open at a time
         fa = QFormLayout(ga)
         self.cb_gmethod = QComboBox()
         self.cb_gmethod.addItems(["Smooth layers (sloped solids)", "Blocks (bricks on a square grid)"])
@@ -910,6 +1221,7 @@ class BoreholeDialog(QDialog):
         bg.clicked.connect(self.create_grid)
         fa.addRow(bg)
         lay.addWidget(ga)
+        _fold(ga)                          # only A) is open at first (see _accordion)
 
         lay.addWidget(self._lithology_visibility_box())
         lay.addWidget(QLabel("QGIS layers: open them with View > New 3D Map View "
@@ -979,6 +1291,10 @@ class BoreholeDialog(QDialog):
         try:
             header, _ = core.read_table(path, self.delims[key].currentData(), max_rows=1)
         except Exception as e:
+            self.hdr[key] = None
+            self.hdr_idx[key] = None
+            for cb in self.forms[key][1].values():     # no column names of the previous file
+                cb.clear()
             self._msg(f"Cannot read {path}: {e}")
             return
         # only columns with a heading are offered (blank headers were named "(column N)")
@@ -1026,15 +1342,26 @@ class BoreholeDialog(QDialog):
             m1["dip"] = self._file_col("bh", self.cb_bh["dip"].currentIndex() - 1)
             m2 = {k: self._file_col("ly", c.currentIndex()) for k, c in self.cb_ly.items()}
             m2["strat"] = self._file_col("ly", self.cb_ly["strat"].currentIndex() - 1)
-            self.ly_header = list(h2)
+            bhs, warns = core.build_boreholes(
+                h1, r1, m1, h2, r2, m2, self.cb_crs.currentData(),
+                self._utm_zone(), bool(self.cb_utm_hemi.currentData()))
+            if not bhs:                      # nothing valid: the previous data stay as they were
+                msg = "\n".join(warns[:10]) if warns else "No valid boreholes found in the CSV file."
+                QMessageBox.warning(self, "No boreholes loaded", msg)
+                return
+            # the column names are replaced only when the new data were built successfully
+            self.boreholes = bhs
+            self.bh_layer_id = None          # the map layer of the previous data set is not ours any more
+            # the columns offered in tab 1 (no blank headers), like in the windows of the logs
+            self.ly_header = [h for h in h2 if not core.is_blank_header(h)]
             self.litho_col = h2[m2["litho"]]
             self.strat_col = h2[m2["strat"]] if m2["strat"] >= 0 else ""
-            self.boreholes, warns = core.build_boreholes(
-                h1, r1, m1, h2, r2, m2, self.cb_crs.currentData(),
-                self.chk_neg.isChecked(), self.chk_swap.isChecked())
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
             return
+        self.clear_line()                    # the old line is in the CRS of the previous data
+        self._loaded_sig = self._crs_signature()
+        self._stale_warned = False
         self.log.clear()
         for v in list(self.viewers):         # open windows drawn from the previous data set
             stale = getattr(v, "mark_stale", None)
@@ -1047,10 +1374,14 @@ class BoreholeDialog(QDialog):
         self.lst_lit.clear()
         n_l = sum(len(b.layers) for b in self.boreholes)
         self._msg(f"Loaded {len(self.boreholes)} boreholes, {n_l} layers "
-                  f"(input CRS: {self.cb_crs.currentText()}).")
+                  f"(input CRS: {self._source_crs_text()}).")
+        if core.work_crs_authid() != core.source_crs_authid():
+            self._msg(f"The file is in degrees or Web Mercator, which cannot be used for distances "
+                      f"in metres: the plugin works in {core.work_crs_authid()} (UTM zone of the "
+                      f"boreholes); the QGIS project keeps {core.source_crs_authid()}.")
         if self.boreholes:
             b = self.boreholes[0]
-            self._msg(f"First borehole {b.name}: S-JTSK QGIS x={b.x:.2f}, y={b.y:.2f} (EPSG:5514)")
+            self._msg(f"First borehole {b.name}: x={b.x:.2f}, y={b.y:.2f} ({core.work_crs_authid()})")
         for w in warns[:200]:
             self._msg("WARNING: " + w)
         lithos = core.lithologies(self.boreholes)
@@ -1072,9 +1403,8 @@ class BoreholeDialog(QDialog):
             gb.setCurrentIndex(logs.GRAINS.index(logs.guess_grain(lit)))
             self.tbl.setCellWidget(i, 2, gb)
             self.grain_boxes[lit] = gb
-            pb = QComboBox()
-            pb.setIconSize(QSize(48, 36))
-            pb.setMaxVisibleItems(12)
+            pb = PatternCombo()
+            pb.setIconSize(QSize(32, 24))
             pb.setModel(pat_model)               # one model (133 icons) for all rows
             pb.setCurrentIndex(max(pb.findData(patterns.default_pattern(lit)), 0))
             self.tbl.setCellWidget(i, 3, pb)
@@ -1118,11 +1448,21 @@ class BoreholeDialog(QDialog):
         if not self.boreholes:
             QMessageBox.warning(self, "No data", "Load data first (tab 1).")
             return False
+        if self._loaded_sig is not None and self._crs_signature() != self._loaded_sig:
+            QMessageBox.warning(self, "Coordinate system changed",
+                                "The coordinate system settings (tab 1) were changed after the data "
+                                "were loaded. Press Load data again so that the boreholes, the map "
+                                "layer, the sections and the 3D models use the new settings.")
+            return False
         return True
 
     def add_points(self):
         if self._need_data():
             lyr = core.make_borehole_point_layer(self.boreholes)
+            if self.chk_proj.isChecked():
+                crs = QgsCoordinateReferenceSystem(core.source_crs_authid())
+                if crs.isValid():
+                    QgsProject.instance().setCrs(crs)     # the project uses the CRS of the CSV file
             QgsProject.instance().addMapLayer(lyr)
             self.bh_layer_id = lyr.id()
             self.iface.mapCanvas().zoomToFullExtent()
@@ -1280,19 +1620,24 @@ class BoreholeDialog(QDialog):
         if self.line_rb:
             self.line_rb.reset(Qgis.GeometryType.Line)
             sc = self.canvas.scene()
-            if sc is not None:
-                sc.removeItem(self.line_rb)
+            if sc is not None and self.line_rb.scene() is sc:
+                sc.removeItem(self.line_rb)      # a QgsRubberBand is a graphics item, not a QObject
             self.line_rb = None
 
     def _line_cancel(self):
         self.canvas.unsetMapTool(self.tool)
+        self._to_front()
+
+    def _to_front(self):
         self.show()
+        self.raise_()
+        self.activateWindow()
 
     def _line_done(self, pts):
         self.canvas.unsetMapTool(self.tool)
         src = self.canvas.mapSettings().destinationCrs()
         self._set_line(pts, src)
-        self.show()
+        self._to_front()
 
     def use_selected(self):
         lyr = self.iface.activeLayer()
@@ -1315,25 +1660,35 @@ class BoreholeDialog(QDialog):
             QMessageBox.warning(self, "Selection", "The selected line needs at least two vertices.")
             return
         self._set_line(pts, lyr.crs())
+        n_sel = len(lyr.selectedFeatures())
+        if n_sel > 1 and self.section_pts:
+            self.lbl_line.setText(self.lbl_line.text() + f"  (the first of {n_sel} selected features)")
 
     def _set_line(self, pts, src_crs):
-        dst = QgsCoordinateReferenceSystem(core.CRS_SJTSK)
+        dst = core.work_crs()                  # the coordinate system of the boreholes
         tr = QgsCoordinateTransform(src_crs, dst, QgsProject.instance().transformContext())
         if not src_crs.isValid() or not tr.isValid():       # invalid CRS would pass unchanged
             QMessageBox.warning(self, "Section line",
                                 "The layer (or the project) has no valid coordinate system, so "
-                                "the section line cannot be transformed to S-JTSK. Assign a CRS "
+                                "the section line cannot be transformed to the coordinate system "
+                                f"of the boreholes ({core.work_crs_authid()}). Assign a CRS "
                                 "to the layer first.")
             return
         try:
             new_pts = [tr.transform(QgsPointXY(p)) for p in pts]
         except (QgsCsException, ValueError) as e:
             QMessageBox.warning(self, "Section line",
-                                "The section line could not be transformed to S-JTSK "
+                                "The section line could not be transformed to "
+                                f"{core.work_crs_authid()} "
                                 f"(layer or project without a valid CRS?):\n{e}")
             return
+        if not all(math.isfinite(p.x()) and math.isfinite(p.y()) for p in new_pts):
+            QMessageBox.warning(self, "Section line",
+                                "The section line lies outside the valid area of "
+                                f"{core.work_crs_authid()}.")
+            return
         length = QgsGeometry.fromPolylineXY(new_pts).length() if len(new_pts) >= 2 else 0.0
-        if length < 1e-6:
+        if not math.isfinite(length) or length < 1e-6:
             QMessageBox.warning(self, "Section line",
                                 "The section line has zero length - click two different points.")
             return
@@ -1346,7 +1701,10 @@ class BoreholeDialog(QDialog):
         self.line_rb.setToGeometry(QgsGeometry.fromPolylineXY(list(pts)), src_crs)
 
     def _marker_radius(self):
-        """Radius (m) of the circular borehole marker on the map at the current scale."""
+        """Radius (m) of the circular borehole marker on the map, measured in the working CRS
+        of the boreholes (metres of UTM / S-JTSK): the pixel size of the canvas is in the units
+        of the project CRS (degrees for EPSG:4326, stretched metres for Web Mercator), so two
+        points one marker radius apart are transformed into the working CRS and measured there."""
         size_mm = 2.0
         try:
             for lyr in self._bh_layers():
@@ -1355,11 +1713,25 @@ class BoreholeDialog(QDialog):
                 if sym is not None and sym.size() > 0:
                     size_mm = sym.size()
                     break
-            scale = self.canvas.scale()
+            ms = self.canvas.mapSettings()
+            r_px = size_mm / 2.0 * ms.outputDpi() / 25.4
+            r_map = r_px * self.canvas.mapUnitsPerPixel()          # in the units of the canvas CRS
+            c = self.canvas.center()
+            canvas_crs = ms.destinationCrs()
+            tr = QgsCoordinateTransform(canvas_crs, core.work_crs(),
+                                       QgsProject.instance().transformContext())
+            if not tr.isValid():                 # no valid CRS yet: no transformation, no log noise
+                return core.OFF_LINE_TOL
+            p1 = tr.transform(QgsPointXY(c.x(), c.y()))
+            dx = -r_map if c.x() > 0 else r_map      # towards the middle of the axis: no step beyond +-180
+            p2 = tr.transform(QgsPointXY(c.x() + dx, c.y()))
+            r = math.hypot(p2.x() - p1.x(), p2.y() - p1.y())
+            if not math.isfinite(r) or r <= 0:
+                raise ValueError("marker radius is not finite")
         except Exception as e:
             core.log_warning(f"Marker size not available: {type(e).__name__}: {e}")
             return core.OFF_LINE_TOL
-        return max(size_mm / 2.0 * scale / 1000.0, 0.1)
+        return max(r, 0.1)
 
     def create_section(self):
         if not self._need_data():
@@ -1378,22 +1750,27 @@ class BoreholeDialog(QDialog):
             QMessageBox.warning(self, "No boreholes",
                                 "No borehole within the given distance of the line.")
             return
-        colors, opts, bedrock, strat = self._section_options()
-        pats = self.current_patterns()
+        _colors, opts, bedrock, strat = self._section_options()
         line = list(self.section_pts)
         tol = self.sp_dash.value() or self._marker_radius()
 
-        def build(faults, proj=proj, colors=colors, opts=opts, bedrock=bedrock, strat=strat,
-                  line=line, pats=pats, tol=tol):
+        poly_cache = {}                                  # correlation polygons of the edit steps
+
+        def build(faults, edits=None, proj=proj, opts=opts, bedrock=bedrock, strat=strat,
+                  line=line, tol=tol, poly_cache=poly_cache):
             core.take_geometry_issues()                  # forget the problems of older builds
-            sc = core.build_section_scene(proj, colors, *opts, faults, bedrock, True, pats,
-                                          off_tol=tol)
+            # colours and patterns of tab 2 are read again at every (re)generation
+            sc = core.build_section_scene(proj, self.current_colors(), *opts, faults, bedrock, True,
+                                          self.current_patterns(), off_tol=tol,
+                                          edits=edits, poly_cache=poly_cache)
             sc.geo["line"] = line
             self._report_geometry_issues()
             return sc
 
         try:
-            v = SectionViewer(build(None), self, proj, build, strat)
+            with _busy():                                # the correlation can take seconds
+                v = SectionViewer(build(None, _edits.SectionEdits() if len(proj) > 1 else None),
+                                  self, proj, build, strat)
         except Exception as e:
             QMessageBox.warning(self, "2D section", f"{type(e).__name__}: {e}")
             return
@@ -1413,6 +1790,17 @@ class BoreholeDialog(QDialog):
     def _track_viewer(self, v):
         """Keep a reference while the window is open; forget it when it is closed."""
         self.viewers.append(v)
+        # closed = deleted (with its scene and pattern bitmaps), not hidden and kept as a child
+        v.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+
+        def _drop_scene(_r=0, v=v):
+            # the CURRENT scene of the window: Regenerate replaces (and deletes) the first one
+            sc = getattr(v, "scene", None)
+            if sc is not None and hasattr(sc, "deleteLater"):
+                with contextlib.suppress(RuntimeError):      # already deleted
+                    sc.deleteLater()
+
+        v.finished.connect(_drop_scene)
         v.finished.connect(lambda _r=0, v=v: self.viewers.remove(v) if v in self.viewers else None)
 
     def _section_options(self):
@@ -1522,8 +1910,10 @@ class BoreholeDialog(QDialog):
         """Button 'Reopen 3D viewer': the models created in this session for the viewer chosen in
         'Open the created model in' (0 = plugin's viewer in the web browser, 1 = QGIS 3D Map View)."""
         web = self.cb_out.currentIndex() == 0
-        if not (self.scene3d if web else self.model_layers):
-            if self.model_layers or self.scene3d:       # a model exists, but for the other viewer
+        has_qgis_layers = any(QgsProject.instance().mapLayer(lid) is not None
+                              for ids in self.model_layers.values() for lid in ids)
+        if not (self.scene3d if web else has_qgis_layers):
+            if has_qgis_layers or self.scene3d:       # a model exists, but for the other viewer
                 msg = "Previous model was created for a different viewer; please generate the model again."
             else:
                 msg = "Create a fence model or a full model first."
@@ -1627,7 +2017,7 @@ class BoreholeDialog(QDialog):
         prov = lyr.dataProvider() if lyr.isValid() else None
         tr = None
         if prov is not None and lyr.crs().isValid():
-            tr = QgsCoordinateTransform(QgsCoordinateReferenceSystem(core.CRS_SJTSK), lyr.crs(),
+            tr = QgsCoordinateTransform(core.work_crs(), lyr.crs(),
                                         QgsProject.instance().transformContext())
         if prov is None or tr is None or not tr.isValid():
             QMessageBox.warning(self, "DEM", f"The raster layer \"{lyr.name()}\" is not usable "
@@ -1635,12 +2025,25 @@ class BoreholeDialog(QDialog):
                                 "the model is built without the DEM.")
             return None
 
+        warned = []
+
         def f(x, y):
             try:
                 v, ok = prov.sample(tr.transform(QgsPointXY(x, y)), 1)
                 return float(v) if (ok and math.isfinite(v)) else None   # NoData may be NaN
-            except Exception:
+            except (QgsCsException, ValueError, RuntimeError) as e:
+                if not warned:
+                    warned.append(1)
+                    core.log_warning(f"DEM: a point could not be sampled ({type(e).__name__}: {e})")
                 return None
+        # does the raster cover the boreholes at all? (another region / only NoData: the model
+        # would silently follow the straight line between the collars)
+        collars = [(b.x, b.y) for b in self.boreholes]
+        if collars and all(f(x, y) is None for x, y in collars):
+            QMessageBox.warning(self, "DEM", f"The raster layer \"{lyr.name()}\" gives no elevation at "
+                                "any borehole (it lies in another area, or has only NoData there) - "
+                                "the model is built without the DEM.")
+            return None
         return f
 
     def build_network(self):
@@ -1695,7 +2098,8 @@ class BoreholeDialog(QDialog):
     # ---- closing / reopening the dialog: the red section line must not stay on the map
     def _leave_map(self):
         if self.canvas.mapTool() is self.tool:
-            self.canvas.unsetMapTool(self.tool)
+            self.tool._finished = True     # a deliberate leave: deactivate() must not emit aborted
+            self.canvas.unsetMapTool(self.tool)    # (it would show the dialog being closed again)
         self._drop_line_rb()
 
     def reject(self):                      # Esc
@@ -1714,18 +2118,33 @@ class BoreholeDialog(QDialog):
             self.line_rb.setColor(QColor(220, 0, 0))
             self.line_rb.setWidth(2)
             self.line_rb.setToGeometry(QgsGeometry.fromPolylineXY(list(self.section_pts)),
-                                       QgsCoordinateReferenceSystem(core.CRS_SJTSK))
+                                       core.work_crs())
+
+    def _project_cleared(self):
+        """A new / closed project: the borehole layer and the line on the canvas are gone."""
+        with contextlib.suppress(RuntimeError):
+            self._drop_line_rb()
+        self.bh_layer_id = None
+
+    def _layer_will_be_removed(self, layer_id):
+        if layer_id == self.bh_layer_id:
+            self.bh_layer_id = None
 
     def cleanup(self):
+        with contextlib.suppress(TypeError, RuntimeError):      # already disconnected / deleted
+            QgsProject.instance().cleared.disconnect(self._project_cleared)
+            QgsProject.instance().layerWillBeRemoved.disconnect(self._layer_will_be_removed)
         with contextlib.suppress(TypeError, RuntimeError):      # already disconnected / deleted
             self.tool.aborted.disconnect(self.show)
         for v in list(self.viewers):
             v.close()
         self.viewers.clear()
         viewer3d_window.cleanup_files()             # files given to a web browser a while ago
+        viewer3d_window.stop_timers()               # no deletion timer stays in the Qt event loop
         with contextlib.suppress(RuntimeError):       # the canvas may already be deleted when QGIS is closing
             self._drop_line_rb()
             if self.canvas is not None:
+                self.tool._finished = True
                 self.canvas.unsetMapTool(self.tool)
                 sc = self.canvas.scene()
                 if sc is not None:

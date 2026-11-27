@@ -65,9 +65,19 @@ def approx_measure(s, size=9.0, bold=False):
 
 
 def wrap_text(s, width, measure, size=9.0):
-    """Break the text into lines no wider than `width` (words are never split)."""
+    """Break the text into lines no wider than `width`; a word wider than that (a long code
+    without spaces) is split."""
     lines, cur = [], ""
     for word in str(s).split():
+        while measure(word, size) > width and len(word) > 1:
+            k = len(word) - 1
+            while k > 1 and measure(word[:k], size) > width:
+                k -= 1
+            if cur:
+                lines.append(cur)
+                cur = ""
+            lines.append(word[:k])
+            word = word[k:]
         trial = word if not cur else cur + " " + word
         if cur and measure(trial, size) > width:
             lines.append(cur)
@@ -97,7 +107,7 @@ def _nice_steps(px_per_m, min_px=38.0):
 
 
 def _fmt(v, step):
-    dec = 0 if step >= 1 else (1 if step >= 0.1 else 2)
+    dec = 0 if step >= 1 else (1 if step >= 0.1 else (2 if step >= 0.01 else 3))
     return f"{v:.{dec}f}"
 
 
@@ -105,7 +115,7 @@ def _ruler(cmds, x, y_of, v0, v1, px_per_m, label_fn=None):
     """Vertical ruler at x for values v0..v1 (y_of maps a value to y); returns nothing."""
     major, minor = _nice_steps(px_per_m)
     first = math.ceil(v0 / minor - 1e-9)
-    last = math.floor(v1 / minor + 1e-9)
+    last = min(math.floor(v1 / minor + 1e-9), first + 5000)     # an absurd scale must not loop for ever
     cmds.append(_line(x, y_of(v0), x, y_of(v1)))
     for i in range(first, last + 1):
         v = i * minor
@@ -127,8 +137,8 @@ def _extent(bhs, mode):
     """(value of the top, value of the bottom) covering all boreholes."""
     if mode == "alt":
         return (max(b.z for b in bhs),
-                min(b.z_at(max([L.bottom for L in b.layers] or [b.depth])) for b in bhs))
-    return 0.0, max(max([L.bottom for L in b.layers] or [b.depth]) for b in bhs)
+                min(b.z_at(max([L.bottom for L in b.layers] + [b.depth])) for b in bhs))
+    return 0.0, max(max([L.bottom for L in b.layers] + [b.depth]) for b in bhs)
 
 
 # ------------------------------------------------------------- 1) profiles
@@ -154,15 +164,16 @@ def _layout_labels(items, line_h):
     return boxes
 
 
-# colours of the geological periods (ICS), same order as core.STRAT_NAMES
-STRAT_COLORS = ["#F9F97F", "#FFE619", "#FD9A52", "#7FC64E", "#34B2C9", "#812B92", "#F04028",
-                "#67A599", "#CB8C37", "#B3E1B6", "#009270", "#7FA056", "#F74370"]
+# colours of the geological periods (ICS): the table STRATIGRAPHY in core.py
+STRAT_COLORS = core.STRAT_COLORS
 STRAT_W = 66.0
 
 
 def strat_color(age):
     """Colour of a period; a span of several periods gets the mean of its two ends."""
-    a, b = STRAT_COLORS[age[0]], STRAT_COLORS[age[1]]
+    def col(i):                       # an unknown period (damaged input) is plain grey, not a crash
+        return STRAT_COLORS[i] if isinstance(i, int) and 0 <= i < len(STRAT_COLORS) else "#cccccc"
+    a, b = col(age[0]), col(age[1])
     mix = [(int(a[i:i + 2], 16) + int(b[i:i + 2], 16)) // 2 for i in (1, 3, 5)]
     return "#%02x%02x%02x" % tuple(mix)
 
@@ -215,7 +226,7 @@ def build_profiles(bhs, colors, patterns, mode="depth", px_per_m=0.0, measure=ap
         # three header lines with 20 px between them (name 15 pt, the others 8 pt)
         cmds.append(_text(bh.name, x0 + COL_W / 2, TOP - 62, 15, "c", bold=True))
         if bh.dip > 0:
-            cmds.append(_text(f"az {bh.azimuth:g}°, dip {bh.dip:g}°",
+            cmds.append(_text(f"az {bh.azimuth:g}°, incl {bh.dip:g}°",
                               x0 + COL_W / 2, TOP - 40, 8, "c"))
         cmds.append(_text("Lithology", x0 + COL_W / 2, TOP - 20, 8, "c"))
         # ground marker
@@ -228,7 +239,8 @@ def build_profiles(bhs, colors, patterns, mode="depth", px_per_m=0.0, measure=ap
             y1, y2 = y_of(a), y_of(b)
             cmds.append(_rect(x0, y1, COL_W, y2 - y1, colors.get(L.litho, "#cccccc"), "#303030", 0.6))
             if show_pattern and patterns.get(L.litho):
-                cmds.append(_rect(x0, y1, COL_W, y2 - y1, None, "#303030", 0.0, patterns[L.litho]))
+                cmds.append(_rect(x0, y1, COL_W, y2 - y1, colors.get(L.litho, "#cccccc"), "#303030", 0.0,
+                                  patterns[L.litho]))     # (fill: only for the colour of the lines)
             items.append((y1, y2, wrap_text(L.desc or L.litho, LABEL_W - 2 * slant - 8, measure, 10)))
         # descriptions: separating lines; a label that does not fit into a thin layer
         # hangs below it as a trapezoid (narrower at the bottom)
@@ -243,6 +255,11 @@ def build_profiles(bhs, colors, patterns, mode="depth", px_per_m=0.0, measure=ap
             cy = (b0 + b1) / 2 - len(lines) * line_h / 2
             for i, s in enumerate(lines):
                 cmds.append(_text(s, (lx0 + lx1) / 2, cy + i * line_h - 1, 10, "c"))
+        if layers and bh.depth > max(L.bottom for L in layers) + 1e-6:      # part without a description
+            last = max(L.bottom for L in layers)
+            a = last if mode == "depth" else bh.z_at(last)
+            b = bh.depth if mode == "depth" else bh.z_at(bh.depth)
+            cmds.append(_rect(x0, y_of(a), COL_W, y_of(b) - y_of(a), "#ffffff", "#000000", 0.6))
         # stratigraphy column
         if sw:
             cmds.append(_text("Stratigraphy", sx + sw / 2, TOP - 20, 8, "c"))
@@ -289,7 +306,7 @@ def build_records(bhs, colors, grains, patterns=None, px_per_m=0.0, measure=appr
     # width of the widest ruler label: the ruler of the next borehole must not run into the
     # previous column (altitudes such as -1250.5 m), and the first one needs room on the left
     lo_v, hi_v = (v_top, v_bot) if mode == "depth" else (v_bot, v_top)
-    lab_w = max(measure(f"{v:g}", 9.0) for v in (lo_v, hi_v, (lo_v + hi_v) / 2.0))
+    lab_w = max(measure(_fmt(v, _nice_steps(k)[0]), 9.0) for v in (lo_v, hi_v, (lo_v + hi_v) / 2.0))
     ruler_room = lab_w + 30.0                     # tick + gap + label
     x0 = max(100.0, ruler_room + 12.0)
     pitch = gw + max(100.0, ruler_room + 40.0)
@@ -298,14 +315,13 @@ def build_records(bhs, colors, grains, patterns=None, px_per_m=0.0, measure=appr
     for n, bh in enumerate(bhs):
         layers = _clean(bh)
         lo, hi = (v_top, v_bot) if mode == "depth" else (v_bot, v_top)
-        _ruler(cmds, x0 - 6, y_of, lo, hi, k,
-               lambda v: f"{v:g}")
+        _ruler(cmds, x0 - 6, y_of, lo, hi, k)      # same labels as the width lab_w was measured with
         if n == 0:
             cmds.append(_text("Depth [m]" if mode == "depth" else "Altitude [m a.s.l.]",
-                              x0 - 60, REC_TOP - HEAD_H - 40, 9, "l", bold=True))
+                              x0 - 60, REC_TOP - HEAD_H - 12, 9, "l", bold=True))   # not under the name
         cmds.append(_text(bh.name, x0 + gw / 2, REC_TOP - HEAD_H - 46, 14, "c", bold=True))
         if bh.dip > 0:                  # inclined hole: the depths are measured along the hole
-            cmds.append(_text(f"az {bh.azimuth:g}°, dip {bh.dip:g}°",
+            cmds.append(_text(f"az {bh.azimuth:g}°, incl {bh.dip:g}°",
                               x0 + gw / 2, REC_TOP - HEAD_H - 24, 8, "c"))
         # header: four grain-size cells with vertical captions
         for i, g in enumerate(GRAINS):
@@ -320,13 +336,19 @@ def build_records(bhs, colors, grains, patterns=None, px_per_m=0.0, measure=appr
             a = L.top if mode == "depth" else bh.z_at(L.top)
             b = L.bottom if mode == "depth" else bh.z_at(L.bottom)
             gr = grains.get(L.litho, DEFAULT_GRAIN)
-            w = CELL * (GRAINS.index(gr) + 1)
+            w = CELL * ((GRAINS.index(gr) if gr in GRAINS else GRAINS.index(DEFAULT_GRAIN)) + 1)
             y1, y2 = y_of(a), y_of(b)
             cmds.append(_rect(x0, y1, w, y2 - y1, colors.get(L.litho, "#cccccc"), "#000000", 0.9))
             if patterns.get(L.litho):
-                cmds.append(_rect(x0, y1, w, y2 - y1, None, "#000000", 0.0, patterns[L.litho]))
+                cmds.append(_rect(x0, y1, w, y2 - y1, colors.get(L.litho, "#cccccc"), "#000000", 0.0,
+                                  patterns[L.litho]))
             if (L.litho, L.desc or L.litho) not in used:
                 used.append((L.litho, L.desc or L.litho))
+        if layers and bh.depth > max(L.bottom for L in layers) + 1e-6:      # part without a description
+            last = max(L.bottom for L in layers)
+            a = last if mode == "depth" else bh.z_at(last)
+            b = bh.depth if mode == "depth" else bh.z_at(bh.depth)
+            cmds.append(_rect(x0, y_of(a), gw, y_of(b) - y_of(a), "#ffffff", "#000000", 0.9))
         if letters:
             cmds.append(_text(string.ascii_lowercase[n % 26], x0 + gw / 2, bottom_px + 12, 14,
                               "c", bold=True))
@@ -344,7 +366,7 @@ def build_records(bhs, colors, grains, patterns=None, px_per_m=0.0, measure=appr
             lines = wrap_text(f"{text}  ({GRAIN_LABELS[gr].lower()})", LEGEND_TEXT_W, measure, 10)
             cmds.append(_rect(lx, y, 40, 18, colors.get(lit, "#cccccc"), "#000000", 0.9))
             if patterns.get(lit):
-                cmds.append(_rect(lx, y, 40, 18, None, "#000000", 0.0, patterns[lit]))
+                cmds.append(_rect(lx, y, 40, 18, colors.get(lit, "#cccccc"), "#000000", 0.0, patterns[lit]))
             for n_l, ln in enumerate(lines):
                 cmds.append(_text(ln, lx + 50, y + 1 + n_l * 13.0, 10, "l"))
             y += max(26.0, 13.0 * len(lines) + 10.0)
@@ -372,7 +394,7 @@ def to_scene(cmds, pattern_scale=0.45):
                 if pattern == "ground":
                     b = QBrush(QColor(0, 0, 0), Qt.BrushStyle.BDiagPattern)
                 else:
-                    b = pat.pattern_brush(pattern, pattern_scale)
+                    b = pat.pattern_brush(pattern, pattern_scale, fill)    # fill = the layer colour
                 if b is None:
                     continue
                 it = scene.addPolygon(poly, p, b)

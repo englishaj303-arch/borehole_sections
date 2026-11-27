@@ -7,6 +7,8 @@ CC0; 718 comes from the FGDC PDF) - see LICENSE.  This module gives the names, a
 pattern for a lithology and the Qt brush made from a tile.
 """
 import os
+import re
+import unicodedata
 
 PATTERN_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patterns")
 
@@ -65,6 +67,13 @@ NAMES = {
     "727": "Igneous rock (7th option)", "728": "Igneous rock (8th option)",
     "729": "Porphyritic rock (1st option)", "730": "Porphyritic rock (2nd option)",
     "731": "Vitrophyre", "732": "Quartz", "733": "Ore",
+    # not in the FGDC standard - drawn for this plugin (make_soil_dirt_tiles.py, kept outside the package)
+    "901": "Soil / humus (organic squiggles, plant ticks)",
+    "902": "Dirt / surface layer (dashes, dots, arcs, grass ticks)",
+    # supplied with the plugin by its author (not FGDC)
+    "903": "Fill / made ground", "904": "Rubble / scree", "905": "Organic clay",
+    "906": "Weathered rock (fissures)", "907": "Eluvium (weathering mantle)",
+    "908": "Colluvium / deluvium (slope deposits)", "909": "Alluvium (river deposits)",
 }
 
 # keyword (lower case, without diacritics) -> pattern.  The keyword standing FIRST in the
@@ -72,34 +81,60 @@ NAMES = {
 _KEYWORDS = [
     ("601", ("sterk", "gravel", "valoun", "slepenec", "conglomerate", "pebble", "cobble")),
     ("605", ("brekcie", "breccia")),
-    ("607", ("pisek", "pisk", "sand", "arkoz")),
+    ("607", ("pisek", "pisk", "pisc", "sand", "arkoz", "arkos")),
+    ("903", ("navaz", "^fill")),
+    ("904", ("rubble", "^sut", "scree")),
+    ("905", ("organic", "organick")),
+    ("906", ("weathered", "zvetral")),
+    ("907", ("eluvium",)),
+    ("908", ("colluvium", "koluvium", "deluvium", "svahovin")),
+    ("909", ("alluvium", "aluvium", "naplav")),
+    ("901", ("humus", "topsoil", "soil", "ornice")),
+    ("902", ("^dirt",)),
     ("616", ("prach", "silt", "hlin", "loam")),
     ("684", ("spras", "loess")),
-    ("620", ("jil", "clay", "bridlic", "shale", "lupek", "mud", "kaolin")),
-    ("623", ("slin", "marl")),
-    ("626", ("kreda", "chalk")),
+    ("620", ("jil", "clay", "shale", "lupek", "mud", "kaolin")),
+    ("703", ("slate", "bridlic")),
+    ("681", ("^till", "morena", "souvkov")),
+    ("623", ("slin", "marl", "sinter", "sintr", "travertin")),
+    ("626", ("krida", "kreda", "chalk")),
     ("627", ("vapenec", "limestone")),
     ("642", ("dolomit", "dolostone")),
-    ("657", ("raselin", "peat")),
-    ("658", ("uhli", "coal")),
+    ("657", ("raselin", "^peat")),
+    ("658", ("uhli", "^coal")),
     ("667", ("sadrovec", "gypsum")),
-    ("702", ("kremenec", "quartzite")),
+    ("702", ("kremenec", "kvarcit", "quartzite")),
     ("708", ("rula", "gneis")),
     ("705", ("svor", "schist")),
-    ("718", ("zula", "granit")),
-    ("717", ("bazalt", "basalt")),
-    ("711", ("tuf",)),
+    ("718", ("zula", "granit", "skal", "rock")),
+    ("717", ("bazalt", "basalt", "cedic")),
+    ("711", ("^tuf",)),
 ]
+
+
+def norm_text(s):
+    """Text without diacritics, lower case (core._norm uses it too: patterns.py imports nothing
+    of the plugin, so there is no circular import)."""
+    s = unicodedata.normalize("NFKD", str(s)).encode("ascii", "ignore").decode()
+    return s.strip().lower()
+
+
+def find_key(n, key):
+    """Position of a keyword in the normalised name, -1 when absent.  A key that starts with ^
+    must be the beginning of a word (^sut = suť, not "sutr" inside another word)."""
+    if key.startswith("^"):
+        m = re.search(r"\b" + re.escape(key[1:]), n)
+        return m.start() if m else -1
+    return n.find(key)
 
 
 def default_pattern(litho):
     """Pattern code guessed from the name of a lithology; '' when nothing fits (plain colour)."""
-    from . import core        # local import: core imports this module at load time (circular)
-    n = core._norm(litho)
+    n = norm_text(litho)
     best = None
     for code, keys in _KEYWORDS:
         for k in keys:
-            pos = n.find(k)
+            pos = find_key(n, k)
             if pos >= 0 and (best is None or pos < best[0]):
                 best = (pos, code)
     return best[1] if best else ""
@@ -118,15 +153,19 @@ def tile_path(code):
 
 
 _cache = {}
+_CACHE_MAX = 96              # tile pixmaps kept (they are large)
 OVERSAMPLE = 2.0       # tiles are kept 2x larger than shown, so the pattern stays sharp when zoomed
 
 
-def tile_pixmap(code, scale=0.45, oversample=OVERSAMPLE):
+def tile_pixmap(code, scale=0.45, oversample=OVERSAMPLE, light=False):
     """QPixmap of a tile.  scale 1 = the tile shown in 300 dpi (the PNG files have 1200 dpi),
-    `oversample` makes the pixmap larger by that factor.  None for an unknown code."""
+    `oversample` makes the pixmap larger by that factor.  None for an unknown code.
+    light=False: black lines; light=True: pale cream lines (for dark fills, see line_is_light).
+    All the files are black lines on a transparent background; the light variant is made from
+    the same file (only its transparency is used)."""
     if code not in NAMES:
         return None
-    key = (code, round(scale, 3), oversample)
+    key = (code, round(scale, 3), oversample, bool(light))
     if key not in _cache:
         from qgis.PyQt.QtCore import Qt
         from qgis.PyQt.QtGui import QPixmap
@@ -138,7 +177,14 @@ def tile_pixmap(code, scale=0.45, oversample=OVERSAMPLE):
             w, h = max(8, round(pm.width() * k)), max(8, round(pm.height() * k))
             small = pm.scaled(w, h, Qt.AspectRatioMode.IgnoreAspectRatio,
                               Qt.TransformationMode.SmoothTransformation)
-            _cache[key] = _boost_lines(small)
+            if len(_cache) >= _CACHE_MAX:                 # a zoom slider makes many scales
+                _cache.pop(next(iter(_cache)))
+            boosted = _boost_lines(small)
+            if light:                                    # the files are black: only this one is made
+                boosted = _recolor(boosted, LIGHT_LINE)
+            _cache[key] = boosted
+    else:
+        _cache[key] = _cache.pop(key)       # least recently used goes first, not the oldest made
     return _cache[key]
 
 
@@ -151,20 +197,26 @@ def _boost_lines(pm):
     raises the alpha of the pale pixels by 60 % (black stays black, full alpha stays full)."""
     from qgis.PyQt.QtGui import QPainter, QPixmap
     out = QPixmap(pm)
+    # (QPixmap: GUI thread only - the tiles are used by the dialogs and the scene builders)
+    # Plus adds the alpha; the tiles are black, so the colour stays black (the light variant is
+    # made from the result afterwards, see tile_pixmap)
     p = QPainter(out)
-    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
-    p.setOpacity(LINE_BOOST)
-    p.drawPixmap(0, 0, pm)
-    p.end()
+    try:
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Plus)
+        p.setOpacity(LINE_BOOST)
+        p.drawPixmap(0, 0, pm)
+    finally:
+        p.end()                       # the painter is always ended
     return out
 
 
-def pattern_brush(code, scale=0.45):
-    """Texture brush (black pattern on a transparent background) or None.
+def pattern_brush(code, scale=0.45, color=None):
+    """Texture brush (lines on a transparent background) or None.  `color` is the colour of the
+    fill the pattern is drawn on: a dark one gets light lines, any other black ones.
 
     The texture is OVERSAMPLE times larger than shown; the brush transform shrinks it
     (the views and exports use SmoothPixmapTransform)."""
-    pm = tile_pixmap(code, scale)
+    pm = tile_pixmap(code, scale, light=line_is_light(color))
     if pm is None:
         return None
     from qgis.PyQt.QtGui import QBrush, QTransform
@@ -199,6 +251,8 @@ def _make_icon(code, size):
     out = QPixmap(size[0], size[1])
     out.fill(Qt.GlobalColor.white)
     p = QPainter(out)
-    p.drawTiledPixmap(0, 0, size[0], size[1], pm)
-    p.end()
+    try:
+        p.drawTiledPixmap(0, 0, size[0], size[1], pm)
+    finally:
+        p.end()
     return QIcon(out)
