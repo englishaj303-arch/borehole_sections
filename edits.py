@@ -161,7 +161,9 @@ class SectionEdits:
         for it in items("forced"):
             if not isinstance(it, (list, tuple)) or len(it) != 3:
                 raise ValueError("invalid forced link")
-            ed.forced[(key(it[0]), key(it[1]))] = "manual" if it[2] == "manual" else "locked"
+            if it[2] not in ("manual", "locked"):          # a typo must not silently become "locked"
+                raise ValueError("invalid state of a forced link")
+            ed.forced[(key(it[0]), key(it[1]))] = it[2]
         for it in items("forbidden"):
             if not isinstance(it, (list, tuple)) or len(it) != 2:
                 raise ValueError("invalid removed link")
@@ -184,6 +186,9 @@ class SectionEdits:
             if abs(lens["d2"] - lens["d1"]) < 1e-6:
                 raise ValueError("a lens needs two different tips")
             lens["litho"] = text(ln.get("litho"), "litho", True)
+            if lens["d1"] > lens["d2"]:                    # the first tip is the left one (as the editor makes them)
+                lens["d1"], lens["d2"] = lens["d2"], lens["d1"]
+                lens["z1"], lens["z2"] = lens["z2"], lens["z1"]
             ed.lenses.append(lens)
         ed.forbidden -= set(ed.forced)           # a link cannot be both kept and removed
         return ed
@@ -318,6 +323,8 @@ def apply_shift(polys, ct, dy):
     linearly, so the neighbouring contacts stay where they were, nothing overlaps and no gap
     opens.  Edges are first split on the grid of the contact, so the warp follows it."""
     xs, us, cs, ls = ct["xs"], ct["u"], ct["c"], ct["l"]
+    if len(xs) < 2:                                    # find_contact never gives less; a direct call might
+        return list(polys)
     x0, x1, pk = xs[0], xs[-1], ct["pk"]
     ymin, ymax = min(us), max(ls)
 

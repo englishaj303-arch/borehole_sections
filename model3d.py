@@ -937,7 +937,7 @@ def _fill_smooth(bhs, edge_of, dz=2.0, cell=0.0, maxlen=0.0, dem=None, max_solid
     n = max(1, int(math.ceil(longest / cell)))
     if len(tris) * n * n > MAX_SMOOTH_CELLS:       # before any loop: a tiny cell would freeze QGIS
         raise ValueError(f"The mesh would have about {len(tris) * n * n:,} cells - increase the "
-                         "mesh size (the limit is {:,}).".format(MAX_SMOOTH_CELLS))
+                         f"mesh size (the limit is {MAX_SMOOTH_CELLS:,}).")
     cache = {}              # node position -> (x, y, {lithology: [(top, bottom), ...]}, g, zbot)
     out = []
 

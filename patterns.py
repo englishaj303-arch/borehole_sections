@@ -191,6 +191,63 @@ def tile_pixmap(code, scale=0.45, oversample=OVERSAMPLE, light=False):
 LINE_BOOST = 0.6        # extra opacity added to the thin 1-2 px lines of the 1200 dpi tiles
 
 
+LIGHT_LINE = (246, 240, 220)     # pale cream: almost white (best contrast on dark fills), warmer than
+                                 # pure white
+LIGHT_BELOW = 0.12               # fills with a relative luminance below this get the light lines
+                                 # (black lines on it would have a contrast of less than 3.4 : 1)
+
+
+def _rgb(color):
+    """(r, g, b) 0-255 of '#rrggbb' text, a QColor or an (r, g, b) tuple; None when unknown."""
+    try:
+        if color is None:
+            return None
+        if isinstance(color, str):
+            c = color.strip().lstrip("#")
+            if len(c) in (6, 8):
+                return int(c[0:2], 16), int(c[2:4], 16), int(c[4:6], 16)
+            return None
+        if hasattr(color, "red"):
+            return color.red(), color.green(), color.blue()
+        r, g, b = color[:3]
+        return int(r), int(g), int(b)
+    except (ValueError, TypeError, IndexError):
+        return None
+
+
+def relative_luminance(rgb):
+    """WCAG relative luminance 0 (black) .. 1 (white) of an (r, g, b) tuple, 0-255."""
+    def lin(v):
+        v = v / 255.0
+        return v / 12.92 if v <= 0.04045 else ((v + 0.055) / 1.055) ** 2.4
+    r, g, b = rgb
+    return 0.2126 * lin(r) + 0.7152 * lin(g) + 0.0722 * lin(b)
+
+
+def line_is_light(color):
+    """True when the pattern lines on a fill of this colour should be light, not black (a dark
+    fill).  Unknown / missing colour: black, the colour of the FGDC patterns.  The same rule is in
+    viewer3d.html (function lightLines) - change both together."""
+    rgb = _rgb(color)
+    return rgb is not None and relative_luminance(rgb) < LIGHT_BELOW
+
+
+def _recolor(pm, rgb):
+    """The pixmap with the colour `rgb` and its own transparency (the shape of the lines is kept)."""
+    from qgis.PyQt.QtCore import Qt
+    from qgis.PyQt.QtGui import QColor, QPainter, QPixmap
+    out = QPixmap(pm.size())
+    out.fill(Qt.GlobalColor.transparent)
+    p = QPainter(out)
+    try:
+        p.drawPixmap(0, 0, pm)
+        p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceIn)
+        p.fillRect(out.rect(), QColor(*rgb))
+    finally:
+        p.end()
+    return out
+
+
 def _boost_lines(pm):
     """The 1-2 px lines of the tiles are averaged with the transparent background when the tile
     is reduced 4x or more and fade away; adding the pixmap to itself (opacity LINE_BOOST)

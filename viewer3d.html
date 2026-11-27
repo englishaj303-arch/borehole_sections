@@ -432,7 +432,7 @@ let texArr = gl.createTexture();
   const T = S.tex || [], N = 256;
   gl.bindTexture(gl.TEXTURE_2D_ARRAY, texArr);
   gl.texStorage3D(gl.TEXTURE_2D_ARRAY, T.length ? 9 : 1, gl.RGBA8, T.length ? N : 1, T.length ? N : 1, Math.max(T.length, 1));
-  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MIN_FILTER, T.length ? gl.LINEAR_MIPMAP_LINEAR : gl.LINEAR);   // no tiles: one level only
   gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_S, gl.REPEAT);
   gl.texParameteri(gl.TEXTURE_2D_ARRAY, gl.TEXTURE_WRAP_T, gl.REPEAT);
@@ -1141,7 +1141,7 @@ function addFault(src) {
   faults.push(f); fSel = f.id; rebuildFaultGl(); refreshList(); toForm();
 }
 $('fadd').onclick = () => addFault();
-$('fdup').onclick = () => { const f = curFault(); if (f) { const c = Object.assign({}, f); c.name = f.name + ' (copy)'; c.pos = Math.min(100, f.pos + 5); if (f.mode === 'xy') { const st = Math.max(1, Math.round(0.03 * Math.max(bmax[0] - bmin[0], bmax[1] - bmin[1]))); c.x = f.x + st; c.y = f.y + st; } addFault(c); } };
+$('fdup').onclick = () => { const f = curFault(); if (f) { const c = Object.assign({}, f); c.name = f.name + ' (copy)'; c.pos = Math.min(100, f.pos + 5); if (f.mode === 'xy') { const off = Math.max(1, Math.round(0.03 * Math.max(bmax[0] - bmin[0], bmax[1] - bmin[1]))); c.x = f.x + off; c.y = f.y + off; } addFault(c); } };
 $('fdel').onclick = () => {
   const i = faults.findIndex(f => f.id === fSel); if (i < 0) return;
   faults.splice(i, 1); fSel = faults.length ? faults[Math.min(i, faults.length - 1)].id : null;
