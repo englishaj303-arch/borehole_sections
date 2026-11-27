@@ -296,12 +296,12 @@ def shift_limits(ct):
     """(largest move up, largest move down) in scene units that keeps both layers thick."""
     up = down = math.inf
     x0, x1, pk = ct["xs"][0], ct["xs"][-1], ct["pk"]
-    for x, u, c, l in zip(ct["xs"], ct["u"], ct["c"], ct["l"]):
+    for x, u, c, low in zip(ct["xs"], ct["u"], ct["c"], ct["l"]):
         w = bump(x, x0, pk, x1)
         if w < 0.02:
             continue
         up = min(up, (c - u) / w)
-        down = min(down, (l - c) / w)
+        down = min(down, (low - c) / w)
     if not math.isfinite(up):
         up = 0.0
     if not math.isfinite(down):
@@ -358,13 +358,13 @@ def apply_shift(polys, ct, dy):
         for x, y, orig in dense:
             ny = y
             if x0 < x < x1:
-                u, c, l = at(x)
-                if u < y < l:
+                u, c, low = at(x)
+                if u < y < low:
                     if y <= c:
                         f = (y - u) / (c - u) if c - u > 1e-9 else 0.0
                     else:
-                        f = (l - y) / (l - c) if l - c > 1e-9 else 0.0
-                    ny = min(max(y + dy * bump(x, x0, pk, x1) * f, u), l)   # never past a neighbour
+                        f = (low - y) / (low - c) if low - c > 1e-9 else 0.0
+                    ny = min(max(y + dy * bump(x, x0, pk, x1) * f, u), low)   # never past a neighbour
                     moved = moved or ny != y
             new.append((x, ny, orig))
         if moved:
