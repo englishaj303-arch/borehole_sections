@@ -16,8 +16,8 @@ from qgis.PyQt.QtCore import Qt, QPointF
 from qgis.PyQt.QtGui import QColor, QBrush, QPen, QPolygonF, QFont, QPainterPath
 from qgis.PyQt.QtWidgets import QGraphicsScene
 from qgis.core import (
-    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject, QgsFeature, QgsGeometry, QgsPoint, QgsPointXY, QgsVectorLayer,
-    QgsMessageLog, Qgis,
+    QgsCoordinateReferenceSystem, QgsCoordinateTransform, QgsProject, QgsFeature, QgsGeometry,
+    QgsPoint, QgsPointXY, QgsVectorLayer, QgsMessageLog, Qgis,
 )
 
 from . import edits as _edits
@@ -374,7 +374,7 @@ def read_table(path, delimiter=None, max_rows=None, max_bytes=MAX_TABLE_BYTES):
     try:
         fh = open(path, "rb")                 # open first, then check the descriptor (no TOCTOU)
     except OSError as e:
-        raise ValueError(f"Cannot read the file ({e.strerror or e}): {path}")
+        raise ValueError(f"Cannot read the file ({e.strerror or e}): {path}") from e
     with fh:
         st = os.fstat(fh.fileno())
         if not stat.S_ISREG(st.st_mode):      # FIFO, device ...: size 0, read() could block forever
@@ -444,7 +444,7 @@ def read_table(path, delimiter=None, max_rows=None, max_bytes=MAX_TABLE_BYTES):
                 raise ValueError(f"More than {MAX_TABLE_ROWS:,} rows - too large for the plugin: "
                                  f"{path}")
     except csv.Error as e:
-        raise ValueError(f"Not a valid CSV table ({e}): {path}")
+        raise ValueError(f"Not a valid CSV table ({e}): {path}") from e
     finally:
         text = None
     if not rows:
@@ -883,7 +883,7 @@ def build_boreholes(h1, r1, m1, h2, r2, m2, crs_key="sjtsk", utm_zone=None, utm_
                                         f"older ({age_label(prev_aged.age)}) at {L.top} m - "
                                         "fault or data error?")
                     prev_aged = L
-            for a, b in zip(bh.layers, bh.layers[1:]):
+            for _a, b in zip(bh.layers, bh.layers[1:]):
                 if b.top < running_bottom - 1e-6:
                     warnings.append(f"{bh.name}: overlapping layers at {b.top} m")
                 elif b.top > running_bottom + 1e-6:
@@ -2713,7 +2713,7 @@ def build_section_scene(proj, colors, vexag=0.0, correlate=True, labels=True,
             shapes.sort(key=lambda s_: -abs(_ring_area(s_[0][0])))
         else:
             shapes = [([pts], lit, age) for pts, lit, age in polys]
-        for rings, lit, age in shapes:
+        for rings, lit, _age in shapes:
             c = QColor(colors.get(lit, QColor(Qt.GlobalColor.gray)))
             c.setAlpha(170)
             shape = QPainterPath()                 # even-odd fill: the holes stay open

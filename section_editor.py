@@ -26,8 +26,9 @@ from qgis.PyQt.QtCore import Qt
 from qgis.PyQt.QtGui import QColor, QKeySequence, QPainterPath, QPen, QPolygonF, QShortcut
 from qgis.PyQt.QtCore import QPointF
 from qgis.PyQt.QtWidgets import (
-    QAbstractButton, QAbstractSpinBox, QApplication, QDialog, QDialogButtonBox, QGridLayout, QLineEdit, QSizePolicy, QButtonGroup, QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QGraphicsPathItem, QGraphicsView, QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPushButton, QToolButton,
+    QAbstractButton, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QDoubleSpinBox, QFileDialog, QFormLayout, QGraphicsPathItem, QGraphicsView, QGridLayout,
+    QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPushButton, QSizePolicy, QToolButton,
     QVBoxLayout,
 )
 

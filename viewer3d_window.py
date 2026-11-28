@@ -18,7 +18,7 @@ def pattern_tiles(codes, size=256):
     """FGDC pattern tiles for the viewer: {code: (PNG bytes of a size x size tile with the black
     pattern on a transparent background, aspect = width / height of the original tile)}."""
     from qgis.PyQt.QtCore import QBuffer, QByteArray, QIODevice
-    from qgis.PyQt.QtGui import QImage
+    from qgis.PyQt.QtGui import QImage, QPixmap
     from . import patterns
     out = {}
     for code in set(codes):
@@ -31,6 +31,9 @@ def pattern_tiles(codes, size=256):
         img = img.convertToFormat(QImage.Format.Format_ARGB32).scaled(
             size, size, Qt.AspectRatioMode.IgnoreAspectRatio,
             Qt.TransformationMode.SmoothTransformation)
+        # the thin lines of the 1200 dpi tiles get faint when shrunk (and again by the mipmaps of
+        # the viewer): the same extra opacity as in the 2D sections keeps them as visible
+        img = patterns._boost_lines(QPixmap.fromImage(img)).toImage()
         ba = QByteArray()
         buf = QBuffer(ba)
         buf.open(QIODevice.OpenModeFlag.WriteOnly)

@@ -591,7 +591,7 @@ def _neighbour_edges(bhs, mode="grid", maxlen=0.0):
             sector = int(((math.atan2(dy, dx) - theta + math.pi / 4) % (2 * math.pi)) // (math.pi / 2))
             if sector not in best or d < best[sector][0]:
                 best[sector] = (d, j)
-        for d, j in best.values():
+        for _d, j in best.values():
             edges.add((min(i, j), max(i, j)))
     return sorted(edges)
 

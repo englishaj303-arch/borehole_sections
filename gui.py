@@ -672,13 +672,16 @@ BH_FIELDS = [("name", "Borehole name", ["name", "borehole", "vrt", "nazev", "id"
              ("y", "Y", ["y"]),
              ("z", "Altitude Z", ["z", "alt", "altitude", "kota", "elev", "vyska"]),
              ("depth", "Total depth", ["depth", "hloub", "total", "delka"]),
-             ("azimuth", "Azimuth [deg] (optional)", ["azimuth", "azimut", "azim", "az", "smer", "direction", "bearing"]),
-             ("dip", "Dip / deviation [deg] (optional)", ["dip", "deviation", "inclination", "incl", "sklon", "odklon", "angle", "tilt"])]
+             ("azimuth", "Azimuth [deg] (optional)",
+              ["azimuth", "azimut", "azim", "az", "smer", "direction", "bearing"]),
+             ("dip", "Dip / deviation [deg] (optional)",
+              ["dip", "deviation", "inclination", "incl", "sklon", "odklon", "angle", "tilt"])]
 LY_FIELDS = [("name", "Borehole name", ["name", "borehole", "vrt", "nazev", "id", "sonda", "oznaceni"]),
              ("top", "Layer from [m]", ["from", "od", "top", "start", "begin", "zacatek", "pocatek"]),
              ("bottom", "Layer to [m]", ["to", "do", "bottom", "end", "konec"]),
              ("litho", "Lithology", ["litho", "lit", "type", "druh", "typ", "hornin", "zemin", "petro"]),
-             ("strat", "Stratigraphy (optional)", ["strat", "period", "perioda", "utvar", "vek", "age", "system", "geolog"])]
+             ("strat", "Stratigraphy (optional)",
+              ["strat", "period", "perioda", "utvar", "vek", "age", "system", "geolog"])]
 
 
 def _fit_to_screen(widget, width, height, max_width=0.9):
@@ -1107,7 +1110,8 @@ class BoreholeDialog(QDialog):
         note.setWordWrap(True)
         vf.addRow(note)
         bview = QPushButton("Reopen 3D viewer (models created in this session)")
-        bview.setToolTip("Opens again the models created in this session for the viewer chosen in 'Open the created model in'.")
+        bview.setToolTip("Opens again the models created in this session for the viewer chosen in "
+                         "'Open the created model in'.")
         bview.clicked.connect(self.open_viewer)
         vf.addRow(bview)
         lay.addWidget(vw)
@@ -1168,13 +1172,15 @@ class BoreholeDialog(QDialog):
         self.cb_fillmode = QComboBox()
         self.cb_fillmode.addItems(["Smooth layers (sloped solids)", "Blocks (columns of boxes, old method)"])
         self.cb_fillmode.setToolTip("Smooth layers: layer boundaries are interpolated surfaces, dipping layers stay\n"
-                                    "inclined and layers pinch out smoothly. Blocks: the method of versions up to 0.18.")
+                                    "inclined and layers pinch out smoothly. "
+                                    "Blocks: the method of versions up to 0.18.")
         fn.addRow("Interpolation", self.cb_fillmode)
         self.sp_fillcell = QDoubleSpinBox()
         self.sp_fillcell.setRange(0, 1000)
         self.sp_fillcell.setSpecialValueText("auto")
         self.sp_fillcell.setSuffix(" m")
-        self.sp_fillcell.setToolTip("Mesh size of the interpolated volume (auto = 1/8 of the median distance of boreholes).")
+        self.sp_fillcell.setToolTip("Mesh size of the interpolated volume "
+                                    "(auto = 1/8 of the median distance of boreholes).")
         fn.addRow("Mesh size of the interpolated volume", self.sp_fillcell)
         bnet = QPushButton("Create network fence model")
         bnet.clicked.connect(self.build_network)
@@ -1186,7 +1192,8 @@ class BoreholeDialog(QDialog):
         fa = QFormLayout(ga)
         self.cb_gmethod = QComboBox()
         self.cb_gmethod.addItems(["Smooth layers (sloped solids)", "Blocks (bricks on a square grid)"])
-        self.cb_gmethod.setToolTip("Smooth layers: the layer stack is interpolated at the nodes of a fine mesh and the \n"
+        self.cb_gmethod.setToolTip("Smooth layers: the layer stack is interpolated at the nodes of a fine mesh "
+                                   "and the \n"
                                    "layers are joined into smooth bodies - layer boundaries are exact surfaces and \n"
                                    "dipping layers stay inclined. Blocks: the older brick model.")
         fa.addRow("Method", self.cb_gmethod)

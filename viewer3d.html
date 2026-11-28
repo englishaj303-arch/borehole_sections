@@ -276,7 +276,7 @@ void main(){
 const FS = `#version 300 es
 precision highp float;
 in vec3 vWorld; in vec3 vPosV; in vec3 vWS;
-uniform mediump sampler2DArray uTex; uniform float uTexLayer; uniform float uTexScale; uniform float uTexAsp; uniform vec3 uTexLine;
+uniform mediump sampler2DArray uTex; uniform float uTexLayer; uniform float uTexScale; uniform float uTexAsp; uniform float uTexZ; uniform vec3 uTexLine;
 uniform vec3 uColor; uniform float uAlpha; uniform int uMode; uniform vec2 uId;
 uniform int uClipAxis; uniform float uClipPos; uniform float uClipSign;
 layout(location=0) out vec4 o0;
@@ -320,7 +320,10 @@ void main(){
     vec2 uv = plan ? vWorld.xy : vec2(dot(vWorld.xy, t), vWorld.z);
     // explicit derivatives of the chosen mapping: no jump of uv between the neighbouring pixels of a
     // top / wall edge can select the coarsest mip level (dark line along the edge)
-    vec2 sc = uTexScale * vec2(uTexAsp, 1.0);
+    // size of one tile in metres: square on the plan; on a wall the vertical side is 1 / (vertical
+    // scale) of the horizontal one, so the pattern looks undistorted (square on the screen) at any
+    // vertical scale - as in the 2D sections
+    vec2 sc = uTexScale * vec2(uTexAsp, plan ? 1.0 : uTexZ);
     vec2 gx = (plan ? dWx.xy : vec2(dot(dWx.xy, t), dWx.z)) / sc;
     vec2 gy = (plan ? dWy.xy : vec2(dot(dWy.xy, t), dWy.z)) / sc;
     float a = textureGrad(uTex, vec3(uv / sc, uTexLayer), gx, gy).a;
@@ -344,7 +347,7 @@ try {
   if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
 } catch (e) { fail('Shader error: ' + e.message); return; }
 const U = {};
-['uV', 'uP', 'uZs', 'uColor', 'uAlpha', 'uMode', 'uId', 'uClipAxis', 'uClipPos', 'uClipSign', 'uTex', 'uTexLayer', 'uTexScale', 'uTexAsp', 'uTexLine']
+['uV', 'uP', 'uZs', 'uColor', 'uAlpha', 'uMode', 'uId', 'uClipAxis', 'uClipPos', 'uClipSign', 'uTex', 'uTexLayer', 'uTexScale', 'uTexAsp', 'uTexZ', 'uTexLine']
   .forEach(n => U[n] = gl.getUniformLocation(prog, n));
 
 // ------------------------------------------------------------------ data
@@ -403,7 +406,9 @@ function niceStep(range) {
   return (f < 1.5 ? 1 : f < 3.5 ? 2 : f < 7.5 ? 5 : 10) * p;
 }
 const gstep = niceStep(horiz);
-const texBase = niceStep(horiz * 1.2);
+// one tile is about 1/20 of the model width (the 2D sections draw it about 2 cm on a 30 cm drawing);
+// the Texture size slider changes it from 20 % to 400 %
+const texBase = niceStep(horiz * 0.4);
 let gridVao, gridCount;
 {
   const pad = horiz * 0.04, x0 = Math.floor((bmin[0] - pad) / gstep) * gstep, x1 = Math.ceil((bmax[0] + pad) / gstep) * gstep;
@@ -542,7 +547,7 @@ function setCommon() {
   gl.useProgram(prog);
   gl.uniformMatrix4fv(U.uV, false, V); gl.uniformMatrix4fv(U.uP, false, P); gl.uniform1f(U.uZs, st.zs);
   gl.activeTexture(gl.TEXTURE0); gl.bindTexture(gl.TEXTURE_2D_ARRAY, texArr);
-  gl.uniform1i(U.uTex, 0); gl.uniform1f(U.uTexScale, texBase * st.texSize / 100);
+  gl.uniform1i(U.uTex, 0); gl.uniform1f(U.uTexScale, texBase * st.texSize / 100); gl.uniform1f(U.uTexZ, 1.0 / st.zs);
 }
 // A lithology is ONE mesh, so sorting whole meshes by their centre draws far parts of a layer
 // over near ones.  For transparent drawing every mesh is therefore cut (once) into spatial

@@ -626,8 +626,9 @@ def remove_old_files(*a, **k):
 
 
 def _remove_old_files(max_age=2 * 3600):
-    """Remove viewer files of this plugin older than two hours (the browser timer is one hour) from the temp directory (only
-    regular files owned by the current user; links and foreign files are never touched)."""
+    """Remove viewer files of this plugin older than two hours (the browser timer is one hour) from the
+    temp directory (only regular files owned by the current user; links and foreign files are never
+    touched)."""
     dirs = []
     try:
         dirs.append(_viewer_dir())
